@@ -157,6 +157,30 @@ Telegram updates не удаляются. Новая версия дожидае
 
 ## Целевые тесты
 
+### Проверенный выпуск 2026-09-16
+
+Рабочая версия: GitHub `dcebe5a` (исходный код TOF `d6ae145`), отдельный
+каталог `/Users/den/my/norik/repairs/tof/releases/vitaliy-bot-dcebe5a`.
+Исходная версия `b5aaf5b` также сохранена в отдельном каталоге выпуска.
+Для штатного отката используйте
+`/Users/den/Library/Application Support/TOF Vitaly Backups/rollback-baseline.plist`,
+а не старый plist с указанием изменяемого checkout `tof_v1`.
+Базу при откате не заменять. Снимок перед переключением:
+`/Users/den/Library/Application Support/TOF Vitaly Backups/2026-09-16-release-point-corrections`.
+
+Проверено: 53 целевых теста на Mac и сервере, 30 тестов standalone checkout;
+живое снятие заведомо ошибочного G1 по исходнику через Telegram-кнопки;
+неизменность остальных полей и чтение актуального отчёта без модели;
+пропуск зависимого Q1 в репетиции, ответ на независимый вопрос и `/stop` с итогом.
+На отдельном тестовом боте выполнен реальный launchd-откат на baseline и возврат:
+кейс и история правок сохранились, `/status`, отправленный во время паузы,
+обработан после запуска. Рабочая версия после переключения ответила на `/help`.
+Старая репетиция пользователя от 09.09 завершена с его явного разрешения;
+остальные пользовательские кейсы не изменялись вручную.
+
+Формальное закрытие задачи в TOF-harness отдельно ограничено ошибкой реестра
+`unknown_resource_class:code_verification`; это не результат продуктовых тестов.
+
 ```zsh
 .venv/bin/python -m pytest -q --tb=short tests/test_vitaly_bot.py tests/test_vitaly_corrections.py tests/test_context_normalization.py tests/test_artifact_qa.py
 ```
