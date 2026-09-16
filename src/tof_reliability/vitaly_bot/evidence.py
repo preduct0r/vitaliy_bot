@@ -121,9 +121,14 @@ class RemoteLedgerEvidenceProvider:
             **hints,
         }
         encoded = base64.urlsafe_b64encode(json.dumps(request, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        external_root = os.environ.get("VITALY_BOT_TOF_ROOT")
+        client_root = Path(external_root).expanduser().resolve() if external_root else ROOT
+        # The TOF client has its own dependencies and an identically named
+        # `scripts` package. Never import it with the standalone bot interpreter.
+        client_python = str(client_root / ".venv/bin/python") if external_root else sys.executable
         command = [
-            sys.executable,
-            str(Path(os.environ.get("VITALY_BOT_TOF_ROOT", str(ROOT))) / "scripts" / "tof_remote_workspace.py"),
+            client_python,
+            str(client_root / "scripts" / "tof_remote_workspace.py"),
             "run",
             "tof_v1",
             "--",
@@ -135,7 +140,7 @@ class RemoteLedgerEvidenceProvider:
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
-                cwd=os.environ.get("VITALY_BOT_TOF_ROOT", str(ROOT)),
+                cwd=str(client_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

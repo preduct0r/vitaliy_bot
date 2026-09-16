@@ -1,5 +1,5 @@
 {
-  "tof_commit": "264234233951c3a8460f473e50d6f6b5a509830d",
+  "tof_commit": "d6ae14589e9619d6289b80c648cc913981a46950",
   "source_paths": [
     "src/tof_reliability/vitaly_bot",
     "scripts/artifact_qa.py",

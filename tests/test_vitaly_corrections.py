@@ -289,6 +289,23 @@ def test_release_refuses_active_job_and_does_not_signal(setup, tmp_path, monkeyp
     assert signals == []
 
 
+def test_external_tof_client_uses_its_own_interpreter(setup, tmp_path, monkeypatch):
+    from tof_reliability.vitaly_bot.evidence import RemoteLedgerEvidenceProvider
+    from tof_reliability.vitaly_bot.models import EvidenceError
+    root = tmp_path / 'external-tof'
+    monkeypatch.setenv('VITALY_BOT_TOF_ROOT', str(root))
+    commands = []
+    async def launch(*args, **kwargs):
+        commands.append((args, kwargs))
+        raise OSError('test transport unavailable')
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', launch)
+    with pytest.raises(EvidenceError):
+        asyncio.run(RemoteLedgerEvidenceProvider(setup[1].config).build('test', []))
+    assert commands[0][0][0] == str(root / '.venv/bin/python')
+    assert commands[0][0][1] == str(root / 'scripts/tof_remote_workspace.py')
+    assert commands[0][1]['cwd'] == str(root)
+
+
 def test_release_restores_previous_plist_on_failed_bootstrap(setup, tmp_path, monkeypatch):
     from scripts import vitaly_release
     from types import SimpleNamespace
