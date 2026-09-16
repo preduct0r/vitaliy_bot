@@ -2,7 +2,7 @@
 
 Локальный Mac-бот для аудита и репетиции встречи. Это симулятор, не настоящий человек.
 
-Установка: `uv sync --extra dev`; на Mac нужны Poppler и LibreOffice для рендеринга.
+Установка: `uv sync --python 3.11 --extra dev`; на Mac нужны Poppler и LibreOffice для рендеринга.
 Авторизация Codex остаётся на Mac. Токен и параметры хранятся вне Git в
 `~/Library/Application Support/TOF Vitaly Bot/config.env`.
 

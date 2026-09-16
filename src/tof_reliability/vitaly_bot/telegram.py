@@ -21,6 +21,7 @@ from .models import ArtifactInput, BotConfig, EvidenceError, InputError, ModelEr
 from .profile import load_default_profile
 from .service import FifoWorker, JobOutcome, VitalyService
 from .storage import VitalyStore
+from . import correction_ui
 
 
 HELP_TEXT = (
@@ -30,6 +31,7 @@ HELP_TEXT = (
     "3. /grill — пройти конечную репетицию вопрос за вопросом.\n"
     "4. /stop — прекратить вопросы и получить итоговый разбор.\n"
     "5. /status — увидеть этап, очередь и ошибку.\n\n"
+    "Ошибочный пункт аудита можно перепроверить кнопкой «Исправить пункт» под отчётом.\n\n"
     "Пока бот занят, новые файлы, текст и команды не принимаются. Поддерживаются PPTX, PDF, DOCX, XLSX, TXT, MD, "
     "CSV, PNG и JPEG; до 50 МБ на файл. Новый кейс: /new."
 )
@@ -55,14 +57,16 @@ def split_message(text: str, limit: int = 3900) -> List[str]:
     return chunks
 
 
-async def send_with_retry(bot: Bot, chat_id: int, text: str) -> None:
+async def send_with_retry(bot: Bot, chat_id: int, text: str, **kwargs: Any) -> List[int]:
     """Retry only Telegram networking failures, never duplicate logic errors."""
 
+    message_ids = []
     for chunk in split_message(text):
         last_error: Optional[TelegramNetworkError] = None
         for attempt in range(3):
             try:
-                await bot.send_message(chat_id, chunk)
+                message = await bot.send_message(chat_id, chunk, **kwargs)
+                message_ids.append(message.message_id)
                 last_error = None
                 break
             except TelegramNetworkError as error:
@@ -70,6 +74,7 @@ async def send_with_retry(bot: Bot, chat_id: int, text: str) -> None:
                 await asyncio.sleep(2 ** attempt)
         if last_error is not None:
             raise last_error
+    return message_ids
 
 
 def _bullet(items: Iterable[str]) -> str:
@@ -83,15 +88,15 @@ def format_review(review: Dict[str, Any]) -> str:
         "Готовность: " + str(review["readiness_score"]) + "/100",
         review["verdict"],
         "\nКритические пробелы:",
-        _bullet(item["title"] + " — " + item["detail"] for item in review["critical_gaps"]),
+        _bullet("G" + str(i) + ". " + item["title"] + " — " + item["detail"] for i, item in enumerate(review["critical_gaps"], 1)),
         "\nПротиворечия:",
-        _bullet(item["title"] + " — " + item["detail"] for item in review["contradictions"]),
+        _bullet("C" + str(i) + ". " + item["title"] + " — " + item["detail"] for i, item in enumerate(review["contradictions"], 1)),
         "\nВероятные вопросы:",
     ]
     for number, question in enumerate(review["questions"], start=1):
         lines.extend(
             [
-                str(number) + ". " + question["text"],
+                "Q" + str(number) + ". " + question["text"],
                 "   Риск " + str(question["severity"]) + "/5, вероятность " + str(question["likelihood"]) + "/5.",
                 "   Почему: " + question["trigger"],
                 "   Короткий ответ: " + question["expected_answer"],
@@ -336,7 +341,12 @@ class TelegramRuntime:
         if outcome.kind == "review":
             self.store.settle_job(case_id, mode="ready")
             await self._end_progress(case_id, chat_id, "✅ Аудит материалов готов.")
-            await send_with_retry(self.bot, chat_id, format_review(outcome.payload))
+            await correction_ui.show_report(self, case_id, chat_id)
+            return
+        if outcome.kind == "review_correction":
+            self.store.settle_job(case_id, mode="ready")
+            await self._end_progress(case_id, chat_id, "✅ Пункт перепроверен.")
+            await correction_ui.show_result(self, job, outcome.payload)
             return
         if outcome.kind == "grill_stopped":
             await self._complete_stopped_grill(case_id, chat_id)
@@ -415,6 +425,7 @@ def _case_status(runtime: TelegramRuntime, case: Dict[str, Any]) -> str:
 
 def build_router(runtime: TelegramRuntime) -> Router:
     router = Router(name="vitaly_bot")
+    correction_ui.register(router, runtime)
 
     @router.message(CommandStart())
     async def start(message: Message) -> None:
@@ -440,6 +451,7 @@ def build_router(runtime: TelegramRuntime) -> Router:
         try:
             case = await runtime.case_for_user(message.chat.id)
             runtime.store.require_idle(case["id"])
+            runtime.service.corrections.cancel(case["id"])
             if not runtime.store.artifacts(case["id"]):
                 raise StateError("Сначала отправьте хотя бы один файл")
             await runtime.queue(case["id"], message.chat.id, "review")
@@ -451,6 +463,7 @@ def build_router(runtime: TelegramRuntime) -> Router:
         try:
             case = await runtime.case_for_user(message.chat.id)
             runtime.store.require_idle(case["id"])
+            runtime.service.corrections.cancel(case["id"])
             if not runtime.store.artifacts(case["id"]):
                 raise StateError("Сначала отправьте хотя бы один файл")
             await runtime.queue(case["id"], message.chat.id, "grill_start")
@@ -489,6 +502,7 @@ def build_router(runtime: TelegramRuntime) -> Router:
                 raise InputError("Один файл не должен быть больше 50 МБ")
             case = await runtime.case_for_user(message.chat.id)
             runtime.store.begin_upload(case["id"])
+            runtime.service.corrections.cancel(case["id"])
             await runtime._ensure_progress(case["id"], message.chat.id)
             incoming = runtime.store.case_dir(case["id"]) / "incoming"
             incoming.mkdir(parents=True, exist_ok=True)
@@ -532,6 +546,12 @@ def build_router(runtime: TelegramRuntime) -> Router:
         case: Optional[Dict[str, Any]] = None
         try:
             case = await runtime.case_for_user(message.chat.id)
+            pending = runtime.service.corrections.pending(case["id"])
+            if pending:
+                runtime.service.corrections.submit(pending["id"], message.chat.id, message.text)
+                runtime.worker.notify()
+                await runtime._ensure_progress(case["id"], message.chat.id)
+                return
             if case["mode"] == "grilling":
                 runtime.store.accept_answer_and_enqueue(case["id"], message.chat.id, message.text)
                 runtime.worker.notify()
@@ -569,6 +589,12 @@ async def run_bot(config: Optional[BotConfig] = None) -> None:
     runtime = TelegramRuntime(bot, active_config)
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(runtime))
+    async def drain_handlers(**kwargs: Any) -> None:
+        # aiogram 3.30 stops polling before shutdown but does not await handlers.
+        pending = list(dispatcher._handle_update_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    dispatcher.shutdown.register(drain_handlers)
     await runtime.start()
     try:
         with contextlib.suppress(TelegramNetworkError):
@@ -582,7 +608,7 @@ async def run_bot(config: Optional[BotConfig] = None) -> None:
                     BotCommand(command="help", description="инструкция"),
                 ]
             )
-        await dispatcher.start_polling(bot, polling_timeout=active_config.poll_timeout)
+        await dispatcher.start_polling(bot, polling_timeout=active_config.poll_timeout, close_bot_session=False)
     finally:
         await runtime.stop()
         await bot.session.close()

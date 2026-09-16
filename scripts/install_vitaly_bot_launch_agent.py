@@ -25,6 +25,7 @@ def build_plist(repository: Path, env_file: Path, logs_dir: Path) -> Dict[str, A
             "VITALY_BOT_ENV_FILE": str(env_file),
             # launchd does not inherit the interactive shell's Homebrew PATH.
             "PATH": os.environ.get("PATH", LAUNCHD_PATH) or LAUNCHD_PATH,
+            **({"VITALY_BOT_TOF_ROOT": os.environ["VITALY_BOT_TOF_ROOT"]} if os.environ.get("VITALY_BOT_TOF_ROOT") else {}),
         },
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},

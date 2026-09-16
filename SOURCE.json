@@ -1,5 +1,5 @@
 {
-  "tof_commit": "cd4b3740986327ffc9a520be0f8a7004b56cd3a4",
+  "tof_commit": "264234233951c3a8460f473e50d6f6b5a509830d",
   "source_paths": [
     "src/tof_reliability/vitaly_bot",
     "scripts/artifact_qa.py",
@@ -10,6 +10,10 @@
     "docs/VITALY_TELEGRAM_BOT.md",
     "discussions/vitaly",
     "tests/test_context_normalization.py",
-    "tests/test_artifact_qa.py"
+    "tests/test_artifact_qa.py",
+    "tests/test_vitaly_corrections.py",
+    "scripts/vitaly_snapshot.py",
+    "scripts/vitaly_release.py",
+    "scripts/export_vitaly_bot.py"
   ]
 }

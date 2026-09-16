@@ -14,6 +14,7 @@ from .evidence import EvidenceProvider, RemoteLedgerEvidenceProvider
 from .models import BotConfig, EvidenceError, ModelError, ModelResult, StateError
 from .profile import VitalyProfile
 from .storage import VitalyStore
+from .corrections import Corrections, correct_point
 
 
 class StructuredRunner(Protocol):
@@ -160,6 +161,7 @@ class VitalyService:
     ) -> None:
         self.store = store
         self.profile = profile
+        self.corrections = Corrections(store)
         self.config = config
         self.documents = DocumentProcessor(store)
         self.runner: StructuredRunner = runner or CodexRunner(config)
@@ -190,6 +192,7 @@ class VitalyService:
             "review": "Модель готовит аудит",
             "grill_feedback": "Модель проверяет ответ",
             "finish": "Модель готовит итог репетиции",
+            "review_correction": "Перепроверяю выбранный пункт",
         }.get(kind, "Модель размышляет")
         self.store.set_activity(case_id, "thinking", stage)
         last_error: Optional[ModelError] = None
@@ -268,7 +271,7 @@ class VitalyService:
     async def review_case(self, case_id: str, job_id: str) -> Dict[str, Any]:
         case = self.store.get_case(case_id)
         if case["review"]:
-            return case["review"]
+            return self.corrections.effective(case_id)
         evidence_pack = await self._evidence_pack(case_id)
         self.store.set_activity(case_id, "processing_materials", "Собираю карту утверждений и чисел")
         material_map = await self._material_map(case_id, job_id)
@@ -306,12 +309,13 @@ class VitalyService:
         if case.get("stop_requested"):
             return JobOutcome("grill_stopped", case_id, {})
         review = await self.review_case(case_id, job_id)
+        review = self.corrections.effective(case_id, rehearsal=True)
         case = self.store.get_case(case_id)
         if case.get("stop_requested"):
             return JobOutcome("grill_stopped", case_id, {})
         question = self._next_planned_question(review, 0)
         if question is None:
-            raise ModelError("model_output_invalid_schema", "Нет вопросов для репетиции")
+            raise StateError("После исправлений не осталось вопросов для репетиции. Откройте актуальный отчёт.")
         self.store.clear_turns(case_id)
         self.store.set_question(case_id, question, 0, "grilling")
         return JobOutcome("grill_question", case_id, {"question": question, "review": review})
@@ -341,12 +345,13 @@ class VitalyService:
             + "\nEvidence-пакет:\n" + _json(evidence_pack)
             + "\nВопрос:\n" + _json(turn["question"])
             + "\nОтвет сотрудника:\n" + turn["answer_text"]
+            + "\nПринятые исправления аудита (не повторяй снятые претензии):\n" + self.corrections.context(case_id)
         )
         feedback = await self._model(case_id, job_id, "grill_feedback", prompt, FEEDBACK_SCHEMA)
         self.store.set_turn_feedback(turn_id, feedback)
         case = self.store.get_case(case_id)
         current = turn["question"]
-        review = case["review"]
+        review = self.corrections.effective(case_id, rehearsal=True)
         planned_index = int(current.get("planned_index", case["planned_question_index"]))
         if case.get("stop_requested"):
             self.store.set_question(case_id, None, planned_index, "stopping")
@@ -371,7 +376,8 @@ class VitalyService:
             self._base_prompt()
             + "\nСделай итоговый разбор репетиции. Оцени доказательность, конкретность, владение цифрами, "
             + "причинно-следственную связь и готовность назвать владельца и срок. Не добавляй фактов.\n"
-            + "Исходный аудит:\n" + _json(case["review"])
+            + "Актуальный аудит:\n" + _json(self.corrections.effective(case_id))
+            + "\nПринятые исправления (не повторяй снятые претензии):\n" + self.corrections.context(case_id)
             + "\nХоды репетиции:\n" + _json(turns)
         )
         result = await self._model(case_id, job_id, "finish", prompt, FINISH_SCHEMA)
@@ -381,6 +387,9 @@ class VitalyService:
 
     async def execute(self, job: Dict[str, Any]) -> JobOutcome:
         kind = job["kind"]
+        if kind == "review_correction":
+            result = await correct_point(self, job)
+            return JobOutcome("review_correction", job["case_id"], result)
         if kind == "review":
             review = await self.review_case(job["case_id"], job["id"])
             return JobOutcome("review", job["case_id"], review)

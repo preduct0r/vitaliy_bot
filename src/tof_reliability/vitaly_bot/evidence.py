@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -122,7 +123,7 @@ class RemoteLedgerEvidenceProvider:
         encoded = base64.urlsafe_b64encode(json.dumps(request, ensure_ascii=False).encode("utf-8")).decode("ascii")
         command = [
             sys.executable,
-            str(ROOT / "scripts" / "tof_remote_workspace.py"),
+            str(Path(os.environ.get("VITALY_BOT_TOF_ROOT", str(ROOT))) / "scripts" / "tof_remote_workspace.py"),
             "run",
             "tof_v1",
             "--",
@@ -134,7 +135,7 @@ class RemoteLedgerEvidenceProvider:
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
-                cwd=str(ROOT),
+                cwd=os.environ.get("VITALY_BOT_TOF_ROOT", str(ROOT)),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
