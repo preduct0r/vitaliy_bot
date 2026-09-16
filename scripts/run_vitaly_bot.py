@@ -25,15 +25,15 @@ from tof_reliability.vitaly_bot.telegram import run_bot
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-auth", action="store_true", help="only check the saved ChatGPT Codex login")
-    parser.add_argument("--cleanup-only", action="store_true", help="remove expired local case files and exit")
+    parser.add_argument("--cleanup-only", action="store_true", help="verify permanent archive retention and exit")
     args = parser.parse_args()
     config = load_config(require_token=not (args.check_auth or args.cleanup_only))
     if args.check_auth:
         result = subprocess.run([str(config.codex_bin), "login", "status"], check=False)
         return result.returncode
     if args.cleanup_only:
-        removed = VitalyStore(config.state_dir).cleanup_expired_files(config.cleanup_days)
-        print("removed_cases=" + str(len(removed)))
+        VitalyStore(config.state_dir, config.knowledge_dir).cleanup_expired_files(config.cleanup_days)
+        print("removed_cases=0 archive_retention=permanent")
         return 0
     lock_dir = Path.home() / "Library" / "Application Support" / "TOF Vitaly Poller Locks"
     lock_dir.mkdir(parents=True, exist_ok=True)

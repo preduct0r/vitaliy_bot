@@ -17,6 +17,7 @@ from .storage import VitalyStore
 
 
 SUPPORTED_SUFFIXES = {".pptx", ".pdf", ".docx", ".xlsx", ".txt", ".md", ".csv", ".png", ".jpeg", ".jpg"}
+MEETING_SUFFIXES = {".txt", ".md", ".docx", ".pdf"}
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_CASE_ARTIFACTS = 10
 MAX_CASE_UNITS = 200
@@ -189,6 +190,63 @@ class DocumentProcessor:
             selected.extend(artifact.image_paths)
         return _select_images(selected)
 
+    def prepare_meeting_source(
+        self, submission_id: str, artifact: ArtifactInput, *, min_free_bytes: int = 0
+    ) -> Dict[str, object]:
+        """Archive a transcript without turning it into a user's case artifact.
+
+        Meeting uploads deliberately use the same normalizer and renderer as a
+        review, but live under the external knowledge archive.  A scanned PDF
+        with no text is rejected because speaker attribution cannot be audited.
+        """
+
+        suffix = Path(artifact.original_name).suffix.casefold()
+        if suffix not in MEETING_SUFFIXES:
+            raise InputError("Для встречи поддерживаются только TXT, MD, DOCX и текстовый PDF")
+        if artifact.size_bytes > MAX_FILE_BYTES:
+            raise InputError("Один файл не должен быть больше 50 МБ")
+        if preflight_unit_count(artifact.path) > MAX_CASE_UNITS:
+            raise InputError("Транскрипт не должен содержать больше 200 страниц")
+        self.store.ensure_free_space(min_free_bytes)
+        root = self.store.knowledge_root / "meetings" / submission_id
+        source_dir = root / "source"
+        normalized_dir = root / "normalized"
+        rendered_dir = root / "rendered"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        target = source_dir / safe_filename(artifact.original_name)
+        if artifact.path.resolve() != target.resolve():
+            shutil.copy2(artifact.path, target)
+        records = context_normalization.normalize_sources({"meeting_transcript": target}, normalized_dir)
+        record = records[0]
+        normalized_paths = [Path(item) for item in record.get("normalized_paths", [])]
+        if not normalized_paths or not normalized_paths[0].exists():
+            raise InputError("Не удалось извлечь текст транскрипта")
+        normalized_path = normalized_paths[0]
+        body = _normalized_body(normalized_path.read_text(encoding="utf-8", errors="replace")).strip()
+        if not body or body.startswith("[Текстовый слой отсутствует"):
+            raise InputError("В PDF нет доступного текстового слоя. Загрузите текстовый PDF или TXT/DOCX.")
+        try:
+            if suffix in {".pdf", ".docx"}:
+                artifact_qa.render_file(target, rendered_dir)
+        except (artifact_qa.ArtifactQaError, OSError, RuntimeError):
+            # Render is retained when available, but extracted text is enough to
+            # classify a transcript safely.
+            pass
+        return {
+            "source_name": target.name,
+            "source_path": target,
+            "normalized_path": normalized_path,
+            "source_sha256": sha256(target),
+            "normalized_sha256": hashlib.sha256(_semantic_text(body).encode("utf-8")).hexdigest(),
+            "text": body,
+        }
+
 
 def uuid_safe_prefix(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _semantic_text(value: str) -> str:
+    """Stable duplicate signal that tolerates harmless whitespace changes."""
+
+    return re.sub(r"\s+", " ", value.casefold()).strip()

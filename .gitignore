@@ -6,5 +6,6 @@ __pycache__/
 config.env
 *.sqlite*
 cases/
+knowledge/
 *.log
 dist/

@@ -8,12 +8,15 @@ import subprocess
 
 
 def export(root, destination):
-    paths = ['src/tof_reliability/vitaly_bot', 'scripts/artifact_qa.py',
+    paths = ['src/tof_reliability/vitaly_bot', 'src/tof_reliability/data', 'harness/capabilities/analytics.json',
+             'scripts/artifact_qa.py',
              'scripts/context_normalization.py', 'scripts/run_vitaly_bot.py',
              'scripts/install_vitaly_bot_launch_agent.py', 'scripts/evaluate_vitaly_profile_holdout.py',
              'docs/VITALY_TELEGRAM_BOT.md', 'discussions/vitaly',
-             'tests/test_context_normalization.py', 'tests/test_artifact_qa.py']
-    for optional in ['tests/test_vitaly_corrections.py', 'scripts/vitaly_snapshot.py',
+             'tests/test_context_normalization.py', 'tests/test_artifact_qa.py',
+             'tests/test_vitaly_bot.py', 'tests/test_vitaly_corrections.py',
+             'tests/test_vitaly_learning_core.py', 'tests/test_vitaly_learning_runtime.py']
+    for optional in ['scripts/vitaly_snapshot.py',
                      'scripts/vitaly_release.py', 'scripts/export_vitaly_bot.py']:
         if (root / optional).exists():
             paths.append(optional)
@@ -32,7 +35,7 @@ def export(root, destination):
 name = "vitaliy-bot"
 version = "0.1.0"
 requires-python = ">=3.10,<3.12"
-dependencies = ["aiogram==3.30.0", "pillow>=11.3,<13"]
+dependencies = ["aiogram==3.30.0", "pandas>=2.2,<3", "pillow>=11.3,<13"]
 [project.optional-dependencies]
 dev = ["pytest>=8.3.3,<9"]
 [build-system]
@@ -52,7 +55,7 @@ root = Path(os.environ["VITALY_BOT_TOF_ROOT"]).expanduser().resolve()
 os.chdir(root)
 os.execv(str(root / ".venv/bin/python"), [str(root / ".venv/bin/python"), str(root / "scripts/tof_remote_workspace.py"), *sys.argv[1:]])
 ''')
-    (destination / '.gitignore').write_text('.venv/\n__pycache__/\n*.pyc\n.pytest_cache/\n.env\nconfig.env\n*.sqlite*\ncases/\n*.log\ndist/\n')
+    (destination / '.gitignore').write_text('.venv/\n__pycache__/\n*.pyc\n.pytest_cache/\n.env\nconfig.env\n*.sqlite*\ncases/\nknowledge/\n*.log\ndist/\n')
     (destination / 'README.md').write_text('''# Vitaliy Telegram Bot
 
 Локальный Mac-бот для аудита и репетиции встречи. Это симулятор, не настоящий человек.

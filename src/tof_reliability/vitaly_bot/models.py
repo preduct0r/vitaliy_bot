@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -19,8 +19,15 @@ class BotConfig:
     poll_timeout: int = 30
     model_timeout_seconds: int = 480
     evidence_timeout_seconds: int = 180
-    cleanup_days: int = 30
+    # Source files are evidence for reviews and learning.  They are retained
+    # indefinitely; ``cleanup_days`` stays only as a compatibility setting for
+    # old local config files and is intentionally not used to delete them.
+    cleanup_days: int = 0
     context_ttl_days: int = 4
+    knowledge_dir: Optional[Path] = None
+    min_free_bytes: int = 2 * 1024 * 1024 * 1024
+    learning_cycle_seconds: int = 24 * 60 * 60
+    operator_user_ids: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

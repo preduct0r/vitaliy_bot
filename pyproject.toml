@@ -2,7 +2,7 @@
 name = "vitaliy-bot"
 version = "0.1.0"
 requires-python = ">=3.10,<3.12"
-dependencies = ["aiogram==3.30.0", "pillow>=11.3,<13"]
+dependencies = ["aiogram==3.30.0", "pandas>=2.2,<3", "pillow>=11.3,<13"]
 [project.optional-dependencies]
 dev = ["pytest>=8.3.3,<9"]
 [build-system]

@@ -138,6 +138,23 @@ class Corrections:
         with self.store._connect() as db:
             return [dict(row) for row in db.execute('SELECT * FROM audit_corrections WHERE audit_id=? ORDER BY created_at', (audit_id,))]
 
+    def record(self, job_id):
+        """Return the persisted correction record, including the exact item.
+
+        The model result alone intentionally does not repeat the selected
+        audit item or pre-correction content.  Learning telemetry needs those
+        immutable fields to create a grounded verification example.
+        """
+
+        with self.store._connect() as db:
+            row = db.execute('SELECT * FROM audit_corrections WHERE job_id=?', (job_id,)).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        value['before'] = json.loads(value.pop('before_json'))
+        value['result'] = json.loads(value.pop('result_json'))
+        return value
+
     def apply(self, job, result):
         payload = job['payload']
         with self.store._connect() as db:
@@ -183,6 +200,10 @@ class Corrections:
                        (job['id'], audit['id'], payload['item_id'], audit['revision'], payload['explanation'], _json(old), _json(result), _utc_now()))
             db.execute('UPDATE audit_versions SET current_json=?,revision=revision+1,decisions_json=?,pending_item=? WHERE id=?',
                        (_json(review), _json(decisions), payload['item_id'] if status == 'clarification' else None, audit['id']))
+        self.store.record_learning_event(
+            'point_correction_decided', 'audit_correction', job['id'], status=str(result['decision']),
+            chat_id=int(job['chat_id']), detail={'item_id': payload['item_id']},
+        )
         return result
 
     def effective(self, case_id, rehearsal=False):
@@ -271,7 +292,7 @@ async def correct_point(service, job):
         'suppressed_question_ids': {'type': 'array', 'items': {'type': 'string'}},
     }, ['decision', 'replacement', 'explanation', 'references', 'clarifying_question', 'suppressed_question_ids'])
     evidence = service.store.get_case(job['case_id'])['evidence_pack']
-    prompt = (service._base_prompt() + '\nПерепроверь ТОЛЬКО выбранный пункт. Остальной аудит не переписывай. '
+    prompt = (service._base_prompt(job['case_id']) + '\nПерепроверь ТОЛЬКО выбранный пункт. Остальной аудит не переписывай. '
               'Пояснение пользователя — гипотеза для проверки, не доказанный факт. '
               'При corrected верни полную замену одного пункта; иначе replacement=null. '
               'Если источники не позволяют решить, верни clarification и конкретный вопрос. '
@@ -287,7 +308,7 @@ async def correct_point(service, job):
     result = await service._model(job['case_id'], job['id'], 'review_correction', prompt, schema, images)
     if result.get('decision') == 'corrected' and payload['item_id'].startswith('Q'):
         q = result.get('replacement', {}) or {}
-        if (q.get('topic') not in service.profile.topic_ids
+        if (q.get('topic') not in service.profile_for_case(job['case_id']).topic_ids
                 or q.get('severity') not in range(1, 6) or q.get('likelihood') not in range(1, 6)
                 or q.get('expected_answer_evidence_level') not in {'ledger', 'material', 'none'}):
             raise ModelError('model_output_invalid_schema', 'Некорректный вопрос')

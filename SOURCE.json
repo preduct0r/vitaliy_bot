@@ -1,7 +1,9 @@
 {
-  "tof_commit": "97ace6efec528ec3005cae8f5058bd074903051b",
+  "tof_commit": "0b19c07e8a757e69f3248ef2affec0f2f0bb781b",
   "source_paths": [
     "src/tof_reliability/vitaly_bot",
+    "src/tof_reliability/data",
+    "harness/capabilities/analytics.json",
     "scripts/artifact_qa.py",
     "scripts/context_normalization.py",
     "scripts/run_vitaly_bot.py",
@@ -11,7 +13,10 @@
     "discussions/vitaly",
     "tests/test_context_normalization.py",
     "tests/test_artifact_qa.py",
+    "tests/test_vitaly_bot.py",
     "tests/test_vitaly_corrections.py",
+    "tests/test_vitaly_learning_core.py",
+    "tests/test_vitaly_learning_runtime.py",
     "scripts/vitaly_snapshot.py",
     "scripts/vitaly_release.py",
     "scripts/export_vitaly_bot.py"

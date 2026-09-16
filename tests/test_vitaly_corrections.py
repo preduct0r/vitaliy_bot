@@ -108,6 +108,98 @@ def test_telegram_selection_answer_and_current_report(setup):
     asyncio.run(scenario())
 
 
+def test_telegram_general_feedback_and_meeting_are_separate_from_case(setup):
+    pytest.importorskip('aiogram')
+    from aiogram import Bot, Dispatcher
+    from aiogram.client.session.base import BaseSession
+    from aiogram.types import Update, Message, Chat
+    from datetime import datetime, timezone
+    from tof_reliability.vitaly_bot.telegram import TelegramRuntime, build_router
+
+    class Session(BaseSession):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+        async def close(self):
+            pass
+        async def stream_content(self, *args, **kwargs):
+            if False:
+                yield b''
+        async def make_request(self, bot, method, timeout=None):
+            self.calls.append(method)
+            if method.__api_method__ == 'sendMessage':
+                return Message(message_id=len(self.calls), date=datetime.now(timezone.utc),
+                               chat=Chat(id=101, type='private'), text=method.text)
+            return True
+
+    async def scenario():
+        store, service, case, audit = setup
+        session = Session()
+        bot = Bot('123456:TEST_TOKEN', session=session)
+        runtime = TelegramRuntime(bot, service.config)
+        runtime._ensure_learning_typing = lambda job: None
+        dp = Dispatcher()
+        dp.include_router(build_router(runtime))
+        user = dict(id=101, is_bot=False, first_name='Test')
+        base = dict(message_id=1, date=1, chat=dict(id=101, type='private'), **{'from': user})
+
+        await dp.feed_update(bot, Update.model_validate(dict(
+            update_id=1,
+            callback_query=dict(id='feedback', **{'from': user}, chat_instance='test', message=base,
+                                data=f"vc:{audit['id']}:{audit['revision']}:feedback"),
+        )))
+        assert store.pending_feedback(101, 101) is not None
+        # While a feedback explanation is pending, any non-text update must be
+        # rejected before it can reach the ordinary case-ingest path.
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=11, message=dict(base, message_id=11,
+            document=dict(file_id='blocked-document', file_unique_id='blocked-document-unique',
+                          file_name='blocked.pdf', mime_type='application/pdf', file_size=10)))))
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=12, message=dict(base, message_id=12,
+            photo=[dict(file_id='blocked-photo', file_unique_id='blocked-photo-unique', width=1, height=1, file_size=10)]))))
+        assert store.pending_feedback(101, 101) is not None
+        assert store.artifact_count(case['id']) == 1
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=2, message=dict(base, message_id=2,
+            text='На двух слайдах разные определения показателя, это не конфликт.'))))
+        assert store.pending_feedback(101, 101) is None
+        assert store.get_learning_job(store.get_feedback(store.own_learning_status(101, 101)['feedback'][0]['id'])['learning_job_id'])['kind'] == 'feedback_analyze'
+        assert store.artifact_count(case['id']) == 1
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=21, message=dict(base, message_id=21,
+            text='Это повтор: не превращайте его в материал.'))))
+        assert store.artifact_count(case['id']) == 1
+        assert len(store.own_learning_status(101, 101)['feedback']) == 1
+
+        # The transcript intake itself is not allowed to start until an already
+        # accepted feedback item has left the foreground user queue.
+        accepted_feedback = store.own_learning_status(101, 101)['feedback'][0]
+        store.set_feedback_result(accepted_feedback['id'], 'case_only', {
+            'result': 'case_only', 'reason': 'Тестовая развязка очереди.',
+            'source_document_id': 'audit', 'fragment': 'G1', 'expected_improvement': '',
+        })
+        store.finish_learning_job(accepted_feedback['learning_job_id'])
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=4, message=dict(base, message_id=4, text='/meeting'))))
+        for update_id, text in enumerate(('2026-09-16', 'Новая встреча', 'Виталий — руководитель'), start=5):
+            await dp.feed_update(bot, Update.model_validate(dict(update_id=update_id, message=dict(base, message_id=update_id, text=text))))
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=8, message=dict(base, message_id=8,
+            text='Виталий: покажите источник и срок. Коллега: подготовим завтра.'))))
+        meeting = store.pending_meeting(101, 101)
+        assert meeting is None
+        own = store.own_learning_status(101, 101)
+        assert own['meetings'][0]['status'] == 'received'
+        assert store.artifact_count(case['id']) == 1
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=22, message=dict(base, message_id=22,
+            text='Это повтор транскрипта.'))))
+        assert store.artifact_count(case['id']) == 1
+        assert len(store.own_learning_status(101, 101)['meetings']) == 1
+        group = dict(message_id=23, date=1, chat=dict(id=-100, type='group'), **{'from': user}, text='/new')
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=23, message=group)))
+        assert any('только в личном чате' in (getattr(call, 'text', '') or '') for call in session.calls)
+        with store._connect() as connection:
+            assert connection.execute('SELECT id FROM cases WHERE chat_id = -100').fetchone() is None
+        await bot.session.close()
+
+    asyncio.run(scenario())
+
+
 def result(decision='corrected'):
     return dict(decision=decision, replacement=dict(title='Показатель подтверждён', detail='Указано 30', material_reference='input.txt') if decision == 'corrected' else None,
                 explanation='Проверено по input.txt', references=['input.txt'],
@@ -268,6 +360,25 @@ def test_timeout_recovery_requeues_one_job(setup):
     assert Corrections(reopened).pending(case['id'])['pending_item'] == 'G1'
 
 
+def test_point_correction_learning_example_keeps_selected_item_and_before_after(setup):
+    store, service, case, audit = setup
+    record = {
+        'item_id': 'G1',
+        'explanation': 'На слайде уже есть нужная подпись.',
+        'before': {'title': 'Ложное противоречие', 'detail': 'x', 'material_reference': 'slide 2'},
+        'result': {'decision': 'removed', 'explanation': 'Подпись снимает противоречие.'},
+    }
+    captured = store.capture_point_correction(
+        case['id'], 'point-job-grounded', {'decision': 'removed', 'explanation': 'Подпись снимает противоречие.'}, record
+    )
+    assert captured is not None
+    payload = captured['result']
+    assert payload['item_id'] == 'G1'
+    assert payload['before'] == record['before']
+    assert payload['after'] == record['result']
+    assert payload['source_document_id'] == 'audit:{}:G1'.format(case['id'])
+
+
 def test_expired_case_callback_is_rejected(setup):
     from datetime import datetime, timedelta, timezone
     store, service, case, audit = setup
@@ -287,6 +398,30 @@ def test_release_refuses_active_job_and_does_not_signal(setup, tmp_path, monkeyp
     with pytest.raises(RuntimeError, match='занят'):
         vitaly_release.switch(tmp_path/'live', tmp_path/'next', store.state_dir, tmp_path/'backup')
     assert signals == []
+
+
+def test_snapshot_resolves_only_configured_knowledge_path(tmp_path, monkeypatch):
+    from scripts.vitaly_snapshot import resolve_knowledge_dir
+
+    state = tmp_path / "state"
+    state.mkdir()
+    archive = tmp_path / "private-knowledge"
+    (state / "config.env").write_text(
+        "VITALY_BOT_TOKEN=must-not-be-read-or-printed\n"
+        f"VITALY_BOT_KNOWLEDGE_DIR={archive}\n"
+    )
+    monkeypatch.delenv("VITALY_BOT_KNOWLEDGE_DIR", raising=False)
+    monkeypatch.delenv("VITALY_BOT_ENV_FILE", raising=False)
+
+    assert resolve_knowledge_dir(state) == archive
+    assert resolve_knowledge_dir(state, tmp_path / "explicit") == tmp_path / "explicit"
+    monkeypatch.setenv("VITALY_BOT_KNOWLEDGE_DIR", str(tmp_path / "from-env"))
+    assert resolve_knowledge_dir(state) == tmp_path / "from-env"
+    external_env = tmp_path / "outside-state.env"
+    external_env.write_text(f"VITALY_BOT_KNOWLEDGE_DIR={tmp_path / 'from-config-path'}\n")
+    monkeypatch.delenv("VITALY_BOT_KNOWLEDGE_DIR")
+    monkeypatch.setenv("VITALY_BOT_ENV_FILE", str(external_env))
+    assert resolve_knowledge_dir(state) == tmp_path / "from-config-path"
 
 
 def test_external_tof_client_uses_its_own_interpreter(setup, tmp_path, monkeypatch):
@@ -313,6 +448,9 @@ def test_release_restores_previous_plist_on_failed_bootstrap(setup, tmp_path, mo
     live, candidate = tmp_path/'live.plist', tmp_path/'candidate.plist'
     live.write_bytes(b'previous')
     candidate.write_bytes(b'candidate')
+    knowledge = tmp_path / "separate-knowledge"
+    knowledge.mkdir()
+    (knowledge / "meeting.txt").write_text("private transcript")
     pids = iter([123, None, None])
     monkeypatch.setattr(vitaly_release, 'pid', lambda: next(pids, None))
     monkeypatch.setattr(vitaly_release.os, 'kill', lambda *a: None)
@@ -326,7 +464,10 @@ def test_release_restores_previous_plist_on_failed_bootstrap(setup, tmp_path, mo
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(vitaly_release.subprocess, 'run', run)
     with pytest.raises(RuntimeError, match='candidate launch failed'):
-        vitaly_release.switch(live, candidate, store.state_dir, tmp_path/'backup')
+        vitaly_release.switch(live, candidate, store.state_dir, tmp_path/'backup', knowledge)
     assert live.read_bytes() == b'previous'
     assert attempts == [b'candidate', b'previous']
     assert (tmp_path/'backup/vitaly_bot.sqlite3').exists()
+    import tarfile
+    with tarfile.open(tmp_path / "backup" / "knowledge.tar.gz") as archive:
+        assert archive.getnames() == ["knowledge", "knowledge/meeting.txt"]

@@ -8,7 +8,13 @@ import plistlib
 import signal
 import sqlite3
 import subprocess
+import tarfile
 import time
+
+try:  # Supports both ``python scripts/...`` and ``from scripts import ...``.
+    from .vitaly_snapshot import resolve_knowledge_dir
+except ImportError:  # pragma: no cover - direct script execution
+    from vitaly_snapshot import resolve_knowledge_dir
 
 LABEL = 'ru.nornickel.tof.vitaly-bot'
 
@@ -17,7 +23,12 @@ def idle(state):
     with sqlite3.connect((state / 'vitaly_bot.sqlite3').as_uri()+'?mode=ro', uri=True) as db:
         jobs = db.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
         cases = db.execute("SELECT COUNT(*) FROM cases WHERE activity <> 'idle' OR mode IN ('grilling','stopping')").fetchone()[0]
-    return not jobs and not cases
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        learning_jobs = (
+            db.execute("SELECT COUNT(*) FROM learning_jobs WHERE status IN ('queued','running')").fetchone()[0]
+            if 'learning_jobs' in tables else 0
+        )
+    return not jobs and not cases and not learning_jobs
 
 
 def pid():
@@ -28,7 +39,7 @@ def pid():
     return None
 
 
-def switch(plist_path, candidate, state, backup):
+def switch(plist_path, candidate, state, backup, knowledge_dir=None):
     if not idle(state):
         raise RuntimeError('Бот занят: выпуск отложен, старый процесс продолжает работать.')
     before = plist_path.read_bytes()
@@ -46,6 +57,10 @@ def switch(plist_path, candidate, state, backup):
             with sqlite3.connect(backup / 'vitaly_bot.sqlite3') as dst:
                 src.backup(dst)
                 assert dst.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        knowledge = resolve_knowledge_dir(state, knowledge_dir)
+        if knowledge.exists():
+            with tarfile.open(backup / 'knowledge.tar.gz', 'w:gz') as archive:
+                archive.add(knowledge, arcname='knowledge')
         # Deliver graceful stop before resuming the loop; no second poller exists.
         os.kill(old_pid, signal.SIGTERM)
     finally:
@@ -84,6 +99,10 @@ if __name__ == '__main__':
     p.add_argument('--candidate-plist', type=Path, required=True)
     p.add_argument('--state', type=Path, required=True)
     p.add_argument('--backup', type=Path, required=True)
+    p.add_argument(
+        '--knowledge', type=Path,
+        help='override VITALY_BOT_KNOWLEDGE_DIR for the release backup',
+    )
     p.add_argument('--plist', type=Path, default=Path.home() / 'Library/LaunchAgents' / (LABEL+'.plist'))
     a = p.parse_args()
-    switch(a.plist, a.candidate_plist, a.state, a.backup)
+    switch(a.plist, a.candidate_plist, a.state, a.backup, a.knowledge)

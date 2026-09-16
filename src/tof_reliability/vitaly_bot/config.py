@@ -46,6 +46,14 @@ def load_config(environ: Optional[Dict[str, str]] = None, require_token: bool = 
             "Не задан VITALY_BOT_TOKEN. Создайте локальный " + str(env_file) + " вне Git."
         )
     state_dir = Path(values.get("VITALY_BOT_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser()
+    knowledge_dir = Path(values.get("VITALY_BOT_KNOWLEDGE_DIR", str(state_dir / "knowledge"))).expanduser()
+    raw_operator_ids = values.get("VITALY_BOT_OPERATOR_USER_IDS", "").strip()
+    try:
+        operator_user_ids = tuple(
+            int(value.strip()) for value in raw_operator_ids.split(",") if value.strip()
+        )
+    except ValueError as error:
+        raise InputError("VITALY_BOT_OPERATOR_USER_IDS должен содержать числовые Telegram user_id") from error
     return BotConfig(
         token=token,
         state_dir=state_dir,
@@ -55,6 +63,10 @@ def load_config(environ: Optional[Dict[str, str]] = None, require_token: bool = 
         poll_timeout=int(values.get("VITALY_BOT_POLL_TIMEOUT", "30")),
         model_timeout_seconds=int(values.get("VITALY_BOT_MODEL_TIMEOUT_SECONDS", "480")),
         evidence_timeout_seconds=int(values.get("VITALY_BOT_EVIDENCE_TIMEOUT_SECONDS", "180")),
-        cleanup_days=int(values.get("VITALY_BOT_CLEANUP_DAYS", "30")),
+        cleanup_days=int(values.get("VITALY_BOT_CLEANUP_DAYS", "0")),
         context_ttl_days=int(values.get("VITALY_BOT_CONTEXT_TTL_DAYS", "4")),
+        knowledge_dir=knowledge_dir,
+        min_free_bytes=int(values.get("VITALY_BOT_MIN_FREE_BYTES", str(2 * 1024 * 1024 * 1024))),
+        learning_cycle_seconds=int(values.get("VITALY_BOT_LEARNING_CYCLE_SECONDS", str(24 * 60 * 60))),
+        operator_user_ids=operator_user_ids,
     )

@@ -15,7 +15,11 @@ def keyboard(audit, page=None):
         return InlineKeyboardButton(text=label, callback_data=prefix + action)
     rows = []
     if page is None:
-        rows = [[button('Исправить пункт', 'page:0')], [button('Актуальный отчёт', 'view')]]
+        rows = [
+            [button('Исправить пункт', 'page:0')],
+            [button('Общая обратная связь', 'feedback')],
+            [button('Актуальный отчёт', 'view')],
+        ]
     else:
         choices = items(json.loads(audit['current_json']))
         page = max(0, min(page, max(0, (len(choices)-1)//PAGE_SIZE)))
@@ -124,5 +128,15 @@ def register(router, runtime):
             elif action == 'cancel':
                 corrections.select(audit_id, int(revision), None, chat_id)
                 await send_with_retry(runtime.bot, chat_id, 'Исправление отменено. Аудит не изменён.')
+            elif action == 'feedback':
+                runtime.store.start_feedback(
+                    audit['case_id'], chat_id, query.from_user.id if query.from_user else None, audit_id
+                )
+                await send_with_retry(
+                    runtime.bot,
+                    chat_id,
+                    'Опишите общую проблему: что бот неверно понял, пропустил или спросил не по делу. '
+                    'Это не изменит текущий отчёт автоматически. Для отмены — /cancel.',
+                )
         except Exception as error:
             await send_with_retry(runtime.bot, chat_id, user_error(error))

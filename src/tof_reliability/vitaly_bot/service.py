@@ -15,6 +15,7 @@ from .models import BotConfig, EvidenceError, ModelError, ModelResult, StateErro
 from .profile import VitalyProfile
 from .storage import VitalyStore
 from .corrections import Corrections, correct_point
+from .learning_runtime import LearningManager, LearningOutcome
 
 
 class StructuredRunner(Protocol):
@@ -166,17 +167,24 @@ class VitalyService:
         self.documents = DocumentProcessor(store)
         self.runner: StructuredRunner = runner or CodexRunner(config)
         self.evidence_provider: EvidenceProvider = evidence_provider or RemoteLedgerEvidenceProvider(config)
+        self.learning = LearningManager(store, profile, config, self.runner)
 
     def new_case(self, chat_id: int) -> Dict[str, Any]:
-        return self.store.create_case(chat_id, self.profile.version)
+        version, package_id = self.learning.profile_version_for_new_case()
+        return self.store.new_case_if_idle(chat_id, version, package_id)
 
     def active_case(self, chat_id: int) -> Dict[str, Any]:
-        return self.store.active_case(chat_id, self.profile.version)
+        version, package_id = self.learning.profile_version_for_new_case()
+        return self.store.active_case(chat_id, version, package_id)
 
     def case_for_user(self, chat_id: int) -> Tuple[Dict[str, Any], Optional[str]]:
         """Activate a user context and report whether the previous one expired."""
 
-        return self.store.activate_case_for_user(chat_id, self.profile.version, self.config.context_ttl_days)
+        version, package_id = self.learning.profile_version_for_new_case()
+        return self.store.activate_case_for_user(chat_id, version, self.config.context_ttl_days, package_id)
+
+    def profile_for_case(self, case_id: str) -> VitalyProfile:
+        return self.learning.profile_for_case(case_id)
 
     async def _model(
         self,
@@ -238,11 +246,15 @@ class VitalyService:
         self.store.set_evidence_pack(case_id, pack, fingerprint)
         return pack
 
-    def _base_prompt(self) -> str:
+    def _base_prompt(self, case_id: Optional[str] = None) -> str:
+        profile = self.profile_for_case(case_id) if case_id else self.profile
+        analysis_rules = self.learning.analysis_rules_for_case(case_id) if case_id else []
         return (
-            "Ты — " + self.profile.simulator_label + ". Это симулятор, а не реальный человек. "
+            "Ты — " + profile.simulator_label + ". Это симулятор, а не реальный человек. "
             "Не имитируй дословные реплики и не приписывай ему мнения вне профиля.\n"
-            "Профиль поведения:\n" + _json(self.profile.prompt_context())
+            "Профиль поведения:\n" + _json(profile.prompt_context())
+            + "\nВерсионируемые правила анализа (применяй только в указанной области, не превращай их в факты):\n"
+            + _json(analysis_rules)
         )
 
     async def _material_map(self, case_id: str, job_id: str) -> Dict[str, Any]:
@@ -259,7 +271,7 @@ class VitalyService:
         maps = []
         for number, chunk in enumerate(chunks, start=1):
             prompt = (
-                self._base_prompt()
+                self._base_prompt(case_id)
                 + "\nСоставь нейтральную карту этого фрагмента для последующей проверки: утверждения, числа, пробелы. "
                 + "Не придумывай фактов.\nФрагмент " + str(number) + ":\n" + chunk
             )
@@ -276,7 +288,7 @@ class VitalyService:
         self.store.set_activity(case_id, "processing_materials", "Собираю карту утверждений и чисел")
         material_map = await self._material_map(case_id, job_id)
         prompt = (
-            self._base_prompt()
+            self._base_prompt(case_id)
             + "\nПроверь подготовленные материалы перед встречей. Сначала назови только проверяемые пробелы и противоречия. "
             + "Затем сформируй до 12 наиболее вероятных неудобных вопросов. Для topic выбери один из topic_id профиля. "
             + "В profile_evidence указывай только идентификаторы встреч из профиля. "
@@ -289,9 +301,9 @@ class VitalyService:
         )
         review = _validate_review(
             await self._model(
-                case_id, job_id, "review", prompt, review_schema(self.profile), self.documents.selected_images(case_id)
+                case_id, job_id, "review", prompt, review_schema(self.profile_for_case(case_id)), self.documents.selected_images(case_id)
             ),
-            self.profile,
+            self.profile_for_case(case_id),
         )
         self.store.set_review(case_id, review)
         return review
@@ -335,7 +347,7 @@ class VitalyService:
         evidence_pack = await self._evidence_pack(case_id)
         material_map = await self._material_map(case_id, job_id)
         prompt = (
-            self._base_prompt()
+            self._base_prompt(case_id)
             + "\nОцени ответ сотрудника на вопрос перед встречей. Будь прямым и коротким. "
             + "Если ответ не закрывает главный риск, сформулируй ровно один короткий followup_question; иначе оставь его пустой строкой. "
             + "При partial, incorrect или not_confirmed обязательно сформулируй correct_answer. Он может опираться только на evidence-пакет "
@@ -373,7 +385,7 @@ class VitalyService:
         if not turns:
             raise StateError("Для итогового разбора нужен хотя бы один ответ в репетиции")
         prompt = (
-            self._base_prompt()
+            self._base_prompt(case_id)
             + "\nСделай итоговый разбор репетиции. Оцени доказательность, конкретность, владение цифрами, "
             + "причинно-следственную связь и готовность назвать владельца и срок. Не добавляй фактов.\n"
             + "Актуальный аудит:\n" + _json(self.corrections.effective(case_id))
@@ -389,6 +401,9 @@ class VitalyService:
         kind = job["kind"]
         if kind == "review_correction":
             result = await correct_point(self, job)
+            self.store.capture_point_correction(
+                job["case_id"], job["id"], result, self.corrections.record(job["id"])
+            )
             return JobOutcome("review_correction", job["case_id"], result)
         if kind == "review":
             review = await self.review_case(job["case_id"], job["id"])
@@ -400,6 +415,10 @@ class VitalyService:
         if kind == "finish":
             return await self.finish_grill(job["case_id"], job["id"])
         raise StateError("Неизвестный тип задачи")
+
+    async def execute_learning(self, job: Dict[str, Any]) -> JobOutcome:
+        outcome: LearningOutcome = await self.learning.execute(job)
+        return JobOutcome(outcome.kind, "", outcome.payload)
 
 
 CompletionHandler = Callable[[Dict[str, Any], JobOutcome], Awaitable[None]]
@@ -434,29 +453,50 @@ class FifoWorker:
 
     async def _loop(self) -> None:
         while not self._stopping:
-            job = self.store.next_queued_job()
+            job = self.store.next_queued_work()
             if job is None:
                 self._wake.clear()
                 await self._wake.wait()
                 continue
             try:
-                self.store.mark_job_running(job["id"])
-                outcome = await self.service.execute(job)
+                self.store.mark_work_running(job)
+                outcome = (
+                    await self.service.execute_learning(job)
+                    if job.get("scope") == "learning"
+                    else await self.service.execute(job)
+                )
             except Exception as error:
                 code = error.code if isinstance(error, (ModelError, EvidenceError)) else str(error)
-                self.store.finish_job(job["id"], code)
+                self.store.finish_work(job, code)
                 detail = error.detail if isinstance(error, (ModelError, EvidenceError)) else str(error)
-                self.store.set_error(job["case_id"], code, detail)
+                if job.get("scope") != "learning":
+                    self.store.set_error(job["case_id"], code, detail)
+                    self.store.record_learning_event(
+                        "case_job_failed", "job", str(job["id"]), status="failed", chat_id=int(job["chat_id"]), error_code=code,
+                        detail={"kind": job["kind"]},
+                    )
+                else:
+                    self.store.mark_learning_submission_failed(str(job["id"]), code)
+                    self.store.record_learning_event(
+                        "learning_job_failed", "learning_job", str(job["id"]), status="failed", chat_id=int(job["chat_id"]),
+                        user_id=job.get("user_id"), error_code=code,
+                    )
                 await self.failed(job, error)
             else:
-                self.store.finish_job(job["id"])
+                self.store.finish_work(job)
                 try:
                     await self.completed(job, outcome)
                 except Exception as error:
-                    self.store.set_error(job["case_id"], "telegram_delivery_failed")
+                    if job.get("scope") != "learning":
+                        self.store.set_error(job["case_id"], "telegram_delivery_failed")
                     try:
                         await self.failed(job, error)
                     except Exception:
                         pass
                 else:
-                    self.store.set_error(job["case_id"], None)
+                    if job.get("scope") != "learning":
+                        self.store.set_error(job["case_id"], None)
+                        self.store.record_learning_event(
+                            "case_job_completed", "job", str(job["id"]), status="completed", chat_id=int(job["chat_id"]),
+                            detail={"kind": job["kind"]},
+                        )
