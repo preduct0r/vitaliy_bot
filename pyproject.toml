@@ -1,0 +1,15 @@
+[project]
+name = "vitaliy-bot"
+version = "0.1.0"
+requires-python = ">=3.10,<3.12"
+dependencies = ["aiogram==3.30.0", "pillow>=11.3,<13"]
+[project.optional-dependencies]
+dev = ["pytest>=8.3.3,<9"]
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+[tool.hatch.build.targets.wheel]
+packages = ["src/tof_reliability", "scripts"]
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]

@@ -1,0 +1,15 @@
+{
+  "tof_commit": "cd4b3740986327ffc9a520be0f8a7004b56cd3a4",
+  "source_paths": [
+    "src/tof_reliability/vitaly_bot",
+    "scripts/artifact_qa.py",
+    "scripts/context_normalization.py",
+    "scripts/run_vitaly_bot.py",
+    "scripts/install_vitaly_bot_launch_agent.py",
+    "scripts/evaluate_vitaly_profile_holdout.py",
+    "docs/VITALY_TELEGRAM_BOT.md",
+    "discussions/vitaly",
+    "tests/test_context_normalization.py",
+    "tests/test_artifact_qa.py"
+  ]
+}

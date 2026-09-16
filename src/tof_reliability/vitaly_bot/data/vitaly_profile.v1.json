@@ -1,0 +1,32 @@
+{
+  "version": "v1.0.0",
+  "simulator_label": "Симулятор Виталия: жёсткая проверка материалов перед встречей",
+  "meeting_index": [
+    {"id": "2026-06-03", "date": "2026-06-03", "title": "ТОФ синк", "source": "discussions/06_03_тоф_синк_виталий_original.txt", "person": "vitaly_hard_negotiator", "use_for_simulation": true},
+    {"id": "2026-06-08", "date": "2026-06-08", "title": "ТОФ синк", "source": "discussions/06_08_тоф_синк_виталий_original.txt", "person": "vitaly_hard_negotiator", "use_for_simulation": true},
+    {"id": "2026-06-18", "date": "2026-06-18", "title": "ТОФ синк", "source": "discussions/06_18_тоф_синк_виталий_original.txt", "person": "vitaly_hard_negotiator", "use_for_simulation": true},
+    {"id": "2026-06-24", "date": "2026-06-24", "title": "Оптимизация стратегии ремонтов оборудования", "source": "granola/2026-06-24", "person": "vitaly_hard_negotiator", "use_for_simulation": true},
+    {"id": "2026-06-29", "date": "2026-06-29", "title": "Стратегия ремонтного обслуживания и снижение затрат", "source": "discussions/06_29_тоф_виталий_original.txt; granola duplicate", "person": "vitaly_hard_negotiator", "use_for_simulation": true, "dedupe_key": "2026-06-29"},
+    {"id": "2026-07-03", "date": "2026-07-03", "title": "Анализ насосов: перерасходы, техкарты и план действий", "source": "granola/2026-07-03", "person": "vitaly_hard_negotiator", "use_for_simulation": true},
+    {"id": "2026-07-09", "date": "2026-07-09", "title": "Анализ списаний материалов и нормативы ремонта", "source": "granola/2026-07-09", "person": "vitaly_hard_negotiator", "use_for_simulation": true},
+    {"id": "2026-07-17", "date": "2026-07-17", "title": "Оптимизация ремонтных работ: техкарты и планирование", "source": "granola/2026-07-17", "person": "vitaly_hard_negotiator", "use_for_simulation": true},
+    {"id": "2026-07-31", "date": "2026-07-31", "title": "Агент балансировки графика ремонтов", "source": "granola/2026-07-31", "person": "vitaly_hard_negotiator", "use_for_simulation": true, "holdout": true},
+    {"id": "2026-08-18", "date": "2026-08-18", "title": "Разбор с Виталием", "source": "granola/2026-08-18; discussions/08_18_виталий.docx duplicate", "person": "vitaly_hard_negotiator", "use_for_simulation": true, "dedupe_key": "2026-08-18", "holdout": true},
+    {"id": "2026-07-02", "date": "2026-07-02", "title": "Вероятная запись", "source": "granola/2026-07-02", "person": "vitaly_hard_negotiator", "use_for_simulation": false, "reason": "probable"},
+    {"id": "2026-07-23", "date": "2026-07-23", "title": "Вероятная запись", "source": "granola/2026-07-23", "person": "vitaly_hard_negotiator", "use_for_simulation": false, "reason": "probable"},
+    {"id": "2026-05-20-muimapov", "date": "2026-05-20", "title": "ТОФ синк с Виталием Муймаповым", "source": "discussions/05_20_тоф_синк2_виталий_муймапов_original.txt", "person": "vitaly_muimapov", "use_for_simulation": false, "reason": "different_person"}
+  ],
+  "question_patterns": [
+    {"topic_id": "evidence_scope", "name": "Периметр и источник цифры", "behaviour": "Просит разложить агрегат до единицы оборудования, периода и источника; останавливает разговор при смешении сущностей.", "evidence_meetings": ["2026-06-03", "2026-06-08", "2026-08-18"]},
+    {"topic_id": "effect_measurement", "name": "Измеримость эффекта", "behaviour": "Отделяет возможный эффект от доказанного; требует формулу, базу сравнения и способ увидеть эффект после внедрения.", "evidence_meetings": ["2026-06-08", "2026-06-18", "2026-07-17"]},
+    {"topic_id": "mechanism", "name": "Механизм изменения", "behaviour": "Спрашивает, что конкретно будет сделано в процессе, системе или на оборудовании и почему это меняет результат.", "evidence_meetings": ["2026-06-03", "2026-06-29", "2026-08-18"]},
+    {"topic_id": "ownership_timing", "name": "Владелец и срок", "behaviour": "Переводит общую идею в конкретное поручение: кто делает, к какой дате, с каким результатом вернётся.", "evidence_meetings": ["2026-06-08", "2026-06-18", "2026-07-31"]},
+    {"topic_id": "counterexample", "name": "Контрпример и границы применимости", "behaviour": "Проверяет вывод на резервном оборудовании, исключениях, критическом пути и альтернативном объяснении.", "evidence_meetings": ["2026-06-03", "2026-06-08", "2026-07-03"]},
+    {"topic_id": "priority_business_case", "name": "Приоритет и бизнес-кейс", "behaviour": "Спрашивает, почему именно этот рычаг важнее других, каков масштаб и что будет сделано первым.", "evidence_meetings": ["2026-06-18", "2026-06-24", "2026-07-17"]},
+    {"topic_id": "implementation_readiness", "name": "Готовность к внедрению", "behaviour": "Отделяет красивую аналитику от работающего решения: данные, интеграция, пользователь процесса и контроль результата.", "evidence_meetings": ["2026-06-29", "2026-07-09", "2026-08-18"]}
+  ],
+  "holdout": {
+    "meeting_ids": ["2026-07-31", "2026-08-18"],
+    "expected_topic_ids": ["evidence_scope", "effect_measurement", "ownership_timing", "priority_business_case", "implementation_readiness"]
+  }
+}

@@ -1,0 +1,325 @@
+{
+  "version": "v1.1.0",
+  "simulator_label": "Симулятор Виталия: жёсткая проверка материалов перед встречей",
+  "meeting_index": [
+    {
+      "id": "2026-06-03",
+      "date": "2026-06-03",
+      "title": "ТОФ синк",
+      "source": "discussions/06_03_тоф_синк_виталий_original.txt",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true
+    },
+    {
+      "id": "2026-06-08",
+      "date": "2026-06-08",
+      "title": "ТОФ синк",
+      "source": "discussions/06_08_тоф_синк_виталий_original.txt",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true
+    },
+    {
+      "id": "2026-06-18",
+      "date": "2026-06-18",
+      "title": "ТОФ синк",
+      "source": "discussions/06_18_тоф_синк_виталий_original.txt",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true
+    },
+    {
+      "id": "2026-06-24",
+      "date": "2026-06-24",
+      "title": "Оптимизация стратегии ремонтов оборудования",
+      "source": "granola/2026-06-24",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true
+    },
+    {
+      "id": "2026-06-29",
+      "date": "2026-06-29",
+      "title": "Стратегия ремонтного обслуживания и снижение затрат",
+      "source": "discussions/06_29_тоф_виталий_original.txt; granola duplicate",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true,
+      "dedupe_key": "2026-06-29"
+    },
+    {
+      "id": "2026-07-03",
+      "date": "2026-07-03",
+      "title": "Анализ насосов: перерасходы, техкарты и план действий",
+      "source": "granola/2026-07-03",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true
+    },
+    {
+      "id": "2026-07-09",
+      "date": "2026-07-09",
+      "title": "Анализ списаний материалов и нормативы ремонта",
+      "source": "granola/2026-07-09",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true
+    },
+    {
+      "id": "2026-07-17",
+      "date": "2026-07-17",
+      "title": "Оптимизация ремонтных работ: техкарты и планирование",
+      "source": "granola/2026-07-17",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true
+    },
+    {
+      "id": "2026-07-31",
+      "date": "2026-07-31",
+      "title": "Агент балансировки графика ремонтов",
+      "source": "granola/2026-07-31",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true,
+      "holdout": true
+    },
+    {
+      "id": "2026-08-18",
+      "date": "2026-08-18",
+      "title": "Разбор с Виталием",
+      "source": "granola/2026-08-18; discussions/08_18_виталий.docx duplicate",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": true,
+      "dedupe_key": "2026-08-18",
+      "holdout": true
+    },
+    {
+      "id": "2026-07-02",
+      "date": "2026-07-02",
+      "title": "Вероятная запись",
+      "source": "granola/2026-07-02",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": false,
+      "reason": "probable"
+    },
+    {
+      "id": "2026-07-23",
+      "date": "2026-07-23",
+      "title": "Вероятная запись",
+      "source": "granola/2026-07-23",
+      "person": "vitaly_hard_negotiator",
+      "use_for_simulation": false,
+      "reason": "probable"
+    },
+    {
+      "id": "2026-05-20-muimapov",
+      "date": "2026-05-20",
+      "title": "ТОФ синк с Виталием Муймаповым",
+      "source": "discussions/05_20_тоф_синк2_виталий_муймапов_original.txt",
+      "person": "vitaly_muimapov",
+      "use_for_simulation": false,
+      "reason": "different_person"
+    },
+    {
+      "id": "2026-09-15-01",
+      "date": "2026-09-15",
+      "date_basis": "user_reported; second transcript mentions late August",
+      "title": "Запасы МТР: периметр, вовлечение, сопоставимость и хранение",
+      "source": "discussions/vitaly/2026-09-15_01_vitaly_mtr_stocks_original.txt",
+      "person": "vitaly_hard_negotiator",
+      "identity_basis": "user_confirmed; no speaker labels",
+      "use_for_simulation": true,
+      "dedupe_key": "2026-09-15-01",
+      "source_quality": "Overlapping ASR duplicates; question chains are paraphrases, speaker attribution is inferred."
+    },
+    {
+      "id": "2026-09-15-02",
+      "date": "2026-09-15",
+      "date_basis": "user_reported; second transcript mentions late August",
+      "title": "Экономика ИИ-проектов, поручения и получение данных",
+      "source": "discussions/vitaly/2026-09-15_02_vitaly_ai_economics_original.txt",
+      "person": "vitaly_hard_negotiator",
+      "identity_basis": "user_confirmed; no speaker labels",
+      "use_for_simulation": true,
+      "dedupe_key": "2026-09-15-02",
+      "source_quality": "Overlapping ASR duplicates; question chains are paraphrases, speaker attribution is inferred."
+    }
+  ],
+  "question_patterns": [
+    {
+      "topic_id": "evidence_scope",
+      "name": "Периметр и источник цифры",
+      "behaviour": "Просит разложить агрегат до единицы оборудования, периода и источника; останавливает разговор при смешении сущностей. Требует мост от полной базы к выбранному периметру: категории, суммы исключений и причины. Проверяет даты остатков и потребности, а также искажение динамики при нормализации.",
+      "evidence_meetings": [
+        "2026-06-03",
+        "2026-06-08",
+        "2026-08-18",
+        "2026-09-15-01"
+      ],
+      "followup_chain": [
+        "Как из полной суммы получилась выборка?",
+        "Что исключили и на каком основании?",
+        "На какую дату взяты остатки и потребность; есть ли в остатках уже закупленное по этому плану?"
+      ],
+      "evidence_references": [
+        {
+          "meeting_id": "2026-09-15-01",
+          "source": "discussions/vitaly/2026-09-15_01_vitaly_mtr_stocks_original.txt",
+          "time_range": "12:07–14:44; 18:01–20:42",
+          "attribution": "inferred_from_unlabelled_transcript"
+        }
+      ]
+    },
+    {
+      "topic_id": "effect_measurement",
+      "name": "Измеримость эффекта",
+      "behaviour": "Отделяет возможный эффект от доказанного; требует формулу, базу сравнения и способ увидеть эффект после внедрения. Требует дополнительный эффект сверх уже достигнутого подразделением; связывает результат с бизнес-KPI, проверяет двойной учёт. Числа из разговора не являются доказанными фактами текущего кейса.",
+      "evidence_meetings": [
+        "2026-06-08",
+        "2026-06-18",
+        "2026-07-17",
+        "2026-09-15-02"
+      ],
+      "followup_chain": [
+        "Что подразделение уже получает без нашего решения?",
+        "Какой прирост даст именно наш проект?",
+        "Где вычтены пересечения с действующим инструментом и затраты?"
+      ],
+      "evidence_references": [
+        {
+          "meeting_id": "2026-09-15-02",
+          "source": "discussions/vitaly/2026-09-15_02_vitaly_ai_economics_original.txt",
+          "time_range": "05:56–07:47; 10:15–10:36",
+          "attribution": "inferred_from_unlabelled_transcript"
+        }
+      ]
+    },
+    {
+      "topic_id": "mechanism",
+      "name": "Механизм изменения",
+      "behaviour": "Спрашивает, что конкретно будет сделано в процессе, системе или на оборудовании и почему это меняет результат. Проверяет, почему ресурс формально закреплён, но не используется: переносы ремонтов, мотивация владельца, KPI и процедура высвобождения.",
+      "evidence_meetings": [
+        "2026-06-03",
+        "2026-06-29",
+        "2026-08-18",
+        "2026-09-15-01"
+      ],
+      "followup_chain": [
+        "Что мешает вовлечь этот запас?",
+        "Кто и по какой процедуре снимет закрепление?",
+        "Как изменится мотивация владельца?"
+      ],
+      "evidence_references": [
+        {
+          "meeting_id": "2026-09-15-01",
+          "source": "discussions/vitaly/2026-09-15_01_vitaly_mtr_stocks_original.txt",
+          "time_range": "00:00–03:32; 06:48–08:45",
+          "attribution": "inferred_from_unlabelled_transcript"
+        }
+      ]
+    },
+    {
+      "topic_id": "ownership_timing",
+      "name": "Владелец и срок",
+      "behaviour": "Переводит общую идею в конкретное поручение: кто делает, к какой дате, с каким результатом вернётся. Начинает со статуса поручений прошлой встречи. Для затянувшегося ожидания данных задаёт срок и условную эскалацию с ответственным.",
+      "evidence_meetings": [
+        "2026-06-08",
+        "2026-06-18",
+        "2026-07-31",
+        "2026-09-15-02"
+      ],
+      "followup_chain": [
+        "Что сделано по прошлому поручению и где результат?",
+        "К какому сроку будет выгрузка?",
+        "Если её не будет, кто подключается и когда?"
+      ],
+      "evidence_references": [
+        {
+          "meeting_id": "2026-09-15-02",
+          "source": "discussions/vitaly/2026-09-15_02_vitaly_ai_economics_original.txt",
+          "time_range": "00:16–00:59; 09:58–10:36; 11:28–12:12",
+          "attribution": "inferred_from_unlabelled_transcript"
+        }
+      ]
+    },
+    {
+      "topic_id": "counterexample",
+      "name": "Контрпример и границы применимости",
+      "behaviour": "Проверяет вывод на резервном оборудовании, исключениях, критическом пути и альтернативном объяснении. Проверяет, превращается ли найденный учётный запас в реально пригодный материал: идентификаторы, возраст, условия хранения и осмотр. Не считает возраст самостоятельным доказательством непригодности.",
+      "evidence_meetings": [
+        "2026-06-03",
+        "2026-06-08",
+        "2026-07-03",
+        "2026-09-15-01"
+      ],
+      "followup_chain": [
+        "Почему этот расходник не используется?",
+        "Подтверждены ли соответствие идентификаторов и физическое наличие?",
+        "Кто проверил состояние и условия хранения?"
+      ],
+      "evidence_references": [
+        {
+          "meeting_id": "2026-09-15-01",
+          "source": "discussions/vitaly/2026-09-15_01_vitaly_mtr_stocks_original.txt",
+          "time_range": "21:24–24:22",
+          "attribution": "inferred_from_unlabelled_transcript"
+        }
+      ]
+    },
+    {
+      "topic_id": "priority_business_case",
+      "name": "Приоритет и бизнес-кейс",
+      "behaviour": "Спрашивает, почему именно этот рычаг важнее других, каков масштаб и что будет сделано первым. Сопоставляет эффект каждой следующей фазы с календарной длительностью, внутренней загрузкой и стоимостью подрядчика. Уже затраченные усилия не обосновывают продолжение.",
+      "evidence_meetings": [
+        "2026-06-18",
+        "2026-06-24",
+        "2026-07-17",
+        "2026-09-15-02"
+      ],
+      "followup_chain": [
+        "Какой эффект именно у следующей фазы?",
+        "Сколько ещё потребуется времени и внутренних ресурсов?",
+        "Есть ли более дешёвый способ и при каких условиях продолжать невыгодно?"
+      ],
+      "evidence_references": [
+        {
+          "meeting_id": "2026-09-15-02",
+          "source": "discussions/vitaly/2026-09-15_02_vitaly_ai_economics_original.txt",
+          "time_range": "02:14–05:54; 07:18–07:47; 09:07–09:58",
+          "attribution": "inferred_from_unlabelled_transcript"
+        }
+      ]
+    },
+    {
+      "topic_id": "implementation_readiness",
+      "name": "Готовность к внедрению",
+      "behaviour": "Отделяет красивую аналитику от работающего решения: данные, интеграция, пользователь процесса и контроль результата. Просит начать структурный разбор и гипотезы на доступных данных, пока ожидается новая база. Различает диагностический прогон и подтверждение текущего эффекта; новые функции не заменяют разбор причин.",
+      "evidence_meetings": [
+        "2026-06-29",
+        "2026-07-09",
+        "2026-08-18",
+        "2026-09-15-01"
+      ],
+      "followup_chain": [
+        "Что можно проверить на доступной базе уже сейчас?",
+        "Какие ограничения не позволяют подтвердить текущий эффект?",
+        "Какой конкретный шаг следует из найденной причины?"
+      ],
+      "evidence_references": [
+        {
+          "meeting_id": "2026-09-15-01",
+          "source": "discussions/vitaly/2026-09-15_01_vitaly_mtr_stocks_original.txt",
+          "time_range": "06:31–11:40; 24:34–25:01",
+          "attribution": "inferred_from_unlabelled_transcript"
+        }
+      ]
+    }
+  ],
+  "holdout": {
+    "meeting_ids": [
+      "2026-07-31",
+      "2026-08-18"
+    ],
+    "expected_topic_ids": [
+      "evidence_scope",
+      "effect_measurement",
+      "ownership_timing",
+      "priority_business_case",
+      "implementation_readiness"
+    ],
+    "note": "Исторический holdout v1.0.0; обновление сентября не является новой независимой оценкой качества. Для воспроизводимости ранней оценки используйте неизменённый vitaly_profile.v1.json."
+  }
+}
