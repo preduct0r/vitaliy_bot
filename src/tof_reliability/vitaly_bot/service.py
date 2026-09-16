@@ -438,7 +438,7 @@ class FifoWorker:
         self._stopping = False
 
     async def start(self) -> None:
-        self.store.recover_jobs()
+        self.store.recover_jobs(automatic_run_hour=self.service.config.learning_run_hour)
         self._task = asyncio.create_task(self._loop(), name="vitaly-bot-model-worker")
         self._wake.set()
 
@@ -453,13 +453,14 @@ class FifoWorker:
 
     async def _loop(self) -> None:
         while not self._stopping:
-            job = self.store.next_queued_work()
+            job = self.store.next_queued_work(automatic_run_hour=self.service.config.learning_run_hour)
             if job is None:
                 self._wake.clear()
                 await self._wake.wait()
                 continue
             try:
-                self.store.mark_work_running(job)
+                if not self.store.mark_work_running(job, automatic_run_hour=self.service.config.learning_run_hour):
+                    continue
                 outcome = (
                     await self.service.execute_learning(job)
                     if job.get("scope") == "learning"
@@ -467,15 +468,17 @@ class FifoWorker:
                 )
             except Exception as error:
                 code = error.code if isinstance(error, (ModelError, EvidenceError)) else str(error)
-                self.store.finish_work(job, code)
                 detail = error.detail if isinstance(error, (ModelError, EvidenceError)) else str(error)
                 if job.get("scope") != "learning":
+                    self.store.finish_work(job, code)
                     self.store.set_error(job["case_id"], code, detail)
                     self.store.record_learning_event(
                         "case_job_failed", "job", str(job["id"]), status="failed", chat_id=int(job["chat_id"]), error_code=code,
                         detail={"kind": job["kind"]},
                     )
                 else:
+                    # This method commits the learning job failure and a
+                    # linked candidate failure in one SQLite transaction.
                     self.store.mark_learning_submission_failed(str(job["id"]), code)
                     self.store.record_learning_event(
                         "learning_job_failed", "learning_job", str(job["id"]), status="failed", chat_id=int(job["chat_id"]),

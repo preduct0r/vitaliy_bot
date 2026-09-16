@@ -18,6 +18,14 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _local_now(now: Optional[datetime] = None) -> datetime:
+    """Return the Mac-local clock, while keeping injected test zones stable."""
+
+    if now is None:
+        return datetime.now().astimezone()
+    return now.astimezone() if now.tzinfo is None else now
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
@@ -908,7 +916,7 @@ class VitalyStore:
         now: str,
         status: str = "queued",
     ) -> str:
-        if status not in {"queued", "paused"}:
+        if status not in {"queued", "paused", "scheduled"}:
             raise ValueError("Недопустимое состояние новой фоновой задачи")
         job_id = uuid.uuid4().hex
         connection.execute(
@@ -971,7 +979,9 @@ class VitalyStore:
             result.append(value)
         return result
 
-    def next_queued_work(self) -> Optional[Dict[str, Any]]:
+    def next_queued_work(
+        self, *, automatic_run_hour: Optional[int] = None, now: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
         """Return the next model invocation without letting background work delay a person.
 
         Once a model run has started it is never cancelled, but after every run
@@ -980,6 +990,16 @@ class VitalyStore:
         """
 
         with self._connect() as connection:
+            if automatic_run_hour is not None and (
+                not 0 <= automatic_run_hour <= 23 or _local_now(now).hour != automatic_run_hour
+            ):
+                # A generator or verifier may lose the worker race to a
+                # person near the end of the 04:00 window.  Keep that next
+                # model step for tomorrow rather than starting it in daytime.
+                connection.execute(
+                    """UPDATE learning_jobs SET status = 'scheduled'
+                       WHERE status = 'queued' AND kind IN ('knowledge_generate', 'knowledge_verify')"""
+                )
             row = connection.execute(
                 "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id LIMIT 1"
             ).fetchone()
@@ -1026,20 +1046,46 @@ class VitalyStore:
             active_job_id=job_id,
         )
 
-    def mark_learning_job_running(self, job_id: str) -> None:
+    def mark_learning_job_running(
+        self, job_id: str, *, automatic_run_hour: Optional[int] = None, now: Optional[datetime] = None
+    ) -> bool:
         with self._connect() as connection:
+            # Take the write lock before reading the clock.  Otherwise a
+            # 04:59 check can wait behind another writer and admit a model
+            # invocation after 05:00.
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute("SELECT kind, status FROM learning_jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None or job["status"] != "queued":
+                raise StateError("Фоновая задача уже не ожидает запуска")
+            if (
+                job["kind"] in {"knowledge_generate", "knowledge_verify"}
+                and automatic_run_hour is not None
+                and (
+                    not 0 <= automatic_run_hour <= 23
+                    or _local_now(now).hour != automatic_run_hour
+                )
+            ):
+                # Check the schedule again at admission time: a job can be
+                # selected at 04:59:59 and reach this write after 05:00.
+                connection.execute(
+                    "UPDATE learning_jobs SET status = 'scheduled' WHERE id = ? AND status = 'queued'",
+                    (job_id,),
+                )
+                return False
             result = connection.execute(
                 "UPDATE learning_jobs SET status = 'running', attempts = attempts + 1, started_at = ? WHERE id = ? AND status = 'queued'",
                 (_utc_now(), job_id),
             )
         if result.rowcount != 1:
             raise StateError("Фоновая задача уже не ожидает запуска")
+        return True
 
-    def mark_work_running(self, job: Dict[str, Any]) -> None:
+    def mark_work_running(self, job: Dict[str, Any], *, automatic_run_hour: Optional[int] = None) -> bool:
         if job.get("scope") == "learning":
-            self.mark_learning_job_running(str(job["id"]))
+            return self.mark_learning_job_running(str(job["id"]), automatic_run_hour=automatic_run_hour)
         else:
             self.mark_job_running(str(job["id"]))
+            return True
 
     def finish_job(self, job_id: str, error: Optional[str] = None) -> None:
         status = "failed" if error else "completed"
@@ -1076,7 +1122,21 @@ class VitalyStore:
             case = self.get_case(case_id)
             self.record_learning_event("grill_finished", "case", case_id, status="finished", chat_id=int(case["chat_id"]))
 
-    def recover_jobs(self) -> List[Dict[str, Any]]:
+    def recover_jobs(
+        self, *, automatic_run_hour: Optional[int] = None, now: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """Recover interrupted work without turning a 04:00 task into daytime work.
+
+        ``automatic_run_hour`` is supplied only by the production worker.  The
+        optional argument preserves the generic storage-recovery API for tools
+        and migration tests that do not own a scheduler.
+        """
+
+        local_now = _local_now(now)
+        automatic_in_window = (
+            automatic_run_hour is None
+            or (0 <= automatic_run_hour <= 23 and local_now.hour == automatic_run_hour)
+        )
         with self._connect() as connection:
             connection.execute("UPDATE jobs SET status = 'queued', started_at = NULL WHERE status = 'running'")
             connection.execute(
@@ -1096,18 +1156,110 @@ class VitalyStore:
             control = connection.execute(
                 "SELECT auto_update_paused FROM learning_control WHERE id = 1"
             ).fetchone()
-            learning_status = "paused" if control is not None and int(control["auto_update_paused"] or 0) else "queued"
+            learning_status = (
+                "paused"
+                if control is not None and int(control["auto_update_paused"] or 0)
+                else ("queued" if automatic_in_window else "scheduled")
+            )
             connection.execute(
                 "UPDATE learning_jobs SET status = ?, started_at = NULL WHERE status = 'running' AND kind IN ('knowledge_generate', 'knowledge_verify')",
                 (learning_status,),
             )
+            if learning_status == "queued":
+                connection.execute(
+                    """UPDATE learning_jobs SET status = 'queued', started_at = NULL
+                       WHERE status = 'scheduled' AND kind IN ('knowledge_generate', 'knowledge_verify')"""
+                )
+            elif learning_status == "scheduled":
+                connection.execute(
+                    """UPDATE learning_jobs SET status = 'scheduled', started_at = NULL
+                       WHERE status = 'queued' AND kind IN ('knowledge_generate', 'knowledge_verify')"""
+                )
             connection.execute(
                 "UPDATE learning_jobs SET status = 'queued', started_at = NULL WHERE status = 'running' AND kind NOT IN ('knowledge_generate', 'knowledge_verify')"
             )
+            # Older releases persisted candidate creation and verifier queueing
+            # in separate transactions.  Repair an interrupted legacy write
+            # before the worker makes any selection, preserving the selected
+            # sources instead of allowing them to be consumed forever.  A
+            # failed verifier is a terminal result, however: never spend a
+            # second model call retrying a recorded permanent failure.
+            verification_candidates = connection.execute(
+                """SELECT id, source_ids_json, verification_json
+                   FROM learning_candidates WHERE status = 'candidate' ORDER BY generated_at, id"""
+            ).fetchall()
+            verification_jobs = connection.execute(
+                """SELECT payload_json, status, error, created_at, finished_at, id FROM learning_jobs
+                   WHERE kind = 'knowledge_verify'
+                   ORDER BY COALESCE(finished_at, created_at), id"""
+            ).fetchall()
+            verifications_by_candidate: Dict[str, List[sqlite3.Row]] = {}
+            for verification_job in verification_jobs:
+                candidate_id = str(_load_json(verification_job["payload_json"], {}).get("candidate_id") or "")
+                if candidate_id:
+                    verifications_by_candidate.setdefault(candidate_id, []).append(verification_job)
+            restored_candidate_ids: List[str] = []
+            terminalized_candidates: List[Tuple[str, str, str]] = []
+            recovery_now = _utc_now()
+            for candidate in verification_candidates:
+                candidate_id = str(candidate["id"])
+                candidate_jobs = verifications_by_candidate.get(candidate_id, [])
+                if any(job["status"] in {"scheduled", "queued", "running", "paused"} for job in candidate_jobs):
+                    continue
+                if not candidate_jobs:
+                    restored_candidate_ids.append(candidate_id)
+                    continue
+                failed_job = next((job for job in reversed(candidate_jobs) if job["status"] == "failed"), None)
+                if failed_job is not None:
+                    candidate_status = "failed"
+                    error = str(failed_job["error"] or "verification_failed")
+                    reason = "Проверка кандидата ранее завершилась с ошибкой; прежняя версия знаний сохранена."
+                    source_outcome = "verification_failed"
+                else:
+                    # A terminal verifier without a saved candidate result is
+                    # an interrupted legacy operation.  Do not infer success
+                    # or replay it: leave the package unchanged and surface a
+                    # recoverable clarification instead.
+                    candidate_status = "needs_clarification"
+                    error = "verification_result_missing"
+                    reason = "Проверка кандидата завершилась без сохранённого решения; автоматическое включение остановлено."
+                    source_outcome = "needs_clarification"
+                verification = _load_json(candidate["verification_json"], {})
+                verification.update({"stage": "verification", "reason": reason, "error_code": error})
+                connection.execute(
+                    """UPDATE learning_candidates
+                       SET status = ?, verification_json = ?, verified_at = ?, error = ?
+                       WHERE id = ? AND status = 'candidate'""",
+                    (candidate_status, _json(verification), recovery_now, error, candidate_id),
+                )
+                source_ids = [str(value) for value in _load_json(candidate["source_ids_json"], [])]
+                self._annotate_learning_sources_in_connection(
+                    connection, source_ids, source_outcome, None, recovery_now
+                )
+                terminalized_candidates.append((candidate_id, candidate_status, error))
+            for candidate_id in restored_candidate_ids:
+                self._insert_learning_job(
+                    connection,
+                    chat_id=0,
+                    user_id=None,
+                    kind="knowledge_verify",
+                    submission_id=None,
+                    payload={"candidate_id": candidate_id},
+                    now=_utc_now(),
+                    status=learning_status,
+                )
             rows = connection.execute("SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at, id").fetchall()
             learning_rows = connection.execute("SELECT id FROM learning_jobs WHERE status = 'queued' ORDER BY created_at, id").fetchall()
             result = [self.get_job(row["id"]) for row in rows]
             result.extend(self._get_learning_job(connection, row["id"]) for row in learning_rows)
+        for candidate_id in restored_candidate_ids:
+            self.record_learning_event(
+                "candidate_verification_recovered", "candidate", candidate_id, status=learning_status
+            )
+        for candidate_id, status, error in terminalized_candidates:
+            self.record_learning_event(
+                "candidate_" + status, "candidate", candidate_id, status=status, error_code=error
+            )
         return result
 
     def queue_position(self, job_id: str) -> int:
@@ -1375,14 +1527,15 @@ class VitalyStore:
             )
             if paused:
                 # A running model invocation is never killed, but the next
-                # automatic stage must wait for the operator to resume it.
+                # automatic stage must wait for the operator to resume the
+                # daily schedule.
                 connection.execute(
                     """UPDATE learning_jobs SET status = 'paused', finished_at = NULL
                        WHERE status = 'queued' AND kind IN ('knowledge_generate', 'knowledge_verify')"""
                 )
             else:
                 connection.execute(
-                    """UPDATE learning_jobs SET status = 'queued', finished_at = NULL
+                    """UPDATE learning_jobs SET status = 'scheduled', finished_at = NULL
                        WHERE status = 'paused' AND kind IN ('knowledge_generate', 'knowledge_verify')"""
                 )
         self.record_learning_event(
@@ -1823,7 +1976,7 @@ class VitalyStore:
         return meeting
 
     def mark_learning_submission_failed(self, job_id: str, error: str) -> None:
-        """Make failed intake terminal, so a later text cannot be misrouted.
+        """Atomically finalize a failed learning job and any linked candidate.
 
         The original source and detailed model-run failure stay in the archive.
         A user may start a fresh feedback or meeting intake after the explicit
@@ -1834,9 +1987,15 @@ class VitalyStore:
         now = _utc_now()
         failed_candidate: Optional[Tuple[str, List[str]]] = None
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             learning_job = connection.execute(
                 "SELECT kind, payload_json FROM learning_jobs WHERE id = ?", (job_id,)
             ).fetchone()
+            connection.execute(
+                """UPDATE learning_jobs SET status = 'failed', error = ?, finished_at = ?
+                   WHERE id = ? AND status IN ('queued', 'running')""",
+                (error, now, job_id),
+            )
             if learning_job is not None and learning_job["kind"] == "knowledge_verify":
                 candidate_id = str(_load_json(learning_job["payload_json"], {}).get("candidate_id") or "")
                 candidate = connection.execute(
@@ -2062,6 +2221,55 @@ class VitalyStore:
         self.record_learning_event("candidate_generated", "candidate", candidate_id, status="candidate", detail={"source_count": len(source_ids), "scope": scope})
         return self.get_learning_candidate(candidate_id)
 
+    def create_learning_candidate_with_verification(
+        self,
+        source_ids: Sequence[str],
+        patch: Dict[str, Any],
+        scope: str,
+        expected_improvement: str,
+        *,
+        baseline_package_id: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Atomically persist a candidate and its independent verifier job."""
+
+        if scope not in {"analysis", "behaviour", "mixed"}:
+            raise StateError("Некорректная область кандидата")
+        candidate_id = "lc-" + uuid.uuid4().hex
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """INSERT INTO learning_candidates(
+                       id, source_ids_json, patch_json, baseline_package_id, status, scope, expected_improvement, generated_at
+                   ) VALUES (?, ?, ?, ?, 'candidate', ?, ?, ?)""",
+                (
+                    candidate_id,
+                    _json(list(source_ids)),
+                    _json(patch),
+                    baseline_package_id,
+                    scope,
+                    expected_improvement[:1000],
+                    now,
+                ),
+            )
+            control = connection.execute("SELECT auto_update_paused FROM learning_control WHERE id = 1").fetchone()
+            status = "paused" if control is not None and int(control["auto_update_paused"] or 0) else "queued"
+            verification_job_id = self._insert_learning_job(
+                connection,
+                chat_id=0,
+                user_id=None,
+                kind="knowledge_verify",
+                submission_id=None,
+                payload={"candidate_id": candidate_id},
+                now=now,
+                status=status,
+            )
+        self.record_learning_event(
+            "candidate_generated", "candidate", candidate_id, status="candidate",
+            detail={"source_count": len(source_ids), "scope": scope},
+        )
+        return self.get_learning_candidate(candidate_id), self.get_learning_job(verification_job_id)
+
     def get_learning_candidate(self, candidate_id: str) -> Dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM learning_candidates WHERE id = ?", (candidate_id,)).fetchone()
@@ -2141,14 +2349,26 @@ class VitalyStore:
             )
         return {"id": run_id, "candidate_id": candidate_id, "baseline_package_id": baseline_package_id, "result": result, "passing": passing}
 
-    def due_learning_cycle(self, interval_seconds: int) -> bool:
-        if interval_seconds < 1:
+    def due_learning_cycle(self, run_hour: int, *, now: Optional[datetime] = None) -> bool:
+        """Whether the low-priority daily cycle may start in this local hour.
+
+        The calendar hour is intentionally evaluated in the Mac's current
+        timezone.  This prevents an elapsed 24-hour interval from slowly
+        moving the background model work into a user's daytime session.  A
+        busy queue does not cause a daytime catch-up run: the next opportunity
+        is tomorrow's configured hour.
+        """
+
+        if not 0 <= run_hour <= 23:
+            return False
+        local_now = _local_now(now)
+        if local_now.hour != run_hour:
             return False
         control = self.learning_control()
         if int(control.get("auto_update_paused") or 0):
             return False
         last = self._as_utc_datetime(str(control.get("last_cycle_at") or ""))
-        if last is not None and last >= datetime.now(timezone.utc) - timedelta(seconds=interval_seconds):
+        if last is not None and last.astimezone(local_now.tzinfo).date() >= local_now.date():
             return False
         with self._connect() as connection:
             user_work = connection.execute("SELECT 1 FROM jobs WHERE status IN ('queued', 'running') LIMIT 1").fetchone()
@@ -2158,19 +2378,42 @@ class VitalyStore:
                    LIMIT 1"""
             ).fetchone()
             running_learning = connection.execute("SELECT 1 FROM learning_jobs WHERE status = 'running' LIMIT 1").fetchone()
-        return user_work is None and user_learning is None and running_learning is None and bool(self.learning_sources())
+            automatic_learning = connection.execute(
+                """SELECT 1 FROM learning_jobs
+                   WHERE status IN ('scheduled', 'queued', 'running')
+                     AND kind IN ('knowledge_generate', 'knowledge_verify') LIMIT 1"""
+            ).fetchone()
+        return (
+            user_work is None
+            and user_learning is None
+            and running_learning is None
+            and automatic_learning is None
+            and bool(self.learning_sources())
+        )
 
-    def queue_learning_cycle(self) -> Optional[Dict[str, Any]]:
-        """Atomically request one generator cycle; duplicate schedulers cannot race."""
+    def queue_learning_cycle(self, run_hour: int, *, now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """Atomically queue the daily cycle without allowing off-hour catch-up."""
 
-        now = _utc_now()
+        if not 0 <= run_hour <= 23:
+            return None
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            # Read the clock only after the lock is acquired: a queued writer
+            # can otherwise cross the 04:59 boundary while waiting here.
+            local_now = _local_now(now)
+            if local_now.hour != run_hour:
+                return None
+            now_text = local_now.astimezone(timezone.utc).isoformat()
             control = connection.execute("SELECT * FROM learning_control WHERE id = 1").fetchone()
             if control is None or int(control["auto_update_paused"] or 0):
                 return None
+            last = self._as_utc_datetime(str(control["last_cycle_at"] or ""))
+            if last is not None and last.astimezone(local_now.tzinfo).date() >= local_now.date():
+                return None
             existing = connection.execute(
-                "SELECT id FROM learning_jobs WHERE kind = 'knowledge_generate' AND status IN ('queued', 'running') LIMIT 1"
+                """SELECT id FROM learning_jobs
+                   WHERE kind IN ('knowledge_generate', 'knowledge_verify')
+                     AND status IN ('scheduled', 'queued', 'running') LIMIT 1"""
             ).fetchone()
             if existing:
                 return self._get_learning_job(connection, str(existing["id"]))
@@ -2183,10 +2426,34 @@ class VitalyStore:
             if user_work or user_learning:
                 return None
             job_id = self._insert_learning_job(
-                connection, chat_id=0, user_id=None, kind="knowledge_generate", submission_id=None, payload={}, now=now
+                connection, chat_id=0, user_id=None, kind="knowledge_generate", submission_id=None, payload={}, now=now_text
             )
-            connection.execute("UPDATE learning_control SET last_cycle_at = ?, updated_at = ? WHERE id = 1", (now, now))
+            connection.execute("UPDATE learning_control SET last_cycle_at = ?, updated_at = ? WHERE id = 1", (now_text, now_text))
             return self._get_learning_job(connection, job_id)
+
+    def resume_scheduled_learning(
+        self, run_hour: int, *, now: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """Make deferred automatic work runnable only in its next daily window."""
+
+        if not 0 <= run_hour <= 23 or _local_now(now).hour != run_hour:
+            return []
+        with self._connect() as connection:
+            control = connection.execute("SELECT auto_update_paused FROM learning_control WHERE id = 1").fetchone()
+            if control is None or int(control["auto_update_paused"] or 0):
+                return []
+            rows = connection.execute(
+                """SELECT id FROM learning_jobs
+                   WHERE status = 'scheduled' AND kind IN ('knowledge_generate', 'knowledge_verify')
+                   ORDER BY created_at, id"""
+            ).fetchall()
+            if not rows:
+                return []
+            connection.execute(
+                """UPDATE learning_jobs SET status = 'queued'
+                   WHERE status = 'scheduled' AND kind IN ('knowledge_generate', 'knowledge_verify')"""
+            )
+            return [self._get_learning_job(connection, str(row["id"])) for row in rows]
 
     def create_learning_model_run(self, job_id: str, kind: str, model: str, reasoning_effort: str) -> str:
         run_id = uuid.uuid4().hex

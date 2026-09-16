@@ -11,7 +11,7 @@ import pytest
 
 from tof_reliability.vitaly_bot.documents import DocumentProcessor
 from tof_reliability.vitaly_bot.evidence import build_evidence_pack
-from tof_reliability.vitaly_bot.models import ArtifactInput, BotConfig, ModelError, ModelResult, StateError
+from tof_reliability.vitaly_bot.models import ArtifactInput, BotConfig, InputError, ModelError, ModelResult, StateError
 from tof_reliability.vitaly_bot.profile import load_default_profile, score_holdout_coverage
 from tof_reliability.vitaly_bot.service import FifoWorker, VitalyService
 from tof_reliability.vitaly_bot.storage import VitalyStore
@@ -171,7 +171,38 @@ def test_local_config_uses_explicit_env_and_never_needs_a_repository_token(tmp_p
     assert config.context_ttl_days == 4
     assert config.knowledge_dir == tmp_path / "state" / "knowledge"
     assert config.cleanup_days == 0
+    assert config.learning_run_hour == 4
     assert config.operator_user_ids == ()
+
+
+@pytest.mark.parametrize("value", ["-1", "24", "four"])
+def test_local_config_rejects_an_invalid_learning_run_hour(tmp_path: Path, value: str):
+    from tof_reliability.vitaly_bot.config import load_config
+
+    with pytest.raises(InputError, match="VITALY_BOT_LEARNING_RUN_HOUR"):
+        load_config(
+            {
+                "VITALY_BOT_TOKEN": "only-in-test",
+                "VITALY_BOT_STATE_DIR": str(tmp_path / "state"),
+                "VITALY_BOT_ENV_FILE": str(tmp_path / "missing.env"),
+                "VITALY_BOT_CODEX_BIN": "/tmp/codex",
+                "VITALY_BOT_LEARNING_RUN_HOUR": value,
+            }
+        )
+
+
+def test_learning_status_displays_the_configured_local_hour(tmp_path: Path):
+    pytest.importorskip("aiogram")
+    from tof_reliability.vitaly_bot.telegram import format_learning_status
+
+    config = BotConfig(
+        token="test-token", state_dir=tmp_path / "state", codex_bin=Path("/usr/bin/codex"), learning_run_hour=3
+    )
+    store = VitalyStore(config.state_dir)
+    VitalyService(store, load_default_profile(), config)
+
+    text = format_learning_status(SimpleNamespace(store=store, config=config), chat_id=1, user_id=1)
+    assert "03:00 по времени Mac" in text
 
 
 def test_model_timeout_message_confirms_the_process_was_stopped():
@@ -515,6 +546,48 @@ def test_telegram_notifies_that_an_inactive_context_was_reset(tmp_path: Path):
         assert fresh["id"] != old_case["id"]
         assert any("Контекст обнулён" in text for text in runtime.bot.messages)
         assert any("не будут использованы" in text for text in runtime.bot.messages)
+
+    asyncio.run(scenario())
+
+
+def test_learning_scheduler_recovers_after_a_transient_tick_error(tmp_path: Path, monkeypatch):
+    pytest.importorskip("aiogram")
+
+    async def scenario() -> None:
+        from tof_reliability.vitaly_bot import telegram
+        from tof_reliability.vitaly_bot.telegram import TelegramRuntime
+
+        runtime = TelegramRuntime(FakeTelegramBot(), _config(tmp_path))  # type: ignore[arg-type]
+        attempts = 0
+
+        def flaky_resume(_hour: int) -> list[Dict[str, Any]]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise StateError("temporary SQLite error")
+            return []
+
+        sleeps = 0
+
+        async def stop_after_two_ticks(_seconds: float) -> None:
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 2:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(runtime.store, "resume_scheduled_learning", flaky_resume)
+        monkeypatch.setattr(runtime.store, "due_learning_cycle", lambda _hour: False)
+        monkeypatch.setattr(telegram.asyncio, "sleep", stop_after_two_ticks)
+
+        with pytest.raises(asyncio.CancelledError):
+            await runtime._learning_scheduler()
+
+        assert attempts == 2
+        with runtime.store._connect() as connection:
+            event = connection.execute(
+                "SELECT error_code FROM learning_events WHERE event_type = 'learning_scheduler_failed'"
+            ).fetchone()
+        assert event["error_code"] == "scheduler_tick_failed"
 
     asyncio.run(scenario())
 

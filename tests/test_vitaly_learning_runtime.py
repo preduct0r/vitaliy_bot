@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -614,15 +616,19 @@ def test_calculated_holdout_coverage_overrides_verifier_scalar_score():
 
 def test_pause_stops_queued_automatic_steps_and_restart_recovers_running_learning(tmp_path: Path):
     store = VitalyStore(tmp_path / "state")
+    local_timezone = timezone(timedelta(hours=3))
+    in_window = datetime(2026, 9, 16, 4, 10, tzinfo=local_timezone)
     queued = store.enqueue_learning_job(kind="knowledge_generate")
     store.set_learning_paused(True, actor_user_id=1)
     assert store.get_learning_job(queued["id"])["status"] == "paused"
     assert store.next_queued_work() is None
     store.set_learning_paused(False, actor_user_id=1)
+    assert store.get_learning_job(queued["id"])["status"] == "scheduled"
+    assert store.resume_scheduled_learning(4, now=in_window)
     assert store.get_learning_job(queued["id"])["status"] == "queued"
     store.mark_learning_job_running(queued["id"])
     restarted = VitalyStore(store.state_dir)
-    restarted.recover_jobs()
+    restarted.recover_jobs(automatic_run_hour=4, now=in_window)
     assert restarted.get_learning_job(queued["id"])["status"] == "queued"
 
     restarted.mark_learning_job_running(queued["id"])
@@ -664,6 +670,7 @@ def test_failed_verification_marks_candidate_terminal_and_keeps_active_package(t
     failed = store.get_learning_candidate(candidate["id"])
     assert failed["status"] == "failed"
     assert failed["error"] == "subscription_exhausted"
+    assert store.get_learning_job(verify_job["id"])["status"] == "failed"
     assert store.active_knowledge_package()["id"] == active_before
     assert store.get_feedback(feedback["id"])["result"]["learning_outcome"] == "verification_failed"
 
@@ -693,7 +700,7 @@ def test_atomic_publish_updates_package_candidate_and_source_together(tmp_path: 
     assert package["summary"] == public_release_summary(payload["patch"])
 
 
-def test_learning_scheduler_is_paused_or_delayed_by_user_work(tmp_path: Path):
+def test_learning_scheduler_runs_only_in_its_local_hour_and_yields_to_user_work(tmp_path: Path):
     config = _config(tmp_path)
     store = VitalyStore(config.state_dir, config.knowledge_dir)
     service = VitalyService(store, load_default_profile(), config, runner=LearningRunner())
@@ -703,12 +710,20 @@ def test_learning_scheduler_is_paused_or_delayed_by_user_work(tmp_path: Path):
     feedback_job = store.submit_feedback(feedback["id"], "Нужен проверочный пример.")
     store.set_feedback_result(feedback["id"], "example", {"reason": "fixture"})
 
-    # A queued foreground review always wins and prevents an auto-cycle from
-    # being admitted until the user queue is empty.
+    local_timezone = timezone(timedelta(hours=3))
+    before_window = datetime(2026, 9, 16, 3, 59, tzinfo=local_timezone)
+    in_window = datetime(2026, 9, 16, 4, 59, tzinfo=local_timezone)
+    after_window = datetime(2026, 9, 16, 5, 0, tzinfo=local_timezone)
+
+    assert store.due_learning_cycle(4, now=before_window) is False
+    assert store.queue_learning_cycle(4, now=after_window) is None
+
+    # A queued foreground review always wins and prevents the 04:00 cycle from
+    # being admitted.  It must not catch up later during daytime hours.
     store.begin_job(case["id"], 12, "review")
-    assert store.due_learning_cycle(1) is False
+    assert store.due_learning_cycle(4, now=in_window) is False
     store.set_learning_paused(True, actor_user_id=120)
-    assert store.due_learning_cycle(1) is False
+    assert store.due_learning_cycle(4, now=in_window) is False
     store.set_learning_paused(False, actor_user_id=120)
     foreground = store.next_queued_job()
     assert foreground is not None
@@ -717,7 +732,161 @@ def test_learning_scheduler_is_paused_or_delayed_by_user_work(tmp_path: Path):
     # A test-only direct result must also model the worker's terminal job
     # transition; otherwise the scheduler correctly sees pending user work.
     store.finish_learning_job(feedback_job["id"])
-    assert store.due_learning_cycle(1) is True
+    assert store.due_learning_cycle(4, now=after_window) is False
+    assert store.due_learning_cycle(4, now=in_window) is True
+    cycle = store.queue_learning_cycle(4, now=in_window)
+    assert cycle is not None
+    assert store.due_learning_cycle(4, now=in_window + timedelta(minutes=30)) is False
+    store.finish_learning_job(cycle["id"])
+    tomorrow = in_window + timedelta(days=1)
+    assert store.due_learning_cycle(4, now=tomorrow) is True
+
+
+def test_learning_schedule_follows_local_calendar_day_across_dst(tmp_path: Path, monkeypatch):
+    store = VitalyStore(tmp_path / "state")
+    berlin = ZoneInfo("Europe/Berlin")
+    previous_window = datetime(2026, 3, 28, 4, 10, tzinfo=berlin)
+    spring_window = datetime(2026, 3, 29, 4, 10, tzinfo=berlin)
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE learning_control SET last_cycle_at = ? WHERE id = 1",
+            (previous_window.astimezone(timezone.utc).isoformat(),),
+        )
+    monkeypatch.setattr(store, "learning_sources", lambda: [{"id": "source"}])
+
+    # The fixed local time is 23 real hours apart on this transition, but it
+    # is still the next local day and must remain eligible at 04:00.
+    assert store.due_learning_cycle(4, now=spring_window) is True
+
+
+def test_recovery_defers_an_unfinished_automatic_cycle_until_next_04_hour(tmp_path: Path):
+    store = VitalyStore(tmp_path / "state")
+    local_timezone = timezone(timedelta(hours=3))
+    automatic = store.enqueue_learning_job(kind="knowledge_generate")
+    store.mark_learning_job_running(automatic["id"])
+
+    restarted = VitalyStore(store.state_dir)
+    after_window = datetime(2026, 9, 16, 8, 30, tzinfo=local_timezone)
+    restarted.recover_jobs(automatic_run_hour=4, now=after_window)
+    assert restarted.get_learning_job(automatic["id"])["status"] == "scheduled"
+    assert restarted.next_queued_work(automatic_run_hour=4, now=after_window) is None
+
+    next_window = datetime(2026, 9, 17, 4, 10, tzinfo=local_timezone)
+    resumed = restarted.resume_scheduled_learning(4, now=next_window)
+    assert [job["id"] for job in resumed] == [automatic["id"]]
+    assert restarted.next_queued_work(automatic_run_hour=4, now=next_window)["id"] == automatic["id"]
+
+
+def test_generator_selected_at_04_59_cannot_cross_the_admission_boundary(tmp_path: Path):
+    store = VitalyStore(tmp_path / "state")
+    automatic = store.enqueue_learning_job(kind="knowledge_generate")
+    after_window = datetime(2026, 9, 16, 5, 0, tzinfo=timezone(timedelta(hours=3)))
+
+    assert store.mark_learning_job_running(automatic["id"], automatic_run_hour=4, now=after_window) is False
+    assert store.get_learning_job(automatic["id"])["status"] == "scheduled"
+
+
+def test_verifier_delayed_by_a_user_job_waits_for_the_next_04_hour(tmp_path: Path):
+    store = VitalyStore(tmp_path / "state")
+    verifier = store.enqueue_learning_job(kind="knowledge_verify", payload={"candidate_id": "candidate"})
+    after_window = datetime(2026, 9, 16, 11, 0, tzinfo=timezone(timedelta(hours=3)))
+
+    assert store.next_queued_work(automatic_run_hour=4, now=after_window) is None
+    assert store.get_learning_job(verifier["id"])["status"] == "scheduled"
+
+    verifier_at_admission = store.enqueue_learning_job(kind="knowledge_verify", payload={"candidate_id": "candidate-2"})
+    assert store.mark_learning_job_running(
+        verifier_at_admission["id"], automatic_run_hour=4, now=after_window
+    ) is False
+    assert store.get_learning_job(verifier_at_admission["id"])["status"] == "scheduled"
+
+
+def test_candidate_and_verifier_are_written_in_one_sqlite_transaction(tmp_path: Path, monkeypatch):
+    store = VitalyStore(tmp_path / "state")
+    VitalyService(store, load_default_profile(), _config(tmp_path), runner=LearningRunner())
+    active = store.active_knowledge_package()
+
+    def interrupted_verifier_write(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(store, "_insert_learning_job", interrupted_verifier_write)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        store.create_learning_candidate_with_verification(
+            ["feedback-atomic"], {"schema_version": 1}, "analysis", "Проверить атомарность",
+            baseline_package_id=active["id"],
+        )
+    with store._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM learning_candidates").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM learning_jobs").fetchone()[0] == 0
+
+
+def test_recovery_backfills_legacy_candidate_without_a_verifier(tmp_path: Path):
+    store = VitalyStore(tmp_path / "state")
+    VitalyService(store, load_default_profile(), _config(tmp_path), runner=LearningRunner())
+    active = store.active_knowledge_package()
+    candidate = store.create_learning_candidate(
+        ["feedback-legacy"], {"schema_version": 1}, "analysis", "Проверить восстановление",
+        baseline_package_id=active["id"],
+    )
+    after_window = datetime(2026, 9, 16, 9, 0, tzinfo=timezone(timedelta(hours=3)))
+
+    store.recover_jobs(automatic_run_hour=4, now=after_window)
+    with store._connect() as connection:
+        rows = connection.execute(
+            "SELECT payload_json, status FROM learning_jobs WHERE kind = 'knowledge_verify'"
+        ).fetchall()
+    assert len(rows) == 1
+    assert json.loads(rows[0]["payload_json"])["candidate_id"] == candidate["id"]
+    assert rows[0]["status"] == "scheduled"
+
+
+def test_recovery_preserves_a_legacy_failed_verifier_without_replaying_it(tmp_path: Path):
+    store = VitalyStore(tmp_path / "state")
+    VitalyService(store, load_default_profile(), _config(tmp_path), runner=LearningRunner())
+    active = store.active_knowledge_package()
+    candidate = store.create_learning_candidate(
+        ["feedback-legacy"], {"schema_version": 1}, "analysis", "Проверить восстановление",
+        baseline_package_id=active["id"],
+    )
+    verifier = store.enqueue_learning_job(kind="knowledge_verify", payload={"candidate_id": candidate["id"]})
+    # Simulates an interrupted old release that recorded the model failure
+    # before it could write the linked candidate result.
+    store.finish_learning_job(verifier["id"], "subscription_exhausted")
+
+    after_window = datetime(2026, 9, 16, 9, 0, tzinfo=timezone(timedelta(hours=3)))
+    store.recover_jobs(automatic_run_hour=4, now=after_window)
+
+    restored = store.get_learning_candidate(candidate["id"])
+    assert restored["status"] == "failed"
+    assert restored["error"] == "subscription_exhausted"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM learning_jobs WHERE kind = 'knowledge_verify'"
+        ).fetchone()[0] == 1
+
+
+def test_recovery_does_not_replay_a_legacy_completed_verifier_without_a_result(tmp_path: Path):
+    store = VitalyStore(tmp_path / "state")
+    VitalyService(store, load_default_profile(), _config(tmp_path), runner=LearningRunner())
+    active = store.active_knowledge_package()
+    candidate = store.create_learning_candidate(
+        ["feedback-legacy"], {"schema_version": 1}, "analysis", "Проверить восстановление",
+        baseline_package_id=active["id"],
+    )
+    verifier = store.enqueue_learning_job(kind="knowledge_verify", payload={"candidate_id": candidate["id"]})
+    store.finish_learning_job(verifier["id"])
+
+    after_window = datetime(2026, 9, 16, 9, 0, tzinfo=timezone(timedelta(hours=3)))
+    store.recover_jobs(automatic_run_hour=4, now=after_window)
+
+    restored = store.get_learning_candidate(candidate["id"])
+    assert restored["status"] == "needs_clarification"
+    assert restored["error"] == "verification_result_missing"
+    with store._connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM learning_jobs WHERE kind = 'knowledge_verify'"
+        ).fetchone()[0] == 1
 
 
 def test_archive_cleanup_is_non_destructive_and_disk_guard_fails_closed(tmp_path: Path, monkeypatch):

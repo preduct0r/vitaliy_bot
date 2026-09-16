@@ -26,7 +26,10 @@ class BotConfig:
     context_ttl_days: int = 4
     knowledge_dir: Optional[Path] = None
     min_free_bytes: int = 2 * 1024 * 1024 * 1024
-    learning_cycle_seconds: int = 24 * 60 * 60
+    # The automatic learning cycle is deliberately tied to one local calendar
+    # hour rather than to an elapsed interval, so it does not drift into a
+    # colleague's daytime use of the bot.
+    learning_run_hour: int = 4
     operator_user_ids: Tuple[int, ...] = ()
 
 

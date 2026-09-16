@@ -1,5 +1,5 @@
 {
-  "tof_commit": "0b19c07e8a757e69f3248ef2affec0f2f0bb781b",
+  "tof_commit": "bb2e7179a942147622831b4e7d75e14f9abf4987",
   "source_paths": [
     "src/tof_reliability/vitaly_bot",
     "src/tof_reliability/data",

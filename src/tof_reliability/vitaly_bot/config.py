@@ -54,6 +54,12 @@ def load_config(environ: Optional[Dict[str, str]] = None, require_token: bool = 
         )
     except ValueError as error:
         raise InputError("VITALY_BOT_OPERATOR_USER_IDS должен содержать числовые Telegram user_id") from error
+    try:
+        learning_run_hour = int(values.get("VITALY_BOT_LEARNING_RUN_HOUR", "4"))
+    except ValueError as error:
+        raise InputError("VITALY_BOT_LEARNING_RUN_HOUR должен быть целым часом от 0 до 23") from error
+    if not 0 <= learning_run_hour <= 23:
+        raise InputError("VITALY_BOT_LEARNING_RUN_HOUR должен быть целым часом от 0 до 23")
     return BotConfig(
         token=token,
         state_dir=state_dir,
@@ -67,6 +73,6 @@ def load_config(environ: Optional[Dict[str, str]] = None, require_token: bool = 
         context_ttl_days=int(values.get("VITALY_BOT_CONTEXT_TTL_DAYS", "4")),
         knowledge_dir=knowledge_dir,
         min_free_bytes=int(values.get("VITALY_BOT_MIN_FREE_BYTES", str(2 * 1024 * 1024 * 1024))),
-        learning_cycle_seconds=int(values.get("VITALY_BOT_LEARNING_CYCLE_SECONDS", str(24 * 60 * 60))),
+        learning_run_hour=learning_run_hour,
         operator_user_ids=operator_user_ids,
     )

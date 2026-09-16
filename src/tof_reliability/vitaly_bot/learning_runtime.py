@@ -696,15 +696,12 @@ class LearningManager:
         # Validate now, before persisting a candidate; the same frozen inputs
         # are rebuilt by the independent verifier in its own FIFO step.
         self._candidate_package(active, dict(generated["patch"]), selected_sources)
-        candidate = self.store.create_learning_candidate(
+        candidate, verify_job = self.store.create_learning_candidate_with_verification(
             source_ids,
             dict(generated["patch"]),
             str(generated["scope"]),
             str(generated["expected_improvement"]),
             baseline_package_id=str(active["id"]),
-        )
-        verify_job = self.store.enqueue_learning_job(
-            kind="knowledge_verify", payload={"candidate_id": candidate["id"]}
         )
         return LearningOutcome("knowledge_candidate", {"candidate": candidate, "verification_job": verify_job})
 

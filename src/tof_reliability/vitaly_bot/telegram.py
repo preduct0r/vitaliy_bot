@@ -179,7 +179,11 @@ def format_learning_status(runtime: "TelegramRuntime", chat_id: int, user_id: Op
         "Накопительный контекст",
         "Активная версия: " + str(package["version"]) + " (" + str(package["id"])[:12] + ").",
         "Последнее изменение: " + public_release_summary(package.get("package", {}).get("patch", {})),
-        "Автообновление: " + ("приостановлено" if int(control.get("auto_update_paused") or 0) else "включено"),
+        "Автообновление: " + (
+            "приостановлено"
+            if int(control.get("auto_update_paused") or 0)
+            else "включено; запуск в " + str(runtime.config.learning_run_hour).zfill(2) + ":00 по времени Mac"
+        ),
         "\nВаши отправки:",
     ]
     feedback = own["feedback"]
@@ -338,20 +342,33 @@ class TelegramRuntime:
         await self.worker.stop()
 
     async def _learning_scheduler(self) -> None:
-        """Schedule at most one low-priority cycle each configured interval."""
+        """Schedule at most one low-priority cycle in the configured local hour."""
 
-        try:
-            while True:
-                if self.store.due_learning_cycle(self.config.learning_cycle_seconds):
-                    job = self.store.queue_learning_cycle()
+        while True:
+            try:
+                resumed = self.store.resume_scheduled_learning(self.config.learning_run_hour)
+                if resumed:
+                    self.worker.notify()
+                if self.store.due_learning_cycle(self.config.learning_run_hour):
+                    job = self.store.queue_learning_cycle(self.config.learning_run_hour)
                     if job is not None:
                         self.worker.notify()
-                await asyncio.sleep(30)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # A scheduler failure must never stop polling or the user queue.
-            return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # A transient SQLite or filesystem error at 04:00 must not
+                # silently disable every later daily cycle.  Preserve a small
+                # diagnostic when possible, then try again on the next tick.
+                with contextlib.suppress(Exception):
+                    self.store.record_learning_event(
+                        "learning_scheduler_failed",
+                        "learning_control",
+                        "1",
+                        status="failed",
+                        error_code="scheduler_tick_failed",
+                        detail={"error": str(error)[:1000]},
+                    )
+            await asyncio.sleep(30)
 
     async def _learning_typing_loop(self, job_id: str, chat_id: int) -> None:
         if not chat_id:
@@ -776,7 +793,13 @@ def build_router(runtime: TelegramRuntime) -> Router:
         try:
             runtime.store.set_learning_paused(False, actor_user_id=assert_operator(message))
             runtime.worker.notify()
-            await send_with_retry(runtime.bot, message.chat.id, "Автоматическое обновление пакетов знаний включено.")
+            await send_with_retry(
+                runtime.bot,
+                message.chat.id,
+                "Автоматическое обновление пакетов знаний включено; следующий запуск — в "
+                + str(runtime.config.learning_run_hour).zfill(2)
+                + ":00 по времени Mac.",
+            )
         except Exception as error:
             await send_with_retry(runtime.bot, message.chat.id, user_error(error))
 
