@@ -82,3 +82,11 @@ def test_pptx_text_follows_presentation_order(tmp_path: Path):
         text = _pptx_text(archive)
     assert text.index("## Слайд 1") < text.index("## Слайд 2")
     assert text.index("ПЕРВЫЙ") < text.index("ВТОРОЙ")
+
+
+def test_legacy_pdf_formfeeds_keep_page_numbers(tmp_path: Path):
+    from tof_reliability.vitaly_bot.documents import _source_locations
+
+    images = [tmp_path / "page-1.png", tmp_path / "page-2.png"]
+    locations = _source_locations("plan.pdf", ".pdf", "one\f two", images)
+    assert [(item["kind"], item["number"]) for item in locations] == [("page", 1), ("page", 2)]

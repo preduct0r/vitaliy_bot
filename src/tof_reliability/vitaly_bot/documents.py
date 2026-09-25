@@ -93,12 +93,16 @@ def _source_locations(name: str, suffix: str, text: str, image_paths: Sequence[P
     kind = "slide" if suffix == ".pptx" else "page"
     marker = r"(?ms)^## (?:Слайд|Страница) (\d+)\s*\n(.*?)(?=^## (?:Слайд|Страница) \d+\s*\n|\Z)"
     matches = list(re.finditer(marker, text))
+    legacy_pages = text.split("\f") if suffix == ".pdf" and "\f" in text else []
     if not matches:
-        matches = [re.match(r"(?s)(.*)", text)] if text else []
+        if legacy_pages:
+            matches = [re.match(r"(?s)(.*)", page) for page in legacy_pages]
+        else:
+            matches = [re.match(r"(?s)(.*)", text)] if text else []
     locations: List[Dict[str, Any]] = []
     for index, match in enumerate(matches, start=1):
-        number = int(match.group(1)) if match.lastindex and match.lastindex >= 2 else index
-        body = match.group(2) if match.lastindex and match.lastindex >= 2 else (match.group(1) if match else "")
+        number = int(match.group(1)) if match and match.lastindex and match.lastindex >= 2 else index
+        body = match.group(2) if match and match.lastindex and match.lastindex >= 2 else (match.group(1) if match else "")
         image_path = str(image_paths[number - 1]) if 0 < number <= len(image_paths) else None
         entry: Dict[str, Any] = {"file": name, "kind": kind, "number": number, "text": body.strip()}
         if image_path:
