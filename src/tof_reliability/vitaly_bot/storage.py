@@ -110,6 +110,7 @@ class VitalyStore:
                     local_path TEXT NOT NULL,
                     normalized_text_path TEXT,
                     rendered_pages_json TEXT NOT NULL DEFAULT '[]',
+                    source_locations_json TEXT NOT NULL DEFAULT '[]',
                     unit_count INTEGER NOT NULL DEFAULT 0,
                     warnings_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL
@@ -178,6 +179,9 @@ class VitalyStore:
         for name, definition in additions.items():
             if name not in known:
                 connection.execute("ALTER TABLE cases ADD COLUMN " + name + " " + definition)
+        artifact_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(artifacts)").fetchall()}
+        if "source_locations_json" not in artifact_columns:
+            connection.execute("ALTER TABLE artifacts ADD COLUMN source_locations_json TEXT NOT NULL DEFAULT '[]'")
 
     @staticmethod
     def _initialize_learning_schema(connection: sqlite3.Connection) -> None:
@@ -582,6 +586,7 @@ class VitalyStore:
         rendered_pages: Sequence[Path],
         unit_count: int,
         warnings: Sequence[str],
+        source_locations: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if self.artifact_count(case_id) >= 10:
             raise InputError("В одном кейсе можно использовать не более 10 файлов")
@@ -593,8 +598,8 @@ class VitalyStore:
             connection.execute(
                 """INSERT INTO artifacts(
                     id, case_id, telegram_file_id, original_name, stored_name, sha256, suffix, size_bytes,
-                    local_path, normalized_text_path, rendered_pages_json, unit_count, warnings_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    local_path, normalized_text_path, rendered_pages_json, source_locations_json, unit_count, warnings_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     artifact_id,
                     case_id,
@@ -607,6 +612,7 @@ class VitalyStore:
                     str(local_path),
                     str(normalized_text_path) if normalized_text_path else None,
                     _json([str(path) for path in rendered_pages]),
+                    _json(list(source_locations or [])),
                     unit_count,
                     _json(list(warnings)),
                     now,
@@ -637,6 +643,7 @@ class VitalyStore:
             raise StateError("Файл не найден")
         value = dict(row)
         value["rendered_pages"] = _load_json(value.pop("rendered_pages_json"), [])
+        value["source_locations"] = _load_json(value.pop("source_locations_json", "[]"), [])
         value["warnings"] = _load_json(value.pop("warnings_json"), [])
         return value
 

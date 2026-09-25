@@ -1,5 +1,5 @@
 {
-  "tof_commit": "bb2e7179a942147622831b4e7d75e14f9abf4987",
+  "tof_commit": "1bb906256a8e065c51e04c403d473e0e46c975d4",
   "source_paths": [
     "src/tof_reliability/vitaly_bot",
     "src/tof_reliability/data",
@@ -17,6 +17,7 @@
     "tests/test_vitaly_corrections.py",
     "tests/test_vitaly_learning_core.py",
     "tests/test_vitaly_learning_runtime.py",
+    "tests/test_vitaly_slide_links.py",
     "scripts/vitaly_snapshot.py",
     "scripts/vitaly_release.py",
     "scripts/export_vitaly_bot.py"

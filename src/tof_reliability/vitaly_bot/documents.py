@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from scripts import artifact_qa, context_normalization
 
@@ -85,6 +85,28 @@ def _normalized_body(value: str) -> str:
     return value
 
 
+def _source_locations(name: str, suffix: str, text: str, image_paths: Sequence[Path]) -> List[Dict[str, Any]]:
+    """Build a stable file/unit/image index for model references and previews."""
+
+    if suffix not in {".pptx", ".pdf"}:
+        return []
+    kind = "slide" if suffix == ".pptx" else "page"
+    marker = r"(?ms)^## (?:Слайд|Страница) (\d+)\s*\n(.*?)(?=^## (?:Слайд|Страница) \d+\s*\n|\Z)"
+    matches = list(re.finditer(marker, text))
+    if not matches:
+        matches = [re.match(r"(?s)(.*)", text)] if text else []
+    locations: List[Dict[str, Any]] = []
+    for index, match in enumerate(matches, start=1):
+        number = int(match.group(1)) if match.lastindex and match.lastindex >= 2 else index
+        body = match.group(2) if match.lastindex and match.lastindex >= 2 else (match.group(1) if match else "")
+        image_path = str(image_paths[number - 1]) if 0 < number <= len(image_paths) else None
+        entry: Dict[str, Any] = {"file": name, "kind": kind, "number": number, "text": body.strip()}
+        if image_path:
+            entry["image_path"] = image_path
+        locations.append(entry)
+    return locations
+
+
 class DocumentProcessor:
     """Prepares one file while leaving the original upload unchanged."""
 
@@ -148,6 +170,13 @@ class DocumentProcessor:
             rendered_pages=image_paths,
             unit_count=actual_units,
             warnings=warnings,
+            source_locations=_source_locations(
+                artifact.original_name,
+                suffix,
+                _normalized_body(normalized_path.read_text(encoding="utf-8", errors="replace"))
+                if normalized_path and normalized_path.exists() else "",
+                image_paths,
+            ),
         )
 
     def prepared(self, case_id: str) -> List[PreparedArtifact]:
@@ -180,6 +209,21 @@ class DocumentProcessor:
             if len(text) <= MAX_CONTEXT_CHARS:
                 chunks.append(prefix + text)
                 continue
+            stored = next((item for item in self.store.artifacts(case_id) if str(item["id"]) == artifact.artifact_id), None)
+            locations = list(stored.get("source_locations") or []) if stored else []
+            if not locations:
+                locations = [item for item in self.material_location_catalog(case_id) if item.get("file") == artifact.name]
+            if locations:
+                current = prefix
+                for location in locations:
+                    section = "## " + ("Слайд" if location.get("kind") == "slide" else "Страница") + " " + str(location.get("number")) + "\n" + str(location.get("text") or "")
+                    if len(current) > len(prefix) and len(current) + len(section) + 2 > MAX_CONTEXT_CHARS:
+                        chunks.append(current)
+                        current = prefix
+                    current += section + "\n\n"
+                if current.strip() != prefix.strip():
+                    chunks.append(current)
+                continue
             for offset in range(0, len(text), MAX_CONTEXT_CHARS):
                 chunks.append(prefix + "Фрагмент " + str(offset // MAX_CONTEXT_CHARS + 1) + "\n" + text[offset : offset + MAX_CONTEXT_CHARS])
         return chunks
@@ -189,6 +233,52 @@ class DocumentProcessor:
         for artifact in self.prepared(case_id):
             selected.extend(artifact.image_paths)
         return _select_images(selected)
+
+    def material_location_catalog(self, case_id: str) -> List[Dict[str, Any]]:
+        """Return only locations that can be checked against the stored source."""
+
+        result: List[Dict[str, Any]] = []
+        for artifact in self.store.artifacts(case_id):
+            locations = list(artifact.get("source_locations") or [])
+            if not locations:
+                normalized_path = artifact.get("normalized_text_path")
+                text = _normalized_body(Path(normalized_path).read_text(encoding="utf-8", errors="replace")) if normalized_path and Path(normalized_path).exists() else ""
+                locations = _source_locations(str(artifact["original_name"]), str(artifact["suffix"]), text, [Path(p) for p in artifact.get("rendered_pages", [])])
+            for location in locations:
+                result.append(dict(location))
+        return result
+
+    def validate_locations(self, case_id: str, locations: Any) -> List[Dict[str, Any]]:
+        """Drop no references silently: invalid model references are rejected."""
+
+        if locations in (None, ""):
+            return []
+        if not isinstance(locations, list):
+            raise InputError("Модель вернула некорректную привязку к слайду")
+        catalog = {(str(item.get("file")), str(item.get("kind")), int(item.get("number"))): item for item in self.material_location_catalog(case_id)}
+        validated: List[Dict[str, Any]] = []
+        for location in locations:
+            if not isinstance(location, dict):
+                raise InputError("Модель вернула некорректную привязку к слайду")
+            try:
+                key = (str(location["file"]), str(location["kind"]), int(location["number"]))
+            except (KeyError, TypeError, ValueError) as error:
+                raise InputError("Модель вернула некорректную привязку к слайду") from error
+            if key not in catalog:
+                raise InputError("Модель указала слайд или страницу, которых нет в загруженном файле")
+            validated.append({"file": key[0], "kind": key[1], "number": key[2]})
+        return validated
+
+    def location_images(self, case_id: str, locations: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        catalog = self.material_location_catalog(case_id)
+        by_key = {(str(item.get("file")), str(item.get("kind")), int(item.get("number"))): item for item in catalog}
+        result = []
+        for location in locations:
+            key = (str(location.get("file")), str(location.get("kind")), int(location.get("number")))
+            item = by_key.get(key)
+            if item and item.get("image_path"):
+                result.append(item)
+        return result
 
     def prepare_meeting_source(
         self, submission_id: str, artifact: ArtifactInput, *, min_free_bytes: int = 0

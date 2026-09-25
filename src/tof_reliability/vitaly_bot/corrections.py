@@ -248,6 +248,8 @@ async def correct_point(service, job):
     selected = item_at(review, payload['item_id'])
     prepared = service.documents.prepared(job['case_id'])
     target_text = str(selected.get('material_reference', '')) + ' ' + payload['explanation']
+    for location in selected.get('material_locations', []) or []:
+        target_text += ' ' + str(location.get('file', '')) + ' ' + ('слайд' if location.get('kind') == 'slide' else 'страница') + ' ' + str(location.get('number', ''))
     named = [p for p in prepared if p.name.casefold() in target_text.casefold()]
     if named:
         prepared = named
@@ -281,8 +283,13 @@ async def correct_point(service, job):
     if any(not path.is_file() for path in images):
         raise StateError('Рендеры удалены. Создайте /new и загрузите материал заново.')
     properties = QUESTION_PROPERTIES if payload['item_id'].startswith('Q') else {
-        k: {'type': 'string'} for k in ('title', 'detail', 'material_reference')}
-    replacement_schema = _object(properties, list(properties))
+        **{k: {'type': 'string'} for k in ('title', 'detail', 'material_reference')},
+        'material_locations': QUESTION_PROPERTIES['material_locations'],
+    }
+    replacement_schema = _object(
+        properties,
+        [key for key in properties if key != 'material_locations'],
+    )
     schema = _object({
         'decision': {'type': 'string', 'enum': list(LABELS)},
         'replacement': {'anyOf': [replacement_schema, {'type': 'null'}]},
@@ -312,4 +319,11 @@ async def correct_point(service, job):
                 or q.get('severity') not in range(1, 6) or q.get('likelihood') not in range(1, 6)
                 or q.get('expected_answer_evidence_level') not in {'ledger', 'material', 'none'}):
             raise ModelError('model_output_invalid_schema', 'Некорректный вопрос')
+    if result.get('decision') == 'corrected' and result.get('replacement') and 'material_locations' in result['replacement']:
+        try:
+            result['replacement']['material_locations'] = service.documents.validate_locations(
+                job['case_id'], result['replacement'].get('material_locations', [])
+            )
+        except Exception as error:
+            raise ModelError('model_output_invalid_location', str(error)) from error
     return corrections.apply(job, result)

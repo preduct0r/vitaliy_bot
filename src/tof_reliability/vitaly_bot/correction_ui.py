@@ -16,6 +16,7 @@ def keyboard(audit, page=None):
     rows = []
     if page is None:
         rows = [
+            [button('Показать слайд', 'locpage:0')],
             [button('Исправить пункт', 'page:0')],
             [button('Общая обратная связь', 'feedback')],
             [button('Актуальный отчёт', 'view')],
@@ -34,6 +35,49 @@ def keyboard(audit, page=None):
             rows.append(nav)
         rows.append([button('Отмена', 'cancel')])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def slide_keyboard(audit, page=0):
+    from .telegram import location_label
+    prefix = 'vc:' + audit['id'] + ':' + str(audit['revision']) + ':'
+    choices = items(json.loads(audit['current_json']))
+    page = max(0, min(page, max(0, (len(choices) - 1) // PAGE_SIZE)))
+    rows = []
+    for key, item in choices[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
+        label = location_label(item.get('material_locations')) or 'место не указано'
+        rows.append([InlineKeyboardButton(text=(key + ' · ' + label)[:60], callback_data=prefix + 'locpick:' + key)])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text='← Назад', callback_data=prefix + 'locpage:' + str(page - 1)))
+    if (page + 1) * PAGE_SIZE < len(choices):
+        nav.append(InlineKeyboardButton(text='Далее →', callback_data=prefix + 'locpage:' + str(page + 1)))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text='Отмена', callback_data=prefix + 'cancel')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_locations(runtime, audit, chat_id, item_id):
+    from .telegram import location_label, send_with_retry
+    selected = item_at(json.loads(audit['current_json']), item_id)
+    locations = selected.get('material_locations') or []
+    if not locations:
+        await send_with_retry(runtime.bot, chat_id, item_id + ': для этого пункта сохранённой привязки к слайду или странице нет.')
+        return
+    rendered = runtime.service.documents.location_images(audit['case_id'], locations)
+    if not rendered:
+        await send_with_retry(runtime.bot, chat_id, item_id + ': привязка найдена (' + location_label(locations) + '), но сохранённого изображения нет.')
+        return
+    for location in rendered:
+        path = location.get('image_path')
+        if not path:
+            continue
+        caption = item_id + ' · ' + location_label([location])
+        try:
+            from aiogram.types import FSInputFile
+            await runtime.bot.send_photo(chat_id, FSInputFile(path), caption=caption[:1024])
+        except (TelegramBadRequest, TelegramNetworkError, OSError):
+            await send_with_retry(runtime.bot, chat_id, 'Не удалось отправить изображение ' + caption + '.')
 
 
 async def show_report(runtime, case_id, chat_id):
@@ -117,6 +161,10 @@ def register(router, runtime):
                 raise StateError('Отчёт обновился. Нажмите «Актуальный отчёт».')
             if action == 'page':
                 await send_with_retry(runtime.bot, chat_id, 'Выберите пункт для перепроверки:', reply_markup=keyboard(audit, int(argument[0])))
+            elif action == 'locpage':
+                await send_with_retry(runtime.bot, chat_id, 'Выберите пункт для просмотра слайда или страницы:', reply_markup=slide_keyboard(audit, int(argument[0])))
+            elif action == 'locpick':
+                await show_locations(runtime, audit, chat_id, argument[0])
             elif action == 'pick':
                 key = argument[0]
                 corrections.select(audit_id, int(revision), key, chat_id)

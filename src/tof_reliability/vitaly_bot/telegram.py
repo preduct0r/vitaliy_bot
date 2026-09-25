@@ -86,15 +86,50 @@ def _bullet(items: Iterable[str]) -> str:
     return "\n".join("• " + value for value in values) if values else "• Нет"
 
 
+def location_label(locations: Any) -> str:
+    """Render validated slide/page references without exposing local paths."""
+
+    if not isinstance(locations, list) or not locations:
+        return ""
+    groups: Dict[tuple[str, str], List[int]] = {}
+    order: List[tuple[str, str]] = []
+    for location in locations:
+        try:
+            key = (str(location["file"]), str(location["kind"]))
+            number = int(location["number"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        if number not in groups[key]:
+            groups[key].append(number)
+    parts = []
+    for file_name, kind in order:
+        numbers = groups[(file_name, kind)]
+        noun = "Слайд" if kind == "slide" else "Страница"
+        if len(numbers) != 1:
+            noun += "ы" if kind == "slide" else "ы"
+        parts.append(noun + " " + " и ".join(str(number) for number in numbers) + " (" + file_name + ")")
+    return ", ".join(parts)
+
+
+def _review_item_line(prefix: str, item: Dict[str, Any], title: str, detail: str) -> str:
+    location = location_label(item.get("material_locations"))
+    if location:
+        return prefix + ". " + location + ": " + title + " — " + detail
+    return prefix + ". " + title + " — " + detail
+
+
 def format_review(review: Dict[str, Any]) -> str:
     lines = [
         "Аудит материалов",
         "Готовность: " + str(review["readiness_score"]) + "/100",
         review["verdict"],
         "\nКритические пробелы:",
-        _bullet("G" + str(i) + ". " + item["title"] + " — " + item["detail"] for i, item in enumerate(review["critical_gaps"], 1)),
+        _bullet(_review_item_line("G" + str(i), item, item["title"], item["detail"]) for i, item in enumerate(review["critical_gaps"], 1)),
         "\nПротиворечия:",
-        _bullet("C" + str(i) + ". " + item["title"] + " — " + item["detail"] for i, item in enumerate(review["contradictions"], 1)),
+        _bullet(_review_item_line("C" + str(i), item, item["title"], item["detail"]) for i, item in enumerate(review["contradictions"], 1)),
         "\nВероятные вопросы:",
     ]
     for number, question in enumerate(review["questions"], start=1):
@@ -106,6 +141,9 @@ def format_review(review: Dict[str, Any]) -> str:
                 "   Короткий ответ: " + question["expected_answer"],
             ]
         )
+        location = location_label(question.get("material_locations"))
+        if location:
+            lines.append("   Место в материале: " + location)
         references = question.get("expected_answer_references", [])
         if references:
             lines.append("   Основание: " + "; ".join(references))

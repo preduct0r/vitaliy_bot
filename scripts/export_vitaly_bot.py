@@ -15,7 +15,8 @@ def export(root, destination):
              'docs/VITALY_TELEGRAM_BOT.md', 'discussions/vitaly',
              'tests/test_context_normalization.py', 'tests/test_artifact_qa.py',
              'tests/test_vitaly_bot.py', 'tests/test_vitaly_corrections.py',
-             'tests/test_vitaly_learning_core.py', 'tests/test_vitaly_learning_runtime.py']
+             'tests/test_vitaly_learning_core.py', 'tests/test_vitaly_learning_runtime.py',
+             'tests/test_vitaly_slide_links.py']
     for optional in ['scripts/vitaly_snapshot.py',
                      'scripts/vitaly_release.py', 'scripts/export_vitaly_bot.py']:
         if (root / optional).exists():

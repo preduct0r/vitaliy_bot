@@ -34,6 +34,19 @@ QUESTION_PROPERTIES = {
     "severity": {"type": "integer", "minimum": 1, "maximum": 5},
     "trigger": {"type": "string"},
     "material_reference": {"type": "string"},
+    "material_locations": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "file": {"type": "string"},
+                "kind": {"type": "string", "enum": ["slide", "page"]},
+                "number": {"type": "integer", "minimum": 1},
+            },
+            "required": ["file", "kind", "number"],
+        },
+    },
     "expected_answer": {"type": "string"},
     "expected_answer_evidence_level": {"type": "string", "enum": ["ledger", "material", "none"]},
     "expected_answer_references": {"type": "array", "items": {"type": "string"}},
@@ -44,9 +57,13 @@ QUESTION_PROPERTIES = {
 
 
 def review_schema(profile: VitalyProfile) -> Dict[str, Any]:
-    question = _object(dict(QUESTION_PROPERTIES, topic={"type": "string", "enum": profile.topic_ids}), list(QUESTION_PROPERTIES))
+    question = _object(
+        dict(QUESTION_PROPERTIES, topic={"type": "string", "enum": profile.topic_ids}),
+        [key for key in QUESTION_PROPERTIES if key != "material_locations"],
+    )
     gap = _object(
-        {"title": {"type": "string"}, "detail": {"type": "string"}, "material_reference": {"type": "string"}},
+        {"title": {"type": "string"}, "detail": {"type": "string"}, "material_reference": {"type": "string"},
+         "material_locations": QUESTION_PROPERTIES["material_locations"]},
         ["title", "detail", "material_reference"],
     )
     return _object(
@@ -135,8 +152,13 @@ def _validate_review(value: Dict[str, Any], profile: VitalyProfile) -> Dict[str,
     if not 0 <= value["readiness_score"] <= 100 or not value["questions"]:
         raise ModelError("model_output_invalid_schema", "Неверная оценка готовности или пустые вопросы")
     for question in value["questions"]:
-        if set(QUESTION_PROPERTIES) - set(question) or question["topic"] not in profile.topic_ids:
+        if (set(QUESTION_PROPERTIES) - {"material_locations"}) - set(question) or question["topic"] not in profile.topic_ids:
             raise ModelError("model_output_invalid_schema", "Вопрос не соответствует профилю")
+    for section in ("critical_gaps", "contradictions"):
+        for item in value.get(section, []):
+            item.setdefault("material_locations", [])
+    for question in value["questions"]:
+        question.setdefault("material_locations", [])
     return value
 
 
@@ -294,8 +316,16 @@ class VitalyService:
             + "В profile_evidence указывай только идентификаторы встреч из профиля. "
             + "Для expected_answer используй только evidence-пакет с provenance=resolved или конкретный фрагмент материалов. "
             + "Если факта нет, expected_answer должен честно сказать, что подтверждённого ответа нет, а expected_answer_evidence_level выбрать none. "
+            + "Для каждого G/C/Q заполни material_locations точными ссылками из каталога ниже: file, kind=slide или page, number. "
+            + "Для общей проблемы оставь пустой список; номера и имена файлов не придумывай. Противоречие между двумя местами укажи обеими ссылками. "
             + "Ответ должен быть на русском и строго соответствовать схеме.\nМатериалы:\n"
             + _json(material_map)
+            + "\nКаталог слайдов/страниц (разрешены только эти ссылки):\n"
+            + _json([
+                {"file": item["file"], "kind": item["kind"], "number": item["number"],
+                 "excerpt": str(item.get("text") or "")[:800]}
+                for item in self.documents.material_location_catalog(case_id)
+            ])
             + "\nEvidence-пакет текущего опубликованного поколения:\n"
             + _json(evidence_pack)
         )
@@ -305,6 +335,14 @@ class VitalyService:
             ),
             self.profile_for_case(case_id),
         )
+        try:
+            for section in ("critical_gaps", "contradictions", "questions"):
+                for item in review.get(section, []):
+                    item["material_locations"] = self.documents.validate_locations(case_id, item.get("material_locations", []))
+        except Exception as error:
+            if isinstance(error, ModelError):
+                raise
+            raise ModelError("model_output_invalid_location", str(error)) from error
         self.store.set_review(case_id, review)
         return review
 

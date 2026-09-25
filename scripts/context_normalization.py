@@ -176,10 +176,33 @@ def _natural_key(value: str) -> list[Any]:
 
 
 def _pptx_text(archive: zipfile.ZipFile) -> str:
-    slides = sorted(
-        (name for name in archive.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)),
-        key=_natural_key,
-    )
+    available = set(archive.namelist())
+    slides: list[str] = []
+    # ``slideN.xml`` is not a presentation order.  The sldIdLst plus the
+    # relationship file is the authoritative order for PPTX decks.
+    try:
+        presentation = ElementTree.fromstring(archive.read("ppt/presentation.xml"))
+        relationships = ElementTree.fromstring(archive.read("ppt/_rels/presentation.xml.rels"))
+        targets = {
+            relation.get("Id"): posixpath.normpath(
+                relation.get("Target", "").lstrip("/")
+                if relation.get("Target", "").startswith("/")
+                else posixpath.join("ppt", relation.get("Target", ""))
+            )
+            for relation in relationships.iter(PACKAGE_REL_NS + "Relationship")
+            if relation.get("TargetMode") != "External"
+        }
+        for slide_id in presentation.iter("{http://schemas.openxmlformats.org/presentationml/2006/main}sldId"):
+            target = targets.get(slide_id.get(REL_NS + "id"))
+            if target in available and re.fullmatch(r"ppt/slides/slide\d+\.xml", target):
+                slides.append(target)
+    except (KeyError, ElementTree.ParseError):
+        slides = []
+    if not slides:
+        slides = sorted(
+            (name for name in available if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)),
+            key=_natural_key,
+        )
     if not slides:
         raise NormalizationError("missing_pptx_slides")
     chunks = []
@@ -305,7 +328,12 @@ def _pdf_text(payload: bytes) -> str:
         raise NormalizationError("pdf_text_extraction_failed")
     if not result.stdout.strip():
         raise VisualReviewRequired("pdf_has_no_text_layer")
-    return result.stdout
+    pages = result.stdout.split("\f")
+    # pdftotext commonly adds one terminal form-feed.  Keep intentional blank
+    # pages while removing only that separator.
+    if pages and not pages[-1].strip():
+        pages.pop()
+    return "\n\n".join(f"## Страница {number}\n{page.strip()}" for number, page in enumerate(pages, start=1))
 
 
 def _normalized_text(payload: bytes, suffix: str) -> tuple[str, str, list[str]]:
