@@ -156,8 +156,6 @@ def test_user_learning_intake_preempts_queued_automatic_steps(tmp_path: Path):
     store.finish_learning_job(feedback_job["id"])
 
     meeting = store.begin_meeting(72, 720)
-    for value in ("2026-09-16", "Планёрка", "Виталий, руководитель"):
-        meeting = store.submit_meeting_metadata(meeting["id"], value)
     transcript = tmp_path / "priority-meeting.txt"
     transcript.write_text("Виталий: где основание?", encoding="utf-8")
     _meeting, meeting_job = store.accept_meeting_source(
@@ -174,8 +172,6 @@ def test_meeting_intake_keeps_current_case_clean_and_exact_dedupes(tmp_path: Pat
     service = VitalyService(store, load_default_profile(), _config(tmp_path), runner=LearningRunner())
     case = service.new_case(8)
     first = store.begin_meeting(8, 80)
-    for value in ("2026-09-16", "Сверка проекта", "Виталий, руководитель проекта"):
-        first = store.submit_meeting_metadata(first["id"], value)
     source = tmp_path / "meeting.txt"
     source.write_text("Виталий: где источник цифры?", encoding="utf-8")
     first, job = store.accept_meeting_source(
@@ -195,8 +191,6 @@ def test_meeting_intake_keeps_current_case_clean_and_exact_dedupes(tmp_path: Pat
     })
 
     second = store.begin_meeting(8, 80)
-    for value in ("2026-09-16", "Копия", "Виталий, руководитель проекта"):
-        second = store.submit_meeting_metadata(second["id"], value)
     second, duplicate_job = store.accept_meeting_source(
         second["id"],
         source_name="copy.txt",
@@ -216,8 +210,6 @@ def test_normalized_meeting_duplicate_does_not_enqueue_second_model_run(tmp_path
     source = tmp_path / "meeting.txt"
     source.write_text("Виталий: где источник цифры?", encoding="utf-8")
     first = store.begin_meeting(81, 810)
-    for value in ("2026-09-16", "Сверка", "Виталий, руководитель"):
-        first = store.submit_meeting_metadata(first["id"], value)
     first, first_job = store.accept_meeting_source(
         first["id"], source_name="a.txt", source_path=source, normalized_path=source,
         source_sha256="source-a", normalized_sha256="normalized-same",
@@ -228,8 +220,6 @@ def test_normalized_meeting_duplicate_does_not_enqueue_second_model_run(tmp_path
         "identity_confident": True, "duplicate_of": "", "continuation_of": "", "source_fragments": [], "observed_topics": [],
     })
     second = store.begin_meeting(81, 810)
-    for value in ("2026-09-16", "Переэкспорт", "Виталий, руководитель"):
-        second = store.submit_meeting_metadata(second["id"], value)
     second, second_job = store.accept_meeting_source(
         second["id"], source_name="b.txt", source_path=source, normalized_path=source,
         source_sha256="source-b", normalized_sha256="normalized-same",
@@ -238,18 +228,100 @@ def test_normalized_meeting_duplicate_does_not_enqueue_second_model_run(tmp_path
     assert second_job is None
 
 
-def test_meeting_metadata_duplicate_does_not_advance_next_field(tmp_path: Path):
+def test_optional_meeting_date_edit_is_deduplicated_and_returns_to_source_step(tmp_path: Path):
     store = VitalyStore(tmp_path / "state")
     meeting = store.begin_meeting(82, 820)
+    assert meeting["step"] == "source"
+    assert meeting["meeting_date"]
+    resumed = VitalyStore(tmp_path / "state").begin_meeting(82, 820)
+    assert resumed["resumed"] is True
+    assert resumed["id"] == meeting["id"]
+    meeting = store.request_meeting_date_edit(meeting["id"], 82, 820)
     accepted = store.submit_meeting_metadata(meeting["id"], "2026-09-16", telegram_message_id=100)
-    assert accepted["step"] == "title"
+    assert accepted["step"] == "source"
     assert store.is_duplicate_meeting_metadata(meeting["id"], "2026-09-16", 100)
     with pytest.raises(StateError, match="уже принято"):
         store.submit_meeting_metadata(meeting["id"], "2026-09-16", telegram_message_id=101)
     unchanged = store.get_meeting(meeting["id"])
     assert unchanged["meeting_date"] == "2026-09-16"
     assert unchanged["title"] is None
-    assert unchanged["step"] == "title"
+    assert unchanged["step"] == "source"
+
+
+def test_legacy_meeting_intake_migrates_to_transcript_step_and_resumes(tmp_path: Path):
+    state = tmp_path / "state"
+    store = VitalyStore(state)
+    meeting = store.begin_meeting(822, 8220)
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE meeting_submissions SET status = 'awaiting_metadata', step = 'vitaly', meeting_date = NULL WHERE id = ?",
+            (meeting["id"],),
+        )
+    migrated = VitalyStore(state).pending_meeting(822, 8220)
+    assert migrated["status"] == "awaiting_source"
+    assert migrated["step"] == "source"
+    assert migrated["meeting_date"]
+
+
+def test_reclassification_archives_previous_result_and_rejects_double_schedule(tmp_path: Path):
+    store = VitalyStore(tmp_path / "state")
+    meeting = store.begin_meeting(821, 8210)
+    source = tmp_path / "transcript.txt"
+    source.write_text("Виталий, какой срок?", encoding="utf-8")
+    meeting, initial_job = store.accept_meeting_source(
+        meeting["id"], source_name=source.name, source_path=source, normalized_path=source,
+        source_sha256="old-classification-source", normalized_sha256="old-classification-normalized",
+    )
+    store.set_meeting_result(meeting["id"], {
+        "status": "needs_clarification", "reason": "Требуется ручное уточнение.",
+        "identity_basis": "ambiguous", "identity_confident": False,
+        "duplicate_of": "", "continuation_of": "", "source_fragments": [], "observed_topics": [],
+    })
+    store.mark_learning_job_running(initial_job["id"])
+    store.finish_learning_job(initial_job["id"])
+
+    job = store.schedule_meeting_reclassification(meeting["id"])
+    refreshed = store.get_meeting(meeting["id"])
+    assert job["kind"] == "meeting_analyze"
+    assert job["payload"]["reclassify"] is True
+    assert refreshed["status"] == "received"
+    assert len(refreshed["classification_history"]) == 1
+    assert refreshed["classification_history"][0]["classification"]["reason"] == "Требуется ручное уточнение."
+    with pytest.raises(StateError, match="ожидающей атрибуции"):
+        store.schedule_meeting_reclassification(meeting["id"])
+
+
+def test_long_meeting_source_context_keeps_its_end_and_verifies_text_span(tmp_path: Path):
+    config = _config(tmp_path)
+    store = VitalyStore(config.state_dir, config.knowledge_dir)
+    manager = LearningManager(store, load_default_profile(), config, LearningRunner())
+    transcript = "Them: Виталий, подтвердите основание.\n" + ("Промежуточный текст. " * 2200) + "\nФИНАЛЬНЫЙ ФРАГМЕНТ ДОЛЖЕН ОСТАТЬСЯ В ОБРАБОТКЕ"
+    path = tmp_path / "long-meeting.txt"
+    path.write_text(transcript, encoding="utf-8")
+    sources = [{"id": "long-meeting", "source_kind": "meeting", "normalized_path": str(path)}]
+    selected, contexts = manager._bounded_learning_batch(sources)
+    assert selected == sources
+    assert contexts[0]["transcript"] == transcript
+    patch = {
+        "question_patterns": [{"evidence_references": [{
+            "meeting_id": "long-meeting", "source": "meeting:long-meeting",
+            "text_span": {"excerpt": "ФИНАЛЬНЫЙ ФРАГМЕНТ ДОЛЖЕН ОСТАТЬСЯ В ОБРАБОТКЕ"},
+        }]}],
+    }
+    manager._validate_candidate_source_references(patch, sources)
+
+
+def test_oversized_transcript_is_not_silently_truncated(tmp_path: Path):
+    config = _config(tmp_path)
+    store = VitalyStore(config.state_dir, config.knowledge_dir)
+    manager = LearningManager(store, load_default_profile(), config, LearningRunner())
+    source = tmp_path / "oversized.txt"
+    source.write_text("x" * 300_001, encoding="utf-8")
+    with pytest.raises(ModelError) as error:
+        manager._bounded_learning_batch([{
+            "id": "oversized-meeting", "source_kind": "meeting", "normalized_path": str(source),
+        }])
+    assert "не был обрезан" in error.value.detail
 
 
 def test_meeting_waits_for_received_feedback_to_finish(tmp_path: Path):
@@ -296,8 +368,6 @@ def test_terminal_intake_jobs_replay_persisted_result_without_second_model_call(
     assert feedback_outcome.payload["assessment"] == feedback_result
 
     meeting = restarted.begin_meeting(85, 850)
-    for value in ("2026-09-16", "Планёрка", "Виталий, руководитель"):
-        meeting = restarted.submit_meeting_metadata(meeting["id"], value)
     transcript = tmp_path / "replay-meeting.txt"
     transcript.write_text("Виталий: где подтверждение?", encoding="utf-8")
     _meeting, meeting_job = restarted.accept_meeting_source(
@@ -492,7 +562,7 @@ def test_learning_batch_is_bounded_and_empty_clarification_cannot_consume_everyt
         {"id": "feedback-{}".format(index), "source_kind": "feedback", "result": {}, "text": "x" * 20_000}
         for index in range(20)
     ]
-    selected, context = manager._bounded_learning_batch(sources)
+    selected, context = manager._bounded_learning_batch(sources, max_chars=100_000)
     assert len(selected) <= 8
     assert len(json.dumps(context, ensure_ascii=False)) <= 100_000
     with pytest.raises(ModelError) as empty_error:
@@ -532,15 +602,16 @@ def test_generator_clarification_is_persisted_without_changing_active_package(tm
     assert store.own_learning_status(150, 15)["feedback"][0]["result"]["learning_outcome"] == "needs_clarification"
 
 
-def test_ambiguous_or_inferred_vitaly_is_never_accepted(tmp_path: Path):
+def test_role_inferred_vitaly_is_accepted_as_a_whole_meeting(tmp_path: Path):
     class InferredRunner(LearningRunner):
         async def run(self, prompt, schema, image_paths=None):
-            del prompt, image_paths
+            self.calls.append(prompt)
+            del image_paths
             assert schema == MEETING_CLASSIFICATION_SCHEMA
             return ModelResult(
                 value={
-                    "status": "accepted", "reason": "Секретная деталь чужой встречи.", "identity_basis": "inferred",
-                    "identity_confident": True, "duplicate_of": "", "continuation_of": "",
+                    "status": "needs_clarification", "reason": "Метки всех реплик одинаковые.", "identity_basis": "ambiguous",
+                    "identity_confident": False, "duplicate_of": "", "continuation_of": "",
                     "source_fragments": ["00:01"], "observed_topics": ["evidence_scope"],
                 }, stdout="", stderr="",
             )
@@ -549,20 +620,50 @@ def test_ambiguous_or_inferred_vitaly_is_never_accepted(tmp_path: Path):
     store = VitalyStore(config.state_dir, config.knowledge_dir)
     manager = LearningManager(store, load_default_profile(), config, InferredRunner())
     meeting = store.begin_meeting(16, 160)
-    for value in ("2026-09-16", "Без меток", "Виталий"):
-        meeting = store.submit_meeting_metadata(meeting["id"], value)
     transcript = tmp_path / "ambiguous.txt"
-    transcript.write_text("Кто-то сказал: где цифры?", encoding="utf-8")
+    transcript.write_text("Meeting Title: План ремонта\nThem: Виталий, где цифры? Почему срок такой?", encoding="utf-8")
     _meeting, job = store.accept_meeting_source(
         meeting["id"], source_name="ambiguous.txt", source_path=transcript, normalized_path=transcript,
         source_sha256="ambiguous-source", normalized_sha256="ambiguous-normalized",
     )
     # The fake runner deliberately bypasses the JSON-schema gateway to prove
-    # the runtime independently rejects an inferred identity as well.
+    # the runtime keeps whole-meeting role inference instead of demanding labels.
     outcome = asyncio.run(manager.execute(job))
-    assert outcome.payload["meeting"]["status"] == "needs_clarification"
-    assert "Секретная" not in outcome.payload["classification"]["reason"]
-    assert "Секретная" in outcome.payload["classification"]["internal_reason"]
+    assert outcome.payload["meeting"]["status"] == "accepted"
+    assert outcome.payload["meeting"]["title"] == "План ремонта"
+    assert outcome.payload["classification"]["identity_basis"] == "role_inferred"
+    assert outcome.payload["classification"]["identity_confident"] is False
+    assert "реплик остаётся спорным" in outcome.payload["classification"]["reason"]
+    assert "confirmed_vitaly_profile" in manager.runner.calls[0]
+    assert "Them" in manager.runner.calls[0]
+
+
+def test_explicit_other_vitaly_evidence_is_still_excluded(tmp_path: Path):
+    class OtherPersonRunner(LearningRunner):
+        async def run(self, prompt, schema, image_paths=None):
+            self.calls.append(prompt)
+            assert schema == MEETING_CLASSIFICATION_SCHEMA
+            return ModelResult(
+                value={
+                    "status": "other_person", "reason": "Текст явно представляет другого Виталия.",
+                    "identity_basis": "speaker_labels", "identity_confident": True,
+                    "duplicate_of": "", "continuation_of": "", "source_fragments": [], "observed_topics": [],
+                }, stdout="", stderr="",
+            )
+
+    config = _config(tmp_path)
+    store = VitalyStore(config.state_dir, config.knowledge_dir)
+    manager = LearningManager(store, load_default_profile(), config, OtherPersonRunner())
+    meeting = store.begin_meeting(17, 170)
+    transcript = tmp_path / "other-vitaly.txt"
+    transcript.write_text("Здесь речь идёт о Виталии Муймапове.", encoding="utf-8")
+    _meeting, job = store.accept_meeting_source(
+        meeting["id"], source_name=transcript.name, source_path=transcript, normalized_path=transcript,
+        source_sha256="other-source", normalized_sha256="other-normalized",
+    )
+    outcome = asyncio.run(manager.execute(job))
+    assert outcome.payload["meeting"]["status"] == "other_person"
+    assert "другого участника" in outcome.payload["classification"]["reason"]
 
 
 def test_general_feedback_rechecks_rendered_pages(tmp_path: Path):

@@ -107,6 +107,24 @@ def test_patch_requires_two_accepted_meetings_for_behavioral_pattern():
         )
 
 
+def test_meeting_references_allow_checkable_text_spans_without_timestamps():
+    profile = load_default_profile()
+    patch = _patch()
+    for number, reference in enumerate(patch["question_patterns"][0]["evidence_references"], start=1):
+        reference.pop("time_range")
+        reference["text_span"] = {"excerpt": "Подтвердите основание цифры {}".format(number)}
+
+    validated = validate_knowledge_patch(
+        patch,
+        accepted_source_ids=["feedback-001"],
+        accepted_meeting_ids=_accepted_meetings(),
+        known_topic_ids=profile.topic_ids,
+        existing_meeting_ids=[meeting["id"] for meeting in profile.core_meetings],
+    )
+    references = validated["question_patterns"][0]["evidence_references"]
+    assert all("text_span" in reference and "time_range" not in reference for reference in references)
+
+
 def test_knowledge_package_is_traceable_reproducible_and_composes_profile():
     baseline = load_default_profile()
     patch = _patch()

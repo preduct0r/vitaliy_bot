@@ -177,14 +177,25 @@ def test_telegram_general_feedback_and_meeting_are_separate_from_case(setup):
         })
         store.finish_learning_job(accepted_feedback['learning_job_id'])
         await dp.feed_update(bot, Update.model_validate(dict(update_id=4, message=dict(base, message_id=4, text='/meeting'))))
-        for update_id, text in enumerate(('2026-09-16', 'Новая встреча', 'Виталий — руководитель'), start=5):
-            await dp.feed_update(bot, Update.model_validate(dict(update_id=update_id, message=dict(base, message_id=update_id, text=text))))
+        pending_meeting = store.pending_meeting(101, 101)
+        assert pending_meeting['step'] == 'source'
+        assert pending_meeting['meeting_date']
+        await dp.feed_update(bot, Update.model_validate(dict(
+            update_id=40,
+            callback_query=dict(id='meeting-date', **{'from': user}, chat_instance='test', message=base,
+                                data='vm:d:' + pending_meeting['id']),
+        )))
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=41, message=dict(base, message_id=41, text='2026-09-24'))))
+        transcript = 'Meeting Title: Новая встреча\nDate: Sep 25\nThem: Виталий, покажите источник и срок. Коллега: подготовим завтра.'
+        await dp.feed_update(bot, Update.model_validate(dict(update_id=42, message=dict(base, message_id=42, text=transcript))))
         await dp.feed_update(bot, Update.model_validate(dict(update_id=8, message=dict(base, message_id=8,
             text='Виталий: покажите источник и срок. Коллега: подготовим завтра.'))))
         meeting = store.pending_meeting(101, 101)
         assert meeting is None
         own = store.own_learning_status(101, 101)
         assert own['meetings'][0]['status'] == 'received'
+        assert own['meetings'][0]['title'] == 'Новая встреча'
+        assert own['meetings'][0]['meeting_date'] == '2026-09-24'
         assert store.artifact_count(case['id']) == 1
         await dp.feed_update(bot, Update.model_validate(dict(update_id=22, message=dict(base, message_id=22,
             text='Это повтор транскрипта.'))))

@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Sequence
 
 import pytest
 
-from tof_reliability.vitaly_bot.documents import DocumentProcessor
+from tof_reliability.vitaly_bot.documents import DocumentProcessor, transcript_title
 from tof_reliability.vitaly_bot.evidence import build_evidence_pack
 from tof_reliability.vitaly_bot.models import ArtifactInput, BotConfig, InputError, ModelError, ModelResult, StateError
 from tof_reliability.vitaly_bot.profile import load_default_profile, score_holdout_coverage
@@ -107,6 +107,11 @@ def _add_text_artifact(store: VitalyStore, case_id: str, tmp_path: Path) -> None
         case_id,
         ArtifactInput("telegram-file-1", source.name, source, source.stat().st_size),
     )
+
+
+def test_meeting_title_uses_transcript_header_and_filename_fallback():
+    assert transcript_title("Meeting Title:  План ремонта на октябрь\nDate: Sep 25", "upload.docx") == "План ремонта на октябрь"
+    assert transcript_title("Them: Виталий, какой срок?", "план_ремонтов.md") == "план_ремонтов"
 
 
 def test_profile_has_exactly_confirmed_core_and_excludes_other_vitaly():

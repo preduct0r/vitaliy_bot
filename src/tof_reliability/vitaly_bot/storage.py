@@ -281,6 +281,14 @@ class VitalyStore:
             );
             CREATE INDEX IF NOT EXISTS idx_meetings_user ON meeting_submissions(user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_meetings_hash ON meeting_submissions(source_sha256, normalized_sha256);
+            CREATE TABLE IF NOT EXISTS meeting_classification_history (
+                id TEXT PRIMARY KEY,
+                meeting_id TEXT NOT NULL REFERENCES meeting_submissions(id) ON DELETE CASCADE,
+                revision INTEGER NOT NULL,
+                classification_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(meeting_id, revision)
+            );
             CREATE TABLE IF NOT EXISTS learning_candidates (
                 id TEXT PRIMARY KEY,
                 source_ids_json TEXT NOT NULL,
@@ -334,6 +342,14 @@ class VitalyStore:
         }.items():
             if name not in meeting_columns:
                 connection.execute("ALTER TABLE meeting_submissions ADD COLUMN " + name + " " + definition)
+        # Old releases asked for date, title, and a speaker label in sequence.
+        # Resume those unfinished uploads directly at the transcript step.
+        connection.execute(
+            """UPDATE meeting_submissions
+               SET meeting_date = COALESCE(meeting_date, ?), status = 'awaiting_source', step = 'source'
+               WHERE status = 'awaiting_metadata' AND step IN ('date', 'title', 'vitaly')""",
+            (_local_now().date().isoformat(),),
+        )
 
     def create_case(
         self, chat_id: int, profile_version: str, knowledge_package_id: Optional[str] = None
@@ -1729,25 +1745,29 @@ class VitalyStore:
             self._assert_meeting_allowed(connection, chat_id)
             existing = connection.execute(
                 """SELECT id FROM meeting_submissions
-                   WHERE chat_id = ? AND status IN ('awaiting_metadata', 'awaiting_source', 'needs_clarification', 'received')
+                   WHERE chat_id = ? AND status IN ('awaiting_metadata', 'awaiting_source', 'received')
                    ORDER BY created_at DESC LIMIT 1""",
                 (chat_id,),
             ).fetchone()
             if existing:
-                raise StateError("Загрузка встречи уже начата или проверяется. Дождитесь результата или используйте /cancel.")
+                meeting = self.get_meeting(str(existing["id"]))
+                if meeting.get("status") in {"awaiting_metadata", "awaiting_source"}:
+                    meeting["resumed"] = True
+                    return meeting
+                raise StateError("Транскрипт уже проверяется. Дождитесь результата; статус: /learning.")
             submission_id = uuid.uuid4().hex
             connection.execute(
                 """INSERT INTO meeting_submissions(
-                       id, chat_id, user_id, status, step, classification_json, created_at, updated_at
-                   ) VALUES (?, ?, ?, 'awaiting_metadata', 'date', '{}', ?, ?)""",
-                (submission_id, chat_id, user_id, now, now),
+                       id, chat_id, user_id, status, step, meeting_date, classification_json, created_at, updated_at
+                   ) VALUES (?, ?, ?, 'awaiting_source', 'source', ?, '{}', ?, ?)""",
+                (submission_id, chat_id, user_id, _local_now().date().isoformat(), now, now),
             )
-        self.record_learning_event("meeting_started", "meeting", submission_id, status="awaiting_metadata", chat_id=chat_id, user_id=user_id)
+        self.record_learning_event("meeting_started", "meeting", submission_id, status="awaiting_source", chat_id=chat_id, user_id=user_id)
         return self.get_meeting(submission_id)
 
     def pending_meeting(self, chat_id: int, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         query = """SELECT * FROM meeting_submissions WHERE chat_id = ?
-                   AND status IN ('awaiting_metadata', 'awaiting_source', 'needs_clarification')"""
+                   AND status IN ('awaiting_metadata', 'awaiting_source')"""
         values: Tuple[Any, ...] = (chat_id,)
         if user_id is not None:
             query += " AND (user_id IS NULL OR user_id = ?)"
@@ -1773,9 +1793,22 @@ class VitalyStore:
     def get_meeting(self, submission_id: str) -> Dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM meeting_submissions WHERE id = ?", (submission_id,)).fetchone()
+            history = connection.execute(
+                "SELECT revision, classification_json, created_at FROM meeting_classification_history WHERE meeting_id = ? ORDER BY revision",
+                (submission_id,),
+            ).fetchall()
         if row is None:
             raise StateError("Загрузка встречи не найдена")
-        return self._learning_row(row)
+        meeting = self._learning_row(row)
+        meeting["classification_history"] = [
+            {
+                "revision": int(item["revision"]),
+                "classification": _load_json(item["classification_json"], {}),
+                "created_at": str(item["created_at"]),
+            }
+            for item in history
+        ]
+        return meeting
 
     def is_duplicate_meeting_metadata(
         self, submission_id: str, value: str, telegram_message_id: Optional[int] = None
@@ -1811,7 +1844,7 @@ class VitalyStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT * FROM meeting_submissions WHERE id = ?", (submission_id,)).fetchone()
-            if row is None or row["status"] != "awaiting_metadata":
+            if row is None or row["status"] not in {"awaiting_metadata", "awaiting_source"}:
                 raise StateError("Этот шаг загрузки встречи уже завершён")
             if (
                 (telegram_message_id is not None and row["last_metadata_message_id"] == telegram_message_id)
@@ -1819,39 +1852,49 @@ class VitalyStore:
             ):
                 raise StateError("Это сообщение уже принято; отправьте данные для следующего шага.")
             step = str(row["step"])
-            if step == "date":
+            if step in {"date", "date_override"}:
                 try:
                     datetime.strptime(clean, "%Y-%m-%d")
                 except ValueError as error:
                     raise InputError("Укажите дату в формате ГГГГ-ММ-ДД, например 2026-09-16") from error
-                updates = (clean, "title", step, digest, telegram_message_id, now, submission_id)
                 connection.execute(
                     """UPDATE meeting_submissions
-                       SET meeting_date = ?, step = ?, last_metadata_step = ?, last_metadata_sha256 = ?,
-                           last_metadata_message_id = ?, updated_at = ? WHERE id = ?""",
-                    updates,
-                )
-            elif step == "title":
-                if len(clean) < 3:
-                    raise InputError("Нужно короткое название встречи")
-                connection.execute(
-                    """UPDATE meeting_submissions
-                       SET title = ?, step = 'vitaly', last_metadata_step = ?, last_metadata_sha256 = ?,
-                           last_metadata_message_id = ?, updated_at = ? WHERE id = ?""",
-                    (clean[:300], step, digest, telegram_message_id, now, submission_id),
-                )
-            elif step == "vitaly":
-                if len(clean) < 2:
-                    raise InputError("Нужно обозначение нужного Виталия среди говорящих")
-                connection.execute(
-                    """UPDATE meeting_submissions
-                       SET vitaly_designation = ?, status = 'awaiting_source', step = 'source',
-                           last_metadata_step = ?, last_metadata_sha256 = ?, last_metadata_message_id = ?, updated_at = ?
-                       WHERE id = ?""",
-                    (clean[:300], step, digest, telegram_message_id, now, submission_id),
+                       SET meeting_date = ?, status = 'awaiting_source', step = 'source', last_metadata_step = ?,
+                           last_metadata_sha256 = ?, last_metadata_message_id = ?, updated_at = ? WHERE id = ?""",
+                    (clean, step, digest, telegram_message_id, now, submission_id),
                 )
             else:
                 raise StateError("Сначала отправьте сам транскрипт")
+        return self.get_meeting(submission_id)
+
+    def request_meeting_date_edit(self, submission_id: str, chat_id: int, user_id: Optional[int]) -> Dict[str, Any]:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM meeting_submissions WHERE id = ?", (submission_id,)).fetchone()
+            if row is None or int(row["chat_id"]) != chat_id or (user_id is not None and row["user_id"] not in {None, user_id}):
+                raise StateError("Эта кнопка больше не относится к вашей загрузке встречи")
+            if row["status"] != "awaiting_source" or row["step"] != "source":
+                raise StateError("Дату можно изменить только до отправки транскрипта")
+            connection.execute(
+                "UPDATE meeting_submissions SET status = 'awaiting_metadata', step = 'date_override', updated_at = ? WHERE id = ?",
+                (now, submission_id),
+            )
+        return self.get_meeting(submission_id)
+
+    def resume_meeting_source(self, submission_id: str, chat_id: int, user_id: Optional[int]) -> Dict[str, Any]:
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM meeting_submissions WHERE id = ?", (submission_id,)).fetchone()
+            if row is None or int(row["chat_id"]) != chat_id or (user_id is not None and row["user_id"] not in {None, user_id}):
+                raise StateError("Эта кнопка больше не относится к вашей загрузке встречи")
+            if row["status"] != "awaiting_metadata" or row["step"] != "date_override":
+                raise StateError("Изменение даты уже завершено")
+            connection.execute(
+                "UPDATE meeting_submissions SET status = 'awaiting_source', step = 'source', updated_at = ? WHERE id = ?",
+                (now, submission_id),
+            )
         return self.get_meeting(submission_id)
 
     def submit_meeting_clarification(self, submission_id: str, value: str) -> Dict[str, Any]:
@@ -1885,6 +1928,7 @@ class VitalyStore:
         self,
         submission_id: str,
         *,
+        title: Optional[str] = None,
         source_name: str,
         source_path: Path,
         normalized_path: Path,
@@ -1921,8 +1965,8 @@ class VitalyStore:
                 connection.execute(
                     """UPDATE meeting_submissions
                        SET source_name = ?, source_path = ?, normalized_path = ?, source_sha256 = ?, normalized_sha256 = ?,
-                           status = 'duplicate', step = 'done', duplicate_of = ?, updated_at = ? WHERE id = ?""",
-                    (source_name, str(source_path), str(normalized_path), source_sha256, normalized_sha256, duplicate["id"], now, submission_id),
+                           title = COALESCE(?, title), status = 'duplicate', step = 'done', duplicate_of = ?, updated_at = ? WHERE id = ?""",
+                    (source_name, str(source_path), str(normalized_path), source_sha256, normalized_sha256, title, duplicate["id"], now, submission_id),
                 )
                 event_status = "duplicate"
                 job = None
@@ -1939,14 +1983,68 @@ class VitalyStore:
                 connection.execute(
                     """UPDATE meeting_submissions
                        SET source_name = ?, source_path = ?, normalized_path = ?, source_sha256 = ?, normalized_sha256 = ?,
-                           status = 'received', step = 'classifying', learning_job_id = ?, updated_at = ? WHERE id = ?""",
-                    (source_name, str(source_path), str(normalized_path), source_sha256, normalized_sha256, job_id, now, submission_id),
+                           title = COALESCE(?, title), status = 'received', step = 'classifying', learning_job_id = ?, updated_at = ? WHERE id = ?""",
+                    (source_name, str(source_path), str(normalized_path), source_sha256, normalized_sha256, title, job_id, now, submission_id),
                 )
                 event_status = "received"
                 job = self._get_learning_job(connection, job_id)
         meeting = self.get_meeting(submission_id)
         self.record_learning_event("meeting_source_received", "meeting", submission_id, status=event_status, chat_id=int(meeting["chat_id"]), user_id=meeting.get("user_id"))
         return meeting, job
+
+    def set_meeting_title(self, submission_id: str, title: str) -> Dict[str, Any]:
+        clean = " ".join(title.split())[:300]
+        if not clean:
+            raise InputError("Не удалось определить название встречи")
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE meeting_submissions SET title = ?, updated_at = ? WHERE id = ?",
+                (clean, _utc_now(), submission_id),
+            )
+        return self.get_meeting(submission_id)
+
+    def schedule_meeting_reclassification(self, submission_id: str) -> Dict[str, Any]:
+        """Queue one explicit reclassification and retain the prior result."""
+
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM meeting_submissions WHERE id = ?", (submission_id,)).fetchone()
+            if row is None:
+                raise StateError("Загрузка встречи не найдена")
+            if row["status"] != "needs_clarification":
+                raise StateError("Повторная проверка допустима только для встречи, ожидающей атрибуции")
+            source_path = Path(str(row["normalized_path"] or ""))
+            if not source_path.is_file():
+                raise StateError("Исходный транскрипт больше не найден; загрузите его в новом кейсе")
+            if connection.execute(
+                "SELECT 1 FROM meeting_classification_history WHERE meeting_id = ? LIMIT 1", (submission_id,)
+            ).fetchone():
+                raise StateError("Для этой встречи повторная классификация уже запускалась")
+            previous = str(row["classification_json"] or "{}")
+            revision = int(connection.execute(
+                "SELECT COALESCE(MAX(revision), 0) + 1 FROM meeting_classification_history WHERE meeting_id = ?",
+                (submission_id,),
+            ).fetchone()[0])
+            connection.execute(
+                "INSERT INTO meeting_classification_history(id, meeting_id, revision, classification_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (uuid.uuid4().hex, submission_id, revision, previous, now),
+            )
+            job_id = self._insert_learning_job(
+                connection,
+                chat_id=int(row["chat_id"]),
+                user_id=row["user_id"],
+                kind="meeting_analyze",
+                submission_id=submission_id,
+                payload={"reclassify": True},
+                now=now,
+            )
+            connection.execute(
+                "UPDATE meeting_submissions SET status = 'received', step = 'classifying', learning_job_id = ?, updated_at = ? WHERE id = ?",
+                (job_id, now, submission_id),
+            )
+        self.record_learning_event("meeting_reclassification_scheduled", "meeting", submission_id, status="received", chat_id=int(row["chat_id"]), user_id=row["user_id"])
+        return self.get_learning_job(job_id)
 
     def cancel_meeting(self, chat_id: int, user_id: Optional[int] = None) -> bool:
         pending = self.pending_meeting(chat_id, user_id)
@@ -2059,7 +2157,10 @@ class VitalyStore:
             meetings = connection.execute(
                 "SELECT * FROM meeting_submissions WHERE " + where + " ORDER BY created_at DESC LIMIT 10", (value,)
             ).fetchall()
-        return {"feedback": [self._learning_row(row) for row in feedback], "meetings": [self._learning_row(row) for row in meetings]}
+        return {
+            "feedback": [self._learning_row(row) for row in feedback],
+            "meetings": [self.get_meeting(str(row["id"])) for row in meetings],
+        }
 
     def set_feedback_result(self, submission_id: str, status: str, result: Dict[str, Any]) -> Dict[str, Any]:
         if status not in {"case_only", "example", "candidate", "insufficient", "rejected", "analyzed"}:

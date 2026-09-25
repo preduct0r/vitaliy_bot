@@ -328,6 +328,7 @@ class DocumentProcessor:
             pass
         return {
             "source_name": target.name,
+            "title": transcript_title(body, artifact.original_name),
             "source_path": target,
             "normalized_path": normalized_path,
             "source_sha256": sha256(target),
@@ -338,6 +339,21 @@ class DocumentProcessor:
 
 def uuid_safe_prefix(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def transcript_title(text: str, source_name: str) -> str:
+    """Use an explicit transcript title when present, otherwise the filename."""
+
+    for line in text.splitlines()[:80]:
+        match = re.match(
+            r"^\s*(?:meeting\s+title|название\s+встречи|тема\s+встречи)\s*[:—-]\s*(.*?)\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match and match.group(1).strip():
+            return match.group(1).strip()[:300]
+    fallback = Path(source_name).stem.strip() or "Встреча"
+    return fallback[:300]
 
 
 def _semantic_text(value: str) -> str:

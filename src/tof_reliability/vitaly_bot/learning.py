@@ -247,8 +247,13 @@ def _meeting_references(
         if meeting_id not in meeting_ids:
             raise InputError("Ссылка встречи {} указывает на встречу вне паттерна".format(number))
         _nonempty_text(raw.get("source"), "source", limit=1000)
-        if not isinstance(raw.get("time_range"), str) or not raw["time_range"].strip():
-            raise InputError("Ссылка встречи {} не содержит диапазона реплики".format(number))
+        time_range = raw.get("time_range")
+        span = raw.get("text_span")
+        has_time = isinstance(time_range, str) and bool(time_range.strip())
+        excerpt = span.get("excerpt") if isinstance(span, Mapping) else None
+        has_text_span = isinstance(excerpt, str) and 12 <= len(excerpt.strip()) <= 500
+        if not has_time and not has_text_span:
+            raise InputError("Ссылка встречи {} должна содержать время или проверяемый текстовый фрагмент".format(number))
         clean = canonical_copy(dict(raw))
         result.append(clean)
         referenced.add(meeting_id)

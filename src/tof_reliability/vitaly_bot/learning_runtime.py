@@ -63,8 +63,12 @@ MEETING_REFERENCE_SCHEMA = _object(
         "meeting_id": {"type": "string"},
         "source": {"type": "string"},
         "time_range": {"type": "string"},
+        "text_span": _object(
+            {"excerpt": {"type": "string"}},
+            ["excerpt"],
+        ),
     },
-    ["meeting_id", "source", "time_range"],
+    ["meeting_id", "source"],
 )
 
 ANALYSIS_RULE_SCHEMA = _object(
@@ -140,7 +144,7 @@ MEETING_CLASSIFICATION_SCHEMA = _object(
             "enum": ["accepted", "duplicate", "continuation", "other_person", "needs_clarification"],
         },
         "reason": {"type": "string"},
-        "identity_basis": {"type": "string", "enum": ["speaker_labels", "user_designation", "ambiguous"]},
+        "identity_basis": {"type": "string", "enum": ["speaker_labels", "user_designation", "role_inferred", "ambiguous"]},
         "identity_confident": {"type": "boolean"},
         "duplicate_of": {"type": "string"},
         "continuation_of": {"type": "string"},
@@ -302,13 +306,14 @@ class LearningManager:
         raise last_error or ModelError("codex_transient")
 
     @staticmethod
-    def _read_text(path_value: Any, maximum: int = 55_000) -> str:
+    def _read_text(path_value: Any, maximum: Optional[int] = None) -> str:
         if not path_value:
             return ""
         path = Path(str(path_value))
         if not path.is_file():
             return ""
-        return path.read_text(encoding="utf-8", errors="replace")[:maximum]
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return text if maximum is None else text[:maximum]
 
     def _feedback_images(self, case_id: str) -> List[Path]:
         """Attach a bounded visual sample when assessing a slide-related claim."""
@@ -369,6 +374,8 @@ class LearningManager:
         return LearningOutcome("feedback_analyzed", {"feedback": saved, "assessment": result})
 
     async def _analyze_meeting(self, job: Dict[str, Any]) -> LearningOutcome:
+        from .documents import transcript_title
+
         meeting = self.store.get_meeting(str(job["submission_id"]))
         # The same restart boundary applies to classified meetings.  In
         # particular, a ``needs_clarification`` result is not a license to
@@ -385,6 +392,9 @@ class LearningManager:
         transcript = self._read_text(meeting.get("normalized_path"))
         if not transcript:
             raise StateError("Текст транскрипта недоступен; загрузите встречу заново")
+        inferred_title = transcript_title(transcript, str(meeting.get("source_name") or "Встреча"))
+        if inferred_title != str(meeting.get("title") or ""):
+            meeting = self.store.set_meeting_title(str(meeting["id"]), inferred_title)
         candidates: List[Dict[str, Any]] = []
         for other in self.store.meeting_similarity_candidates(str(meeting["id"])):
             candidates.append(
@@ -396,12 +406,20 @@ class LearningManager:
                     "text": self._read_text(other.get("normalized_path"), 12_000),
                 }
             )
+        active = self.active_package()
+        active_profile = VitalyProfile.from_dict(dict(active["package"]["profile"]))
         prompt = (
             "Ты классифицируешь новый транскрипт для профиля переговорного поведения. "
-            "Нельзя приписывать реплики нужному Виталию без достаточной атрибуции. "
+            "Для Granola учитывай, что весь разговор может быть помечен Them или одним участником. "
+            "Искомый Виталий — тот, кто ведёт переговоры: задаёт жёсткие уточняющие вопросы, перебивает и возвращает "
+            "собеседников к цифрам, срокам и основаниям. Восстанавливай роль по последовательности вопросов и ответов "
+            "и сходству с подтверждёнными паттернами. Упоминание или обращение по имени само по себе не доказывает роль: "
+            "не путай адресата с тем, кто задаёт вопросы. Это допустимая role_inferred атрибуция. "
+            "По принятому правилу запись принимается целиком, даже если отдельные реплики нельзя надёжно разделить. "
+            "Не выбирай needs_clarification только из-за отсутствия speaker labels или неоднозначности отдельных реплик. "
+            "other_person ставь только при явном свидетельстве в записи, что речь о другом Виталии. "
             "Проверь точные/содержательные дубли и продолжение одной встречи. "
-            "accepted означает: это отдельная встреча нужного Виталия с достаточной атрибуцией; "
-            "other_person — другой Виталий; needs_clarification — сведений недостаточно. "
+            "accepted означает самостоятельную встречу нужного Виталия; не требуется назвать его метку говорящего. "
             "Не извлекай бизнес-факты и не копируй реплики дословно.\n"
             + _json(
                 {
@@ -412,34 +430,42 @@ class LearningManager:
                         "target_vitaly_designation": meeting.get("vitaly_designation"),
                     },
                     "transcript": transcript,
+                    "confirmed_vitaly_profile": self._profile_generation_context(active_profile),
                     "possible_duplicates_or_continuations": candidates,
                 }
             )
         )
         result = await self._model(job, "meeting_analyze", prompt, MEETING_CLASSIFICATION_SCHEMA)
-        if result["status"] == "accepted" and (
-            not result["identity_confident"]
-            or result["identity_basis"] not in {"speaker_labels", "user_designation"}
-        ):
+        result = dict(result)
+        if result["status"] == "needs_clarification":
+            result["status"] = "accepted"
+            result["identity_basis"] = "role_inferred"
+            result["identity_confident"] = False
+            result["reason"] = str(result.get("reason") or "") + " Принята целиком по пользовательскому правилу; отдельные роли остаются спорными."
+        elif result["status"] == "accepted" and result["identity_basis"] == "ambiguous":
             result = dict(result)
-            result["status"] = "needs_clarification"
+            result["identity_basis"] = "role_inferred"
+            result["identity_confident"] = False
         # The classifier compares this transcript to archive records that may
         # belong to another person.  Its free-form rationale is retained only
         # as local diagnostic evidence; all Telegram-visible paths use a
         # fixed, source-free explanation.
         result = dict(result)
         result["internal_reason"] = str(result.get("reason") or "")
-        result["reason"] = {
+        public_reason = {
             "accepted": "Запись атрибутирована нужному Виталию и прошла проверку на дубли.",
             "duplicate": "Совпадение с уже известной записью подтверждено проверкой дубликатов.",
             "continuation": "Запись относится к продолжению уже известной встречи.",
             "other_person": "Атрибуция указывает на другого участника с этим именем.",
             "needs_clarification": "Недостаточно данных, чтобы надёжно атрибутировать нужного Виталия.",
         }[str(result["status"])]
+        if result["status"] == "accepted" and result.get("identity_basis") == "role_inferred" and not result.get("identity_confident"):
+            public_reason = "Запись принята целиком по последовательности обращений, вопросов и уточнений; распределение отдельных реплик остаётся спорным."
+        result["reason"] = public_reason
         saved = self.store.set_meeting_result(str(meeting["id"]), result)
         return LearningOutcome("meeting_analyzed", {"meeting": saved, "classification": result})
 
-    def _source_context(self, source: Dict[str, Any], transcript_limit: int = 55_000) -> Dict[str, Any]:
+    def _source_context(self, source: Dict[str, Any], transcript_limit: Optional[int] = None) -> Dict[str, Any]:
         if source["source_kind"] == "feedback":
             return {
                 "source_id": source["id"],
@@ -459,7 +485,7 @@ class LearningManager:
         }
 
     def _bounded_learning_batch(
-        self, sources: Sequence[Dict[str, Any]], *, max_sources: int = 8, max_chars: int = 100_000
+        self, sources: Sequence[Dict[str, Any]], *, max_sources: int = 8, max_chars: int = 300_000
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Select a deterministic, bounded source batch for one daily cycle.
 
@@ -474,18 +500,20 @@ class LearningManager:
         for source in sources:
             if len(selected) >= max_sources or remaining < 1:
                 break
-            per_source = min(30_000, max(4_000, remaining))
-            context = self._source_context(source, transcript_limit=per_source)
+            # Transcripts are never sliced: a profile update must be able to
+            # cite material from the end of a long meeting as well as its start.
+            # Feedback bodies retain their independent, small per-item bound.
+            context = self._source_context(source, transcript_limit=16_000 if source.get("source_kind") == "feedback" else None)
             size = len(_json(context))
             if size > remaining and selected:
                 continue
             if size > remaining:
-                # The first source is still useful, but its raw transcript is
-                # truncated to the fixed total budget.
                 if "transcript" in context:
-                    context["transcript"] = str(context["transcript"])[:remaining]
-                elif "text" in context:
-                    context["text"] = str(context["text"])[:remaining]
+                    raise ModelError(
+                        "learning_transcript_too_large",
+                        "Транскрипт превышает безопасный размер одного запуска; он сохранён целиком, но не был обрезан или обработан частично.",
+                    )
+                context["text"] = str(context.get("text") or "")[:max(0, remaining)]
                 size = len(_json(context))
             selected.append(source)
             contexts.append(context)
@@ -539,8 +567,17 @@ class LearningManager:
                 if str(reference.get("source") or "") != self._meeting_locator(meeting_id):
                     raise ModelError("model_output_invalid_schema", "Ссылка паттерна не совпадает с архивом встречи")
                 time_range = str(reference.get("time_range") or "")
-                if not re.fullmatch(r"\d{1,2}:\d{2}(?:\s*[-–]\s*\d{1,2}:\d{2})?", time_range):
-                    raise ModelError("model_output_invalid_schema", "У ссылки встречи неверный диапазон времени")
+                if time_range:
+                    if not re.fullmatch(r"\d{1,2}:\d{2}(?:\s*[-–]\s*\d{1,2}:\d{2})?", time_range):
+                        raise ModelError("model_output_invalid_schema", "У ссылки встречи неверный диапазон времени")
+                    continue
+                span = reference.get("text_span")
+                excerpt = str(span.get("excerpt") or "").strip() if isinstance(span, dict) else ""
+                if len(excerpt) < 12 or len(excerpt) > 500:
+                    raise ModelError("model_output_invalid_schema", "У ссылки встречи неверный текстовый фрагмент")
+                transcript = self._read_text(source.get("normalized_path"))
+                if not transcript or transcript.count(excerpt) != 1:
+                    raise ModelError("model_output_invalid_schema", "Текстовая ссылка встречи должна один раз точно встречаться в сохранённом транскрипте")
         for meeting in patch.get("meetings", []):
             if not isinstance(meeting, dict):
                 continue
@@ -674,7 +711,8 @@ class LearningManager:
             "Поведенческий паттерн обязан иметь минимум две разные принятые встречи. "
             "Правило анализа обязано выбрать transfer_key из схемы. Поведенческий паттерн может только replace "
             "существующую тему и обязан выбрать style_mode из схемы. Для каждой новой встречи и её ссылки "
-            "используй source строго в форме meeting:<source_id>. "
+            "используй source строго в форме meeting:<source_id>. Если у транскрипта нет таймкодов, "
+            "укажи text_span.excerpt — короткий точный фрагмент из доступного транскрипта; он будет проверен по архиву. "
             "Не копируй реплики дословно, не делай новые бизнес-факты и не используй сомнительную атрибуцию. "
             "Если обоснованного изменения нет, decision=none и верни пустой patch с обязательной структурой.\n"
             + _json(

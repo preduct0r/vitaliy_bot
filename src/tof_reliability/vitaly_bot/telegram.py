@@ -13,7 +13,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BotCommand, CallbackQuery, Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.chat_action import ChatActionSender
 
 from .config import load_config
@@ -34,7 +34,7 @@ HELP_TEXT = (
     "4. /stop — прекратить вопросы и получить итоговый разбор.\n"
     "5. /status — увидеть этап, очередь и ошибку.\n\n"
     "Ошибочный пункт аудита можно перепроверить кнопкой «Исправить пункт»; общую проблему — кнопкой «Общая обратная связь».\n"
-    "/meeting — добавить транскрипт новой встречи в отдельную базу профиля.\n"
+    "/meeting — сразу отправить транскрипт новой встречи; дата по умолчанию сегодняшняя, её можно изменить кнопкой.\n"
     "/learning — увидеть версию контекста и статус своих отправок.\n\n"
     "Пока бот занят, новые файлы, текст и команды не принимаются. Поддерживаются PPTX, PDF, DOCX, XLSX, TXT, MD, "
     "CSV, PNG и JPEG; до 50 МБ на файл. Новый кейс: /new."
@@ -281,17 +281,22 @@ def format_learning_status(runtime: "TelegramRuntime", chat_id: int, user_id: Op
 
 def _next_meeting_prompt(meeting: Dict[str, Any]) -> str:
     step = str(meeting.get("step"))
-    if step == "date":
-        return "Укажите дату встречи в формате ГГГГ-ММ-ДД."
-    if step == "title":
-        return "Укажите короткое название встречи."
-    if step == "vitaly":
-        return "Как среди говорящих обозначен нужный Виталий? Не угадывайте: укажите имя, роль или метку из транскрипта."
+    if step == "date_override":
+        return "Отправьте новую дату в формате ГГГГ-ММ-ДД. Сейчас указано: " + str(meeting.get("meeting_date") or "не указана") + "."
     if step == "source":
         return "Отправьте транскрипт: текст сообщением или TXT, MD, DOCX либо текстовый PDF. Аудио в этот режим не принимается."
-    if step == "clarification":
-        return "Нужно уточнить, как в транскрипте распознать нужного Виталия. Ответьте одним сообщением или /cancel."
     return "Встреча принята в обработку."
+
+
+def _meeting_prompt_markup(meeting: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
+    submission_id = str(meeting.get("id") or "")
+    if not submission_id or str(meeting.get("step")) not in {"source", "date_override"}:
+        return None
+    if str(meeting.get("step")) == "date_override":
+        button = InlineKeyboardButton(text="Назад к загрузке", callback_data="vm:b:" + submission_id)
+    else:
+        button = InlineKeyboardButton(text="Изменить дату", callback_data="vm:d:" + submission_id)
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
 
 
 def user_error(error: Exception) -> str:
@@ -306,6 +311,7 @@ def user_error(error: Exception) -> str:
             "model_timeout": "Модель не ответила вовремя; запуск остановлен. Повторите действие позже.",
             "model_output_invalid_json": "Модель вернула неполный структурированный ответ. Повторите команду.",
             "model_output_invalid_schema": "Модель вернула ответ не по контракту. Повторите команду.",
+            "learning_transcript_too_large": "Транскрипт сохранён целиком, но превышает безопасный размер одного обучающего запуска; он не обрезан и не будет обработан частично.",
         }
         return messages.get(error.code, "Модельный запуск не завершился: " + error.code)
     if isinstance(error, VitalyBotError):
@@ -789,9 +795,41 @@ def build_router(runtime: TelegramRuntime) -> Router:
     async def meeting(message: Message) -> None:
         try:
             intake = runtime.store.begin_meeting(message.chat.id, user_id(message))
-            await send_with_retry(runtime.bot, message.chat.id, "Новый транскрипт будет храниться отдельно от текущего кейса. " + _next_meeting_prompt(intake))
+            prefix = "Незавершённая загрузка восстановлена. " if intake.pop("resumed", False) else "Новый транскрипт будет храниться отдельно от текущего кейса. "
+            await send_with_retry(
+                runtime.bot, message.chat.id, prefix + "Дата по умолчанию: " + str(intake.get("meeting_date")) + ". " + _next_meeting_prompt(intake),
+                reply_markup=_meeting_prompt_markup(intake),
+            )
         except Exception as error:
             await send_with_retry(runtime.bot, message.chat.id, user_error(error))
+
+    @router.callback_query(F.data.startswith("vm:"))
+    async def meeting_date_callback(query: CallbackQuery) -> None:
+        if not query.message:
+            await query.answer("Откройте загрузку встречи в чате с ботом.", show_alert=True)
+            return
+        try:
+            _prefix, action, submission_id = str(query.data or "").split(":", 2)
+            if action == "d":
+                intake = runtime.store.request_meeting_date_edit(
+                    submission_id, query.message.chat.id, query.from_user.id
+                )
+            elif action == "b":
+                intake = runtime.store.resume_meeting_source(
+                    submission_id, query.message.chat.id, query.from_user.id
+                )
+            else:
+                raise StateError("Эта кнопка больше не действует")
+            await query.answer()
+            await send_with_retry(
+                runtime.bot, query.message.chat.id, _next_meeting_prompt(intake),
+                reply_markup=_meeting_prompt_markup(intake),
+            )
+        except Exception as error:
+            try:
+                await query.answer(user_error(error), show_alert=True)
+            except (TelegramBadRequest, TelegramNetworkError):
+                pass
 
     @router.message(Command("learning"))
     async def learning(message: Message) -> None:
@@ -942,6 +980,7 @@ def build_router(runtime: TelegramRuntime) -> Router:
             )
             meeting, job = runtime.store.accept_meeting_source(
                 str(intake["id"]),
+                title=str(prepared.get("title") or ""),
                 source_name=str(prepared["source_name"]),
                 source_path=Path(prepared["source_path"]),
                 normalized_path=Path(prepared["normalized_path"]),
@@ -1006,17 +1045,15 @@ def build_router(runtime: TelegramRuntime) -> Router:
                     )
                     return
                 step = str(pending_meeting.get("step"))
-                if step in {"date", "title", "vitaly"}:
+                if step == "date_override":
                     updated = runtime.store.submit_meeting_metadata(
                         str(pending_meeting["id"]), message.text, message.message_id
                     )
-                    await send_with_retry(runtime.bot, message.chat.id, _next_meeting_prompt(updated))
-                    return
-                if step == "clarification":
-                    job = runtime.store.submit_meeting_clarification(str(pending_meeting["id"]), message.text)
-                    runtime.worker.notify()
-                    runtime._ensure_learning_typing(job)
-                    await send_with_retry(runtime.bot, message.chat.id, "⏳ Уточнение принято. Повторно проверяю атрибуцию встречи…")
+                    await send_with_retry(
+                        runtime.bot, message.chat.id,
+                        "✅ Дата встречи изменена на " + str(updated.get("meeting_date")) + ". " + _next_meeting_prompt(updated),
+                        reply_markup=_meeting_prompt_markup(updated),
+                    )
                     return
                 if step == "source":
                     runtime.store.ensure_free_space(runtime.config.min_free_bytes, runtime.store.knowledge_root)
@@ -1036,6 +1073,7 @@ def build_router(runtime: TelegramRuntime) -> Router:
                     )
                     _meeting, job = runtime.store.accept_meeting_source(
                         str(pending_meeting["id"]),
+                        title=str(prepared.get("title") or ""),
                         source_name=str(prepared["source_name"]),
                         source_path=Path(prepared["source_path"]),
                         normalized_path=Path(prepared["normalized_path"]),
