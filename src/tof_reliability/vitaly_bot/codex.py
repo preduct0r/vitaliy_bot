@@ -155,12 +155,21 @@ class CodexRunner:
 
 
 def codex_binary_from_environment(value: Optional[str]) -> Path:
-    """Resolve the desktop bundle first, then a command supplied in PATH."""
+    """Resolve the configured CLI, current desktop bundle, then PATH."""
 
-    if value:
-        return Path(value)
-    desktop = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
-    if desktop.exists():
-        return desktop
+    configured = Path(value) if value else None
+    if configured is not None and configured.exists():
+        return configured
+    resources = Path("/Applications/ChatGPT.app/Contents/Resources")
+    # ChatGPT has shipped the CLI at both the resources root and inside its
+    # bundled CodexCLI app. A stale saved path should not disable the bot.
+    desktop_candidates = [
+        resources / "codex",
+        resources / "codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        *sorted(resources.glob("codex-cli/*/Contents/MacOS/codex")),
+    ]
+    for desktop in desktop_candidates:
+        if desktop.is_file():
+            return desktop
     discovered = shutil.which("codex")
-    return Path(discovered) if discovered else Path("codex")
+    return Path(discovered) if discovered else configured or Path("codex")
