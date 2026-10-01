@@ -66,7 +66,9 @@ def switch(plist_path, candidate, state, backup, knowledge_dir=None):
     finally:
         os.kill(old_pid, signal.SIGCONT)
     domain = f'gui/{os.getuid()}'
-    for _ in range(50):
+    # Polling shutdown can take longer than five seconds while Telegram's
+    # long-poll request is cancelled. Keep the old plist in place until exit.
+    for _ in range(300):
         if pid() is None:
             break
         time.sleep(.1)

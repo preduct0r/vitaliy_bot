@@ -514,3 +514,30 @@ def test_release_restores_previous_plist_on_failed_bootstrap(setup, tmp_path, mo
     import tarfile
     with tarfile.open(tmp_path / "backup" / "knowledge.tar.gz") as archive:
         assert archive.getnames() == ["knowledge", "knowledge/meeting.txt"]
+
+
+def test_release_waits_for_slow_graceful_shutdown(setup, tmp_path, monkeypatch):
+    from scripts import vitaly_release
+    from types import SimpleNamespace
+    store, _, _, _ = setup
+    live, candidate = tmp_path / 'live.plist', tmp_path / 'candidate.plist'
+    live.write_bytes(b'previous')
+    candidate.write_bytes(b'candidate')
+    calls = 0
+
+    def pid():
+        nonlocal calls
+        calls += 1
+        if calls <= 61:
+            return 123
+        if calls <= 63:
+            return None
+        return 456
+
+    monkeypatch.setattr(vitaly_release, 'pid', pid)
+    monkeypatch.setattr(vitaly_release.os, 'kill', lambda *a: None)
+    monkeypatch.setattr(vitaly_release.time, 'sleep', lambda *a: None)
+    monkeypatch.setattr(vitaly_release.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0))
+    vitaly_release.switch(live, candidate, store.state_dir, tmp_path / 'backup')
+    assert live.read_bytes() == b'candidate'
+    assert calls >= 65
