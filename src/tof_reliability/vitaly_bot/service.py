@@ -59,12 +59,12 @@ QUESTION_PROPERTIES = {
 def review_schema(profile: VitalyProfile) -> Dict[str, Any]:
     question = _object(
         dict(QUESTION_PROPERTIES, topic={"type": "string", "enum": profile.topic_ids}),
-        [key for key in QUESTION_PROPERTIES if key != "material_locations"],
+        list(QUESTION_PROPERTIES),
     )
     gap = _object(
         {"title": {"type": "string"}, "detail": {"type": "string"}, "material_reference": {"type": "string"},
          "material_locations": QUESTION_PROPERTIES["material_locations"]},
-        ["title", "detail", "material_reference"],
+        ["title", "detail", "material_reference", "material_locations"],
     )
     return _object(
         {

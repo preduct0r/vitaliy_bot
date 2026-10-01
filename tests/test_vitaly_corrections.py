@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -435,11 +436,11 @@ def test_snapshot_resolves_only_configured_knowledge_path(tmp_path, monkeypatch)
     assert resolve_knowledge_dir(state) == tmp_path / "from-config-path"
 
 
-def test_external_tof_client_uses_its_own_interpreter(setup, tmp_path, monkeypatch):
+def test_evidence_transport_uses_published_server_runtime(setup, tmp_path, monkeypatch):
     from tof_reliability.vitaly_bot.evidence import RemoteLedgerEvidenceProvider
     from tof_reliability.vitaly_bot.models import EvidenceError
-    root = tmp_path / 'external-tof'
-    monkeypatch.setenv('VITALY_BOT_TOF_ROOT', str(root))
+    monkeypatch.setenv('VITALY_BOT_TOF_ROOT', str(tmp_path / 'missing-local-tof'))
+    monkeypatch.setenv('TOF_SSH_HOST', 'tof-test')
     commands = []
     async def launch(*args, **kwargs):
         commands.append((args, kwargs))
@@ -447,9 +448,40 @@ def test_external_tof_client_uses_its_own_interpreter(setup, tmp_path, monkeypat
     monkeypatch.setattr(asyncio, 'create_subprocess_exec', launch)
     with pytest.raises(EvidenceError):
         asyncio.run(RemoteLedgerEvidenceProvider(setup[1].config).build('test', []))
-    assert commands[0][0][0] == str(root / '.venv/bin/python')
-    assert commands[0][0][1] == str(root / 'scripts/tof_remote_workspace.py')
-    assert commands[0][1]['cwd'] == str(root)
+    assert commands[0][0][:2] == ('ssh', '-T')
+    assert 'tof-test' in commands[0][0]
+    assert '/srv/tof/repos/tof_v1/.venv/bin/python -' in commands[0][0][-1]
+    assert commands[0][1]['stdin'] == asyncio.subprocess.PIPE
+
+
+def test_evidence_transport_kills_timed_out_ssh_process(setup, monkeypatch):
+    from tof_reliability.vitaly_bot.evidence import RemoteLedgerEvidenceProvider
+    from tof_reliability.vitaly_bot.models import EvidenceError
+
+    class HangingProcess:
+        killed = False
+
+        async def communicate(self, _input=None):
+            await asyncio.Event().wait()
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            return 0
+
+    process = HangingProcess()
+
+    async def launch(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', launch)
+    config = replace(setup[1].config, evidence_timeout_seconds=0.01)
+    with pytest.raises(EvidenceError) as caught:
+        asyncio.run(RemoteLedgerEvidenceProvider(config).build('test', []))
+
+    assert caught.value.code == 'tof_unavailable'
+    assert process.killed
 
 
 def test_release_restores_previous_plist_on_failed_bootstrap(setup, tmp_path, monkeypatch):

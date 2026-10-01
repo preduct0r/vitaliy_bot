@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional, Sequence
 import pytest
 
 from tof_reliability.vitaly_bot.documents import DocumentProcessor, transcript_title
-from tof_reliability.vitaly_bot.evidence import build_evidence_pack
+from tof_reliability.vitaly_bot.evidence import build_evidence_pack, extract_hints
 from tof_reliability.vitaly_bot.models import ArtifactInput, BotConfig, InputError, ModelError, ModelResult, StateError
 from tof_reliability.vitaly_bot.profile import load_default_profile, score_holdout_coverage
 from tof_reliability.vitaly_bot.service import FifoWorker, VitalyService
@@ -419,6 +419,58 @@ def _write_csv(path: Path, fields: Sequence[str], rows: Sequence[Dict[str, str]]
         writer = csv.DictWriter(handle, fieldnames=list(fields))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def test_evidence_hints_ignore_document_paths_dates_and_prose_words():
+    material = (
+        "Источник: /cases/a9489883745b_20260930_GenAI.pdf\n"
+        "Оборудования для пилота достаточно. ЕО категории 3-4.\n"
+        "929395 Гайка M20, 660678 Болт с гайкой. Заказ № 12345678.\n"
+    )
+
+    assert set(extract_hints(material)["candidate_ids"]) == {"929395", "660678", "12345678"}
+
+
+def test_evidence_lookup_avoids_loading_entire_ledger(tmp_path: Path, monkeypatch):
+    from tof_reliability import data
+
+    ledger = tmp_path / "ledger"
+    ledger.mkdir()
+    _write_csv(
+        ledger / "source_documents.csv",
+        ["source_document_id", "relative_path", "sha256", "document_type", "parser_status"],
+        [
+            {"source_document_id": "doc-good", "relative_path": "good.csv", "sha256": "a", "document_type": "xlsx", "parser_status": "published"},
+            {"source_document_id": "doc-review", "relative_path": "review.csv", "sha256": "b", "document_type": "xlsx", "parser_status": "needs_review"},
+        ],
+    )
+    _write_csv(
+        ledger / "work_order_events.csv",
+        ["event_id", "source_document_id", "source_file", "order_id", "equipment_id", "work_type_raw", "event_date", "actual_cost"],
+        [
+            {"event_id": "event-good", "source_document_id": "doc-good", "source_file": "good.csv", "order_id": "123456", "equipment_id": "EO-1", "work_type_raw": "ТР", "event_date": "2026-01-01", "actual_cost": "100"},
+            {"event_id": "event-review", "source_document_id": "doc-review", "source_file": "review.csv", "order_id": "123456", "equipment_id": "EO-2", "work_type_raw": "ТР", "event_date": "2026-01-02", "actual_cost": "200"},
+        ],
+    )
+    state = tmp_path / "generation.json"
+    state.write_text('{"run_id":"generation-1","ledger_path":"' + str(ledger) + '"}', encoding="utf-8")
+    original_load_table = data.load_table
+
+    def reject_full_table(name: str, **kwargs: Any):
+        if name != "source_documents":
+            raise AssertionError("full ledger table loaded: " + name)
+        return original_load_table(name, **kwargs)
+
+    monkeypatch.setattr(data, "load_table", reject_full_table)
+    pack = build_evidence_pack(
+        {"version": 1, "candidate_ids": ["123456"], "artifact_hashes": ["hash"]},
+        generation_state_path=state,
+        root=Path(__file__).resolve().parents[1],
+    )
+
+    assert [(row["record"]["event_id"], row["source_document_ids"]) for row in pack["records"]] == [
+        ("event-good", ["doc-good"])
+    ]
 
 
 def test_evidence_pack_uses_current_generation_and_excludes_needs_review(tmp_path: Path):

@@ -62,13 +62,13 @@ MEETING_REFERENCE_SCHEMA = _object(
     {
         "meeting_id": {"type": "string"},
         "source": {"type": "string"},
-        "time_range": {"type": "string"},
-        "text_span": _object(
-            {"excerpt": {"type": "string"}},
-            ["excerpt"],
-        ),
+        "time_range": {"type": ["string", "null"]},
+        "text_span": {"anyOf": [
+            _object({"excerpt": {"type": "string"}}, ["excerpt"]),
+            {"type": "null"},
+        ]},
     },
-    ["meeting_id", "source"],
+    ["meeting_id", "source", "time_range", "text_span"],
 )
 
 ANALYSIS_RULE_SCHEMA = _object(

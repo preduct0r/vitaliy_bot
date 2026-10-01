@@ -288,7 +288,7 @@ async def correct_point(service, job):
     }
     replacement_schema = _object(
         properties,
-        [key for key in properties if key != 'material_locations'],
+        list(properties),
     )
     schema = _object({
         'decision': {'type': 'string', 'enum': list(LABELS)},
