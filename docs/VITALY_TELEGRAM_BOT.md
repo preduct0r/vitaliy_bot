@@ -336,3 +336,35 @@ Telegram updates не удаляются. Новая версия дожидае
 ```zsh
 .venv/bin/python -m pytest -q --tb=short tests/test_vitaly_bot.py tests/test_vitaly_corrections.py tests/test_vitaly_learning_core.py tests/test_vitaly_learning_runtime.py tests/test_context_normalization.py tests/test_artifact_qa.py
 ```
+
+### Независимая карта аналитических интересов
+
+Карта интересов к анализу не является семью поведенческими темами профиля и не
+выводится автоматически из них. Закрытые индексы, выдержки, ожидания и отчёты
+храните вне Git. `scripts/hypotheses_interests.py` создаёт файлы только вне
+checkout, без перезаписи, с правами 0600. Исходные файлы он только читает.
+
+1. Подготовьте закрытый JSON-массив всех подтверждённых baseline-источников:
+   `id`, ISO `date`, `status: accepted`, `kind: baseline`, `sha256`, абсолютный
+   `path`. Включайте каждый исходный материал, а не только поведенческий профиль.
+2. `uv run python scripts/hypotheses_interests.py prepare --receipt /path/receipt.json --baseline /private/baseline.json --version corpus-v1 --output /private/corpus-v1.json`.
+   Команда сверяет хэши всех принятых записей и baseline, удаляет точные
+   дубликаты и требует все три даты holdout. Содержимое встреч не копируется.
+3. Независимо извлеките аналитические интересы из **обучающей части** до
+   26 октября и сохраните карту: `version`, `corpus_version`, `interests` с
+   `id`, обобщённым `requirement` и `evidence` (source_id, locator,
+   attribution: direct_request / interpretation / third_party_paraphrase,
+   fragment). Для проверки используйте `chars:начало-конец`: нулевые индексы
+   Unicode, конец исключён. Атрибуция требует содержательной проверки человеком;
+   отсутствие надёжной идентификации говорящего не доказывает прямой запрос.
+   `uv run python scripts/hypotheses_interests.py verify --index /private/corpus-v1.json --profile /private/training-map.json --output /private/provenance.json`.
+4. До чтения holdout независимо сформируйте упорядоченный JSON-массив из идей
+   и сохраните идентификаторы групп. Отдельный проверяющий размечает группы по
+   встречам 26/28/30 октября в JSON-массиве ожиданий, не передавая их генератору.
+   `uv run python scripts/hypotheses_interests.py score --index /private/corpus-v1.json --expected /private/expected.json --predicted /private/predicted.json --output /private/holdout-result.json`.
+   Порог — 70% уникальных ожидаемых групп среди первых семи; пустые ожидания
+   не проходят. Самоотчёт модели не подтверждает разметку и соответствие идей.
+5. Только после сохранения результата оценки создайте финальную карту, добавив
+   интересы holdout, и снова проверьте происхождение. Публикации карты или
+   оценки эти команды не выполняют. Генератору передаётся только явно отобранный
+   обобщённый контекст; оператор отвечает за анонимизацию формулировок.
