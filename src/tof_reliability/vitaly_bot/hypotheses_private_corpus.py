@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import unicodedata
 from pathlib import Path
 
 from .hypotheses_interests import (
@@ -22,6 +23,20 @@ def _outside_git(path: Path) -> None:
                             capture_output=True, text=True, check=False)
     if result.returncode == 0 and result.stdout.strip() == 'true':
         raise ValueError('private artifacts must be outside every Git worktree')
+
+
+def _resolve_unicode_path(path: Path) -> Path:
+    """Resolve each filename canonically, rejecting ambiguous equivalents."""
+    if not path.is_absolute():
+        raise ValueError('source path must be absolute')
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        matches = [entry for entry in current.iterdir()
+                   if unicodedata.normalize('NFC', entry.name) == unicodedata.normalize('NFC', part)]
+        if len(matches) != 1:
+            raise ValueError('source path missing or Unicode-ambiguous: ' + str(current / part))
+        current = matches[0]
+    return current
 
 
 def build_and_assess_private_corpus(*, sources, training_map, holdout_topics, model,
@@ -47,11 +62,12 @@ def build_and_assess_private_corpus(*, sources, training_map, holdout_topics, mo
         if not isinstance(ident, str) or not ident or ident in identifiers:
             blockers.append('missing or repeated source id: ' + str(ident))
         identifiers.add(ident)
-        if row.get('status') == 'accepted':
+        if row.get('use_for_simulation') is False:
+            row['status'] = 'excluded'
+        elif row.get('status') == 'accepted':
             try:
-                path = Path(row['path'])
-                if not path.is_absolute():
-                    raise ValueError('source path must be absolute')
+                path = _resolve_unicode_path(Path(row['path']))
+                row['path'] = str(path)
                 digest = hashlib.sha256(path.read_bytes()).hexdigest()
                 if digest != str(row.get('sha256', '')).lower():
                     row['status'] = 'hash_mismatch'
