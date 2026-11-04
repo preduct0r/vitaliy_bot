@@ -58,10 +58,15 @@ def snapshot(tmp_path):
     ledger = tmp_path / "generations" / "g1" / "ledger"
     ledger.mkdir(parents=True)
     state = tmp_path / "current_generation.json"
-    state.write_text(json.dumps({"run_id": "g1", "ledger_path": str(ledger)}), encoding="utf-8")
+    catalog = tmp_path / "data_catalog.csv"
+    state.write_text(json.dumps({"run_id": "g1", "ledger_path": str(ledger), "catalog_path": str(catalog)}), encoding="utf-8")
+    write_csv(catalog, ["source_document_id", "catalog_status", "parser_status"], [
+        {"source_document_id": "good", "catalog_status": "ready_for_parse", "parser_status": "supported"},
+        {"source_document_id": "review", "catalog_status": "needs_review", "parser_status": "unknown"},
+    ])
     write_csv(ledger / "source_documents.csv", ["source_document_id", "relative_path", "parser_status"], [
-        {"source_document_id": "good", "relative_path": "good.csv", "parser_status": "published"},
-        {"source_document_id": "review", "relative_path": "review.csv", "parser_status": "needs_review"},
+        {"source_document_id": "good", "relative_path": "good.csv", "parser_status": "supported"},
+        {"source_document_id": "review", "relative_path": "review.csv", "parser_status": "unknown"},
     ])
     write_csv(ledger / "work_order_events.csv",
               ["event_id", "order_id", "equipment_id", "event_date", "source_document_id"], [
