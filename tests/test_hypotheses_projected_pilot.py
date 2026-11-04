@@ -10,6 +10,8 @@ import json
 
 import pytest
 
+from pilot_projection_support import distinct_directions
+
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
 
 
@@ -49,7 +51,7 @@ def case():
               "ranking": {"utility": 3, "feasibility": 3, "interest": 3, "novelty": 0}}
              for n in range(1, 6)]
     return {"interests": interests, "labels": labels, "audit": audit,
-            "coverage": coverage, "cards": cards, "evidence": evidence}
+            "coverage": coverage, "cards": distinct_directions(cards), "evidence": evidence}
 
 
 class Verifier:

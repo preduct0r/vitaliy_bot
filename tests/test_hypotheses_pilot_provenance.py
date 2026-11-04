@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from pilot_projection_support import LABEL, TOPIC, project_cards, projection
+from pilot_projection_support import LABEL, TOPIC, distinct_directions, project_cards, projection
 
 from tof_reliability.vitaly_bot import hypotheses_interests as interests
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
@@ -82,6 +82,7 @@ def make_run(coverage, context):
               "novelty": "unknown", "ranking": {"utility": 3, "feasibility": 3,
                                                      "interest": 3, "novelty": 0}}
              for n in range(1, 6)]
+    distinct_directions(cards)
     return {"generation_id": "gen-1", "knowledge_version": "knowledge-1",
             "interest_version": context["version"], "coverage": coverage,
             "interest_context": context, "cards": cards}

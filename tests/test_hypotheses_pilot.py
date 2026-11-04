@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from pilot_projection_support import LABEL, TOPIC, project_cards, projection
+from pilot_projection_support import LABEL, TOPIC, distinct_directions, project_cards, projection
 
 
 @pytest.fixture
@@ -50,7 +50,7 @@ def inputs():
 
 @pytest.fixture
 def cards():
-    return [{
+    return distinct_directions([{
         "number": i,
         "capability_id": "AN-REPAIR-EPISODES",
         "management_question": f"Какие причины повторного ремонта {chr(1040 + i)}?",
@@ -67,7 +67,7 @@ def cards():
         "analyst_brief": "Проверить ключи и период до расчёта",
         "novelty": "unknown",
         "ranking": {"utility": 5, "feasibility": 3, "interest": 4, "novelty": 0},
-    } for i in range(1, 6)]
+    } for i in range(1, 6)])
 
 
 def generate(pilot, inputs, cards, model=None, coverage=None, **trusted):

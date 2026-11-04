@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from pilot_projection_support import LABEL, TOPIC, project_cards, projection
+from pilot_projection_support import LABEL, TOPIC, distinct_directions, project_cards, projection
 
 from tof_reliability.vitaly_bot import hypotheses_interests as interests
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
@@ -51,7 +51,7 @@ def inputs(tmp_path):
               "novelty": "unknown", "ranking": {"utility": 3, "feasibility": 3,
                                                    "interest": 3, "novelty": 0}}
              for n in range(1, 6)]
-    return context, report, coverage, cards, text, str(source)
+    return context, report, coverage, distinct_directions(cards), text, str(source)
 
 
 def generate(context, coverage, cards, **trusted):

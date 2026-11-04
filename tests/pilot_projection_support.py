@@ -20,3 +20,17 @@ def project_cards(cards):
         if isinstance(meeting, dict):
             meeting.setdefault('topic_id', TOPIC)
     return cards
+
+
+def distinct_directions(cards):
+    """Give unrelated guard tests valid, substantively distinct directions."""
+    pairs = [
+        ("Выбрать оборудование для расследования повторов", "Сравнить частоту эпизодов по оборудованию"),
+        ("Выбрать тип отказов для проверки", "Сопоставить причины повторных отказов"),
+        ("Уточнить границы ремонтного эпизода", "Проверить объединение заказов по ключам"),
+        ("Определить период наблюдения", "Сравнить интервалы между ремонтами"),
+        ("Приоритизировать проверку данных", "Сопоставить пропуски в записях ремонтов"),
+    ]
+    for card, (decision, method) in zip(cards, pairs):
+        card['decision'], card['metrics_method'] = decision, method
+    return cards

@@ -404,7 +404,12 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
                                 'Эффект сценария — только непроверенное исследование с недостающей методикой. '
                                 'Сформулируйте различные аналитические управленческие вопросы: по одной гипотезе на вопрос. '
                                 'Рассмотрите качество данных, покрытие техкарт, проверку нормативной и измеренной трудоёмкости, '
-                                'ресурсные ограничения графика с привязкой к обучающим интересам. '
+                                'полноту реестра техкарт и статус проверки, готовность ресурсов и материалов для графика. '
+                                'Для каждого направления сформулируйте отдельное управленческое решение и метод; '
+                                'связанные разрезы и вопросы включайте в метод и вопросы аналитика, не выдавая их за отдельные направления. '
+                                'Проверяйте применимость каждой темы по проверенной проекции интересов и выбранному маршруту; '
+                                'при отсутствии данных обозначьте неизвестность и необходимые свидетельства, а не утверждайте факт. '
+                                'Ресурсные ограничения графика рассматривайте с привязкой к обучающим интересам. '
                                 'Не утверждайте непроверенных фактов; укажите interest_id и topic_id выбранной пары. '
                                 'Интерпретация и пересказ третьего лица не являются подтверждённым прямым запросом. '
                                 'Неизвестную новизну укажите явно и оцените нулём.')}
@@ -447,6 +452,15 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
             card['meeting_interest'] = {'interest_id': meeting['interest_id'], 'topic_id': topic, **entry}
 
     _validate_pilot(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store)
+    # Different wording of a question does not create a new decision or method.
+    # This catches exact repetitions only; semantic diversity still needs review.
+    seen = {field: set() for field in ('decision', 'metrics_method')}
+    for card in run['cards']:
+        for field, values in seen.items():
+            key = ' '.join(card[field].casefold().split()).strip(' .!?')
+            if key in values:
+                raise ValueError(f'duplicate {field}: insufficient diversity')
+            values.add(key)
     run['cards'].sort(key=lambda c: sum(c['ranking'][k] for k in SCORES), reverse=True)
     for number, card in enumerate(run['cards'], 1):
         card['number'] = number
