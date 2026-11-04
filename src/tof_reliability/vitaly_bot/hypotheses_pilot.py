@@ -19,6 +19,17 @@ TEXT_FIELDS = ('management_question', 'decision', 'scope', 'metrics_method',
                'falsification', 'analyst_brief', 'novelty')
 LIST_FIELDS = ('source_references', 'missing_evidence', 'hard_questions')
 SCORES = ('utility', 'feasibility', 'interest', 'novelty')
+CARD_FIELDS = set(TEXT_FIELDS + LIST_FIELDS + ('number', 'capability_id', 'source_readiness', 'meeting_interest', 'ranking'))
+MEETING_FIELDS = {'interest_id', 'topic_id', 'reference', 'attribution', 'source_id', 'date', 'locator', 'sha256'}
+
+
+def _check_card_fields(card):
+    if not isinstance(card, dict) or set(card) - CARD_FIELDS:
+        raise ValueError('unknown card fields')
+    for name, allowed in (('meeting_interest', MEETING_FIELDS), ('ranking', set(SCORES))):
+        value = card.get(name)
+        if not isinstance(value, dict) or set(value) - allowed:
+            raise ValueError(f'unknown or invalid {name} fields')
 
 
 def _text(value: Any, name: str) -> str:
@@ -115,7 +126,9 @@ def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inter
     for number, card in enumerate(cards, 1):
         if not isinstance(card, dict) or card.get('number') != number:
             raise ValueError('cards must be numbered consecutively')
-        _validate_numeric_claims(card, run.get('scope', ''))
+        _check_card_fields(card)
+        # The run and its scope are mutable, not an independently persisted request.
+        _validate_numeric_claims(card, '')
         for field in TEXT_FIELDS:
             _text(card.get(field), field)
         for field in LIST_FIELDS:
@@ -206,6 +219,14 @@ _NUMERIC_CLAIM = re.compile(
     r'четырёхсот|четырехсот|пятьсот|шестьсот|семьсот|восемьсот|девятьсот|'
     r'тыс|млн|млрд)\b', re.IGNORECASE)
 
+# Match full inflected ordinal words, never prefixes such as "шестигранный".
+_ORDINAL_CLAIM = re.compile(
+    r'\b(?:перв|втор|трет|четв[её]рт|пят|шест|седьм|восьм|девят|десят|'
+    r'одиннадцат|двенадцат|тринадцат|четырнадцат|пятнадцат|шестнадцат|'
+    r'семнадцат|восемнадцат|девятнадцат|двадцат|тридцат|сороков|сот|тысячн|миллионн)'
+    r'(?:ый|ий|ой|ая|яя|ое|ее|ые|ие|ого|его|ому|ему|ым|им|ую|юю|ых|их|ыми|ими|ом|ем|ою|ею)\b', re.I)
+_ROMAN_CLAIM = re.compile(r'(?<![\w])[IVXLCDM]+(?![\w])')
+
 
 def _case_statement(value):
     # Preserve all words, punctuation and ordering inside a statement. Only
@@ -222,7 +243,8 @@ def _validate_numeric_claims(card, scope):
     prose = [v for v in prose if isinstance(v, str)]
     if not isinstance(scope, str):
         raise ValueError('scope must be text')
-    if any(_NUMERIC_CLAIM.search(value) and _case_statement(value) != _case_statement(scope)
+    if any((_NUMERIC_CLAIM.search(value) or _ORDINAL_CLAIM.search(value) or _ROMAN_CLAIM.search(value))
+           and _case_statement(value) != _case_statement(scope)
            for value in prose):
         raise ValueError('unsupported numerical value')
 
@@ -310,6 +332,8 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
         for number, card in enumerate(run['cards'], 1):
             if not isinstance(card, dict):
                 raise ValueError(f'card {number}: expected object')
+            _check_card_fields(card)
+            _validate_numeric_claims(card, '')
             capability = _text(card.get('capability_id'), f'card {number} capability_id')
             if capability not in routes:
                 raise ValueError(f'card {number}: unknown capability_id {capability}')
@@ -349,20 +373,9 @@ def export_pilot(run: Mapping[str, Any], *, output_dir: Path, source_verificatio
     if source_verification.get('interest_version') != run['interest_version'] or source_verification.get('corpus_version') != run['interest_context'].get('corpus_version'):
         raise ValueError('source verification version mismatch')
     validate_pilot(run, coverage=run['coverage'], interest_context=run['interest_context'])
-    for item in _interests(run['interest_context'])['interests']:
-        for entry in item['evidence']:
-            if not any(c.get('interest_id') == item['id'] and all(c.get(k) == entry[k] for k in ('source_id', 'locator', 'date', 'sha256', 'attribution')) and c.get('verified') is True for c in checks):
-                raise ValueError('source verification does not match evidence')
-    output_dir = Path(output_dir).resolve()
-    repo = Path(__file__).resolve().parents[3]
-    if output_dir == repo or repo in output_dir.parents:
-        raise ValueError('pilot outputs must be outside the checkout')
-    output_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
-    for name, value in (('pilot.json', run), ('source-verification.json', source_verification)):
-        data = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + '\n').encode('utf-8')
-        fd = os.open(output_dir / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, 'wb') as handle:
-            handle.write(data)
+    # No persisted, independent case/user/request binding is available to this
+    # offline API. A hash supplied by the mutable run would not establish one.
+    raise ValueError('trusted persisted request binding required for export')
 
 
 def codex_generator(runner):
