@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+from pilot_projection_support import LABEL, TOPIC, project_cards, projection
+
 from tof_reliability.vitaly_bot import hypotheses_interests as interests
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
 
@@ -40,7 +42,7 @@ def inputs(tmp_path):
         {"capability_id": "repairs", "availability": "partial",
          "missing_evidence": ["ключи эпизодов"], "source_references": ["ledger:repairs"]}]}
     cards = [{"number": n, "capability_id": "repairs",
-              "management_question": f"Как проверить повторы {n}?", "decision": "Выбрать проверку",
+              "management_question": f"Как проверить повторы {chr(1040 + n)}?", "decision": "Выбрать проверку",
               "scope": "насосы", "metrics_method": "Проверить ключи",
               "meeting_interest": {"interest_id": "repeat"},
               "source_references": ["ledger:repairs"], "source_readiness": "partial",
@@ -55,7 +57,7 @@ def inputs(tmp_path):
 def generate(context, coverage, cards):
     return pilot.generate_pilot(scope="насосы", knowledge_version="knowledge-1",
                                 interest_context=context, coverage_provider=lambda: copy.deepcopy(coverage),
-                                generator=lambda _: copy.deepcopy(cards))
+                                generator=lambda _: copy.deepcopy(project_cards(cards)), **projection(context))
 
 
 def test_id_only_resolves_exact_evidence_deterministically_and_exports(inputs, tmp_path):
@@ -87,13 +89,13 @@ def test_schema_requests_only_interest_id(inputs):
     class Runner:
         async def run(self, prompt, schema):
             seen.update(prompt=prompt, schema=schema)
-            return type("Result", (), {"value": {"cards": copy.deepcopy(cards)}})()
+            return type("Result", (), {"value": {"cards": copy.deepcopy(project_cards(cards))}})()
 
     pilot.generate_pilot(scope="насосы", knowledge_version="knowledge-1", interest_context=context,
-                         coverage_provider=lambda: coverage, generator=pilot.codex_generator(Runner()))
+                         coverage_provider=lambda: coverage, generator=pilot.codex_generator(Runner()), **projection(context))
     meeting = seen["schema"]["properties"]["cards"]["items"]["properties"]["meeting_interest"]
-    assert set(meeting["properties"]) == {"interest_id"}
-    assert meeting["required"] == ["interest_id"]
+    assert set(meeting["properties"]) == {"interest_id", "topic_id"}
+    assert meeting["required"] == ["interest_id", "topic_id"]
     assert meeting["additionalProperties"] is False
     assert secret not in seen["prompt"] and path not in seen["prompt"]
 

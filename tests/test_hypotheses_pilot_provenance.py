@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+from pilot_projection_support import LABEL, TOPIC, project_cards, projection
+
 from tof_reliability.vitaly_bot import hypotheses_interests as interests
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
 
@@ -69,7 +71,7 @@ def source_context(evidence):
 
 
 def make_run(coverage, context):
-    cards = [{"number": n, "capability_id": "AN-REPAIR-EPISODES", "management_question": f"Что проверить в ремонтах {n}?",
+    cards = [{"number": n, "capability_id": "AN-REPAIR-EPISODES", "management_question": f"Что проверить в ремонтах {chr(1040 + n)}?",
               "decision": "Выбрать проверку", "scope": "насосы", "metrics_method": "Проверить ключи",
               "meeting_interest": {"interest_id": "repeat", "attribution": "interpretation",
                                    "reference": "meeting-a:chars:0-16"},
@@ -171,7 +173,7 @@ def test_model_reference_must_match_selected_evidence(coverage, source_context):
     cards[0]["meeting_interest"]["reference"] = "meeting-b:chars:0-16"
     with pytest.raises(ValueError):
         pilot.generate_pilot(scope="", knowledge_version="k", interest_context=source_context,
-                             coverage_provider=lambda: coverage, generator=lambda _: cards)
+                             coverage_provider=lambda: coverage, generator=lambda _: project_cards(cards), **projection(source_context))
 
 
 def test_pilot_training_index_excludes_holdout_even_if_index_contains_it(evidence):
@@ -205,10 +207,10 @@ def test_generation_requests_distinct_analytical_questions_and_preserves_schema(
     class Runner:
         async def run(self, prompt, schema):
             seen.update(prompt=prompt, schema=schema)
-            return type("Result", (), {"value": {"cards": copy.deepcopy(cards)}})()
+            return type("Result", (), {"value": {"cards": copy.deepcopy(project_cards(cards))}})()
 
     pilot.generate_pilot(scope="насосы", knowledge_version="knowledge-1", interest_context=source_context,
-                         coverage_provider=lambda: coverage, generator=pilot.codex_generator(Runner()))
+                         coverage_provider=lambda: coverage, generator=pilot.codex_generator(Runner()), **projection(source_context))
     prompt = seen["prompt"].casefold()
     for term in ("качеств", "техкарт", "трудо", "ресурс", "различ"):
         assert term in prompt

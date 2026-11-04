@@ -4,6 +4,8 @@ import copy
 
 import pytest
 
+from pilot_projection_support import LABEL, TOPIC, project_cards, projection
+
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
 
 
@@ -30,7 +32,7 @@ def inputs():
     ]}
     cards = [{
         "number": n, "capability_id": "repair-episodes",
-        "management_question": f"Как проверить повторы {n}?",
+        "management_question": f"Как проверить повторы {chr(1040 + n)}?",
         "decision": "Выбрать проверку", "scope": "насосы",
         "metrics_method": "Проверить ключи эпизодов",
         "meeting_interest": {"interest_id": "repeat", "attribution": "interpretation",
@@ -49,7 +51,8 @@ def generate(interests, coverage, cards):
     return pilot.generate_pilot(
         scope="насосы", knowledge_version="knowledge-1", interest_context=interests,
         coverage_provider=lambda: copy.deepcopy(coverage),
-        generator=lambda _: copy.deepcopy(cards),
+        generator=lambda _: copy.deepcopy(project_cards(cards)),
+        **projection(interests),
     )
 
 
@@ -59,7 +62,7 @@ def test_shared_table_uses_selected_route_and_preserves_meeting_reference(inputs
     assert all(card["capability_id"] == "repair-episodes" for card in run["cards"])
     assert all(card["source_readiness"] == "partial" for card in run["cards"])
     assert all(card["missing_evidence"] == ["связь заказов с эпизодами"] for card in run["cards"])
-    expected = {"interest_id": "repeat", **interests["interests"][0]["evidence"][0]}
+    expected = {"interest_id": "repeat", "topic_id": TOPIC, **interests["interests"][0]["evidence"][0]}
     assert all(card["meeting_interest"] == expected for card in run["cards"])
     pilot.validate_pilot(run, coverage=coverage, interest_context=interests)
 

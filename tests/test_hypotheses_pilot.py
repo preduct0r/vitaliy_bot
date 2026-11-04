@@ -11,6 +11,8 @@ import json
 
 import pytest
 
+from pilot_projection_support import LABEL, TOPIC, project_cards, projection
+
 
 @pytest.fixture
 def pilot():
@@ -51,7 +53,7 @@ def cards():
     return [{
         "number": i,
         "capability_id": "AN-REPAIR-EPISODES",
-        "management_question": f"Какие причины повторного ремонта {i}?",
+        "management_question": f"Какие причины повторного ремонта {chr(1040 + i)}?",
         "decision": "Определить приоритет проверки",
         "scope": "насосы цеха A",
         "metrics_method": "Проверить эпизоды по подтверждённым ключам",
@@ -73,7 +75,8 @@ def generate(pilot, inputs, cards, model=None, coverage=None):
         scope=inputs["scope"], knowledge_version=inputs["knowledge_version"],
         interest_context=inputs["interest_context"],
         coverage_provider=coverage or (lambda: copy.deepcopy(inputs["coverage"])),
-        generator=model or (lambda context: copy.deepcopy(cards)),
+        generator=model or (lambda context: copy.deepcopy(project_cards(cards))),
+        **projection(inputs["interest_context"]),
     )
 
 
@@ -133,11 +136,12 @@ def test_generator_receives_only_generalized_interests_and_no_holdout(pilot, inp
     inputs["interest_context"]["private_fragment"] = "PRIVATE_SENTINEL"
     inputs["interest_context"]["expected_topic_ids"] = ["HOLDOUT_SENTINEL"]
     seen = []
-    generate(pilot, inputs, cards, model=lambda ctx: seen.append(ctx) or copy.deepcopy(cards))
+    generate(pilot, inputs, cards, model=lambda ctx: seen.append(ctx) or copy.deepcopy(project_cards(cards)))
     payload = json.dumps(seen, ensure_ascii=False)
     assert "PRIVATE_SENTINEL" not in payload
     assert "HOLDOUT_SENTINEL" not in payload
-    assert "Изучить повторные ремонты" in payload
+    assert "Изучить повторные ремонты" not in payload
+    assert LABEL in payload and TOPIC in payload
 
 
 def test_export_is_reproducible_and_preserves_verification(pilot, inputs, cards, tmp_path):

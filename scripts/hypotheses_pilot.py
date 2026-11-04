@@ -12,7 +12,7 @@ from tof_reliability.vitaly_bot.codex import CodexRunner
 from tof_reliability.vitaly_bot.config import load_config
 from tof_reliability.vitaly_bot.coverage import RemoteCoverageProvider
 from tof_reliability.vitaly_bot.hypotheses_interests import assess_provenance, generator_context, pilot_training_index
-from tof_reliability.vitaly_bot.hypotheses_pilot import codex_generator, export_pilot, generate_pilot
+from tof_reliability.vitaly_bot.hypotheses_pilot import codex_generator, export_pilot, generate_pilot, subprocess_verifier
 
 
 def read(path: Path):
@@ -23,6 +23,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--index', type=Path, required=True, help='private S1 corpus index')
     parser.add_argument('--profile', type=Path, required=True, help='private verified interest profile')
+    parser.add_argument('--verified-labels', type=Path, required=True)
+    parser.add_argument('--verifier-audit', type=Path, required=True)
+    parser.add_argument('--private-verifier', type=Path, required=True, help='separate executable JSON verifier')
     parser.add_argument('--knowledge-version', required=True)
     parser.add_argument('--scope', default='')
     parser.add_argument('--coverage-request', type=Path, required=True, help='S2 request JSON')
@@ -39,7 +42,9 @@ def main() -> int:
         provider = RemoteCoverageProvider()
         config = load_config(environ={**os.environ, 'VITALY_BOT_ENV_FILE': '/dev/null'}, require_token=False)
         run = generate_pilot(scope=args.scope, knowledge_version=args.knowledge_version,
-                             interest_context=context,
+                             interest_context=context, verified_labels=read(args.verified_labels),
+                             verifier_audit=read(args.verifier_audit),
+                             private_verifier=subprocess_verifier(args.private_verifier),
                              coverage_provider=lambda: asyncio.run(provider.build(request)),
                              generator=codex_generator(CodexRunner(config)))
         export_pilot(run, output_dir=args.output, source_verification=verification)
