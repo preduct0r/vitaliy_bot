@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .hypotheses_interests import ATTRIBUTIONS
+from .models import ModelError
 
 TEXT_FIELDS = ('management_question', 'decision', 'scope', 'metrics_method',
                'falsification', 'analyst_brief', 'novelty')
@@ -75,11 +76,15 @@ def _coverage(value: Mapping[str, Any]) -> dict:
     routes = value.get('routes')
     if not isinstance(routes, list) or not routes:
         raise ValueError('coverage routes required')
+    seen = set()
     for route in routes:
-        _text(route.get('capability_id'), 'capability id')
+        ident = _text(route.get('capability_id'), 'capability id')
+        if ident in seen:
+            raise ValueError(f'duplicate coverage capability id: {ident}')
+        seen.add(ident)
         if route.get('availability') not in ('available', 'partial', 'unavailable'):
             raise ValueError('invalid coverage availability')
-        if not isinstance(route.get('missing_evidence'), list):
+        if not isinstance(route.get('missing_evidence'), list) or any(not isinstance(x, str) or not x.strip() for x in route['missing_evidence']):
             raise ValueError('missing evidence list required')
     return copy.deepcopy(value)
 
@@ -101,6 +106,7 @@ def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inter
     if not isinstance(cards, list) or not 5 <= len(cards) <= 7:
         raise ValueError('five to seven cards required')
     ids = {i['id']: i for i in interests['interests']}
+    routes = {r['capability_id']: r for r in coverage['routes']}
     for number, card in enumerate(cards, 1):
         if not isinstance(card, dict) or card.get('number') != number:
             raise ValueError('cards must be numbered consecutively')
@@ -118,15 +124,18 @@ def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inter
         evidence = ids[meeting['interest_id']]['evidence']
         if not any(e['reference'] == meeting.get('reference') and e['attribution'] == meeting.get('attribution') for e in evidence):
             raise ValueError('unsupported meeting reference or attribution')
-        readiness = card.get('source_readiness')
+        capability = _text(card.get('capability_id'), f'card {number} capability_id')
+        route = routes.get(capability)
+        if route is None:
+            raise ValueError(f'card {number}: unknown capability_id {capability}')
         refs = set(card['source_references'])
-        matching = [r for r in coverage['routes'] if refs <= _references(r)]
-        if not matching:
-            raise ValueError('source references or readiness unsupported by coverage')
-        if any(r['availability'] != readiness for r in matching):
-            raise ValueError('ambiguous or unsupported readiness')
-        if any(not set(r['missing_evidence']) <= set(card['missing_evidence']) for r in matching):
-            raise ValueError('missing evidence omitted')
+        unsupported = refs - _references(route)
+        if unsupported:
+            raise ValueError(f'card {number}: references unsupported by {capability}: {sorted(unsupported)}')
+        if card.get('source_readiness') != route['availability']:
+            raise ValueError(f'card {number}: readiness mismatches {capability}')
+        if not set(route['missing_evidence']) <= set(card['missing_evidence']):
+            raise ValueError(f'card {number}: missing evidence omitted for {capability}')
         ranking = card.get('ranking')
         if not isinstance(ranking, dict) or any(type(ranking.get(k)) not in (int, float) or not 0 <= ranking[k] <= 5 for k in SCORES):
             raise ValueError('invalid ranking')
@@ -151,6 +160,8 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
                'instructions': ('Предложите 5–7 гипотез, не выполняя анализ. Не выдумывайте источники, готовность или эффект. '
                                 'Укажите ограничения, проверку опровержения и вопросы аналитика. '
                                 'Различайте заказ и эпизод, длительность и трудоёмкость, план и факт, норму и оценку. '
+                                'Выберите точный capability_id одного маршрута и только его source_references; '
+                                'не заявляйте планируемый эффект сценария как установленный факт. '
                                 'Эффект сценария — только непроверенное исследование с недостающей методикой. '
                                 'Сформулируйте различные аналитические управленческие вопросы: по одной гипотезе на вопрос. '
                                 'Рассмотрите качество данных, покрытие техкарт, проверку нормативной и измеренной трудоёмкости, '
@@ -161,6 +172,17 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
     run = {'generation_id': coverage['generation']['run_id'], 'knowledge_version': knowledge_version,
            'interest_version': interests['version'], 'scope': scope, 'coverage': coverage,
            'interest_context': interests, 'cards': copy.deepcopy(cards)}
+    routes = {r['capability_id']: r for r in coverage['routes']}
+    if isinstance(run['cards'], list):
+        for number, card in enumerate(run['cards'], 1):
+            if not isinstance(card, dict):
+                raise ValueError(f'card {number}: expected object')
+            capability = _text(card.get('capability_id'), f'card {number} capability_id')
+            if capability not in routes:
+                raise ValueError(f'card {number}: unknown capability_id {capability}')
+            route = routes[capability]
+            card['source_readiness'] = route['availability']
+            card['missing_evidence'] = copy.deepcopy(route['missing_evidence'])
     validate_pilot(run, coverage=coverage, interest_context=interests)
     # Resolve references from the trusted projected map, never from free-form model text.
     by_id = {item['id']: item for item in interests['interests']}
@@ -209,7 +231,7 @@ def codex_generator(runner):
                'required': ['interest_id', 'attribution', 'reference']}
     ranking = {'type': 'object', 'additionalProperties': False,
                'properties': {k: {'type': 'number'} for k in SCORES}, 'required': list(SCORES)}
-    properties = {k: string for k in TEXT_FIELDS + ('source_readiness',)}
+    properties = {k: string for k in TEXT_FIELDS + ('source_readiness', 'capability_id')}
     properties.update({k: string_list for k in LIST_FIELDS})
     properties.update({'number': {'type': 'integer'}, 'meeting_interest': meeting, 'ranking': ranking})
     schema = {'type': 'object', 'additionalProperties': False,
@@ -219,5 +241,8 @@ def codex_generator(runner):
               'required': ['cards']}
     def generate(context):
         prompt = 'Верните JSON с карточками гипотез на русском языке. Контекст:\n' + json.dumps(context, ensure_ascii=False, sort_keys=True)
-        return asyncio.run(runner.run(prompt, schema)).value['cards']
+        try:
+            return asyncio.run(runner.run(prompt, schema)).value['cards']
+        except ModelError as exc:
+            raise RuntimeError(f'model error {exc.code}: {exc.detail}') from exc
     return generate

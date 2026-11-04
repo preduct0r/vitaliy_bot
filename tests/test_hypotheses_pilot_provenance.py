@@ -69,7 +69,7 @@ def source_context(evidence):
 
 
 def make_run(coverage, context):
-    cards = [{"number": n, "management_question": f"Что проверить в ремонтах {n}?",
+    cards = [{"number": n, "capability_id": "AN-REPAIR-EPISODES", "management_question": f"Что проверить в ремонтах {n}?",
               "decision": "Выбрать проверку", "scope": "насосы", "metrics_method": "Проверить ключи",
               "meeting_interest": {"interest_id": "repeat", "attribution": "interpretation",
                                    "reference": "meeting-a:chars:0-16"},

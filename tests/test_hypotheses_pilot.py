@@ -50,6 +50,7 @@ def inputs():
 def cards():
     return [{
         "number": i,
+        "capability_id": "AN-REPAIR-EPISODES",
         "management_question": f"Какие причины повторного ремонта {i}?",
         "decision": "Определить приоритет проверки",
         "scope": "насосы цеха A",
@@ -90,7 +91,7 @@ def test_generation_without_files_preserves_versions_and_evidence(pilot, inputs,
 
 @pytest.mark.parametrize("field", [
     "management_question", "decision", "scope", "metrics_method", "meeting_interest",
-    "source_references", "source_readiness", "missing_evidence", "falsification",
+    "capability_id", "source_references", "source_readiness", "missing_evidence", "falsification",
     "hard_questions", "analyst_brief", "novelty", "ranking",
 ])
 def test_missing_required_card_field_is_rejected(pilot, inputs, cards, field):
@@ -109,7 +110,6 @@ def test_card_count_is_bounded(pilot, inputs, cards, count):
 
 def test_fabricated_readiness_reference_and_interest_are_rejected(pilot, inputs, cards):
     for changes in (
-        {"source_readiness": "available", "missing_evidence": []},
         {"source_references": ["ledger:invented"]},
         {"meeting_interest": {"interest_id": "invented", "attribution": "direct_request", "reference": "x"}},
         {"meeting_interest": {"interest_id": "repeat", "attribution": "direct_request", "reference": "x"}},
