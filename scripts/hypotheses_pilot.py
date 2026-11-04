@@ -11,7 +11,7 @@ from pathlib import Path
 from tof_reliability.vitaly_bot.codex import CodexRunner
 from tof_reliability.vitaly_bot.config import load_config
 from tof_reliability.vitaly_bot.coverage import RemoteCoverageProvider
-from tof_reliability.vitaly_bot.hypotheses_interests import assess_provenance, generator_context
+from tof_reliability.vitaly_bot.hypotheses_interests import assess_provenance, generator_context, pilot_training_index
 from tof_reliability.vitaly_bot.hypotheses_pilot import codex_generator, export_pilot, generate_pilot
 
 
@@ -30,10 +30,11 @@ def main() -> int:
     args = parser.parse_args()
     try:
         index, profile = read(args.index), read(args.profile)
-        verification = assess_provenance(profile, index)
+        training = pilot_training_index(index)
+        verification = assess_provenance(profile, training)
         if not verification['verified']:
             raise ValueError('source provenance verification failed')
-        context = generator_context({'version': index['version'], 'training': index['sources']}, profile)
+        context = generator_context({'version': training['version'], 'training': training['sources']}, profile)
         request = read(args.coverage_request)
         provider = RemoteCoverageProvider()
         config = load_config(environ={**os.environ, 'VITALY_BOT_ENV_FILE': '/dev/null'}, require_token=False)

@@ -114,15 +114,34 @@ def validate_interest_map(profile: Mapping[str, Any], index: Mapping[str, Any]) 
                 raise ValueError("invalid attribution")
 
 
+def pilot_training_index(index: Mapping[str, Any]) -> dict:
+    """Exclude the fixed holdout and all later sources from pilot generation."""
+    return {"version": _required(index.get("version"), "version"),
+            "sources": [s for s in index["sources"] if _date(s.get("date")) < min(HOLDOUT_DATES)]}
+
+
 def generator_context(split: Mapping[str, Any], profile: Mapping[str, Any] | None = None) -> dict:
     if profile is None:
         return {"interests": []}
-    validate_interest_map(profile, {"version": split["version"], "sources": split["training"]})
-    # Deliberate allowlist: no fragment, source ID, locator, dates, paths or expectations.
-    return {"version": profile["version"], "interests": [
-        {"id": i["id"], "requirement": i["requirement"],
-         "attributions": sorted({e["attribution"] for e in i["evidence"]})}
-        for i in profile["interests"]]}
+    index = {"version": split["version"], "sources": split["training"]}
+    validate_interest_map(profile, index)
+    if not assess_provenance(profile, index)["verified"]:
+        raise ValueError("source provenance verification failed")
+    sources = {s["id"]: s for s in split["training"]}
+    result = []
+    for item in profile["interests"]:
+        evidence = []
+        for entry in item["evidence"]:
+            source = sources[entry["source_id"]]
+            sid, locator = source["id"], entry["locator"]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", sid) or not re.fullmatch(r"chars:[0-9]+-[0-9]+", locator):
+                raise ValueError("unsafe source identifier or locator")
+            evidence.append({"source_id": sid, "date": _date(source["date"]),
+                             "locator": locator, "attribution": entry["attribution"],
+                             "sha256": source["sha256"], "reference": f"{sid}:{locator}"})
+        result.append({"id": item["id"], "requirement": item["requirement"],
+                       "attributions": sorted({e["attribution"] for e in evidence}), "evidence": evidence})
+    return {"version": profile["version"], "corpus_version": split["version"], "interests": result}
 
 
 def assess_provenance(profile: Mapping[str, Any], index: Mapping[str, Any]) -> dict:
@@ -147,7 +166,9 @@ def assess_provenance(profile: Mapping[str, Any], index: Mapping[str, Any]) -> d
                         reason = "verified" if ok else "fragment or locator mismatch"
                 except (OSError, UnicodeError):
                     reason = "source unreadable or not UTF-8"
-            checks.append({"interest_id": item["id"], "source_id": source["id"], "locator": evidence["locator"], "verified": ok, "reason": reason})
+            checks.append({"interest_id": item["id"], "source_id": source["id"], "locator": evidence["locator"],
+                           "date": source.get("date"), "sha256": source.get("sha256"),
+                           "attribution": evidence["attribution"], "verified": ok, "reason": reason})
     return {"corpus_version": index["version"], "interest_version": profile["version"], "verified": bool(checks) and all(c["verified"] for c in checks), "checks": checks}
 
 

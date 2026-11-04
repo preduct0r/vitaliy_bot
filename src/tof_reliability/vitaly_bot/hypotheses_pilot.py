@@ -5,6 +5,8 @@ import asyncio
 import copy
 import json
 import os
+import re
+from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -24,6 +26,7 @@ def _text(value: Any, name: str) -> str:
 
 def _interests(context: Mapping[str, Any]) -> dict:
     version = _text(context.get('version'), 'interest version')
+    corpus_version = _text(context.get('corpus_version'), 'corpus version')
     items = context.get('interests')
     if not isinstance(items, list) or not items:
         raise ValueError('interests required')
@@ -36,8 +39,30 @@ def _interests(context: Mapping[str, Any]) -> dict:
             raise ValueError('invalid interest attribution')
         if any(i['id'] == ident for i in projected):
             raise ValueError('duplicate interest')
-        projected.append({'id': ident, 'requirement': requirement, 'attributions': list(attributions)})
-    return {'version': version, 'interests': projected}
+        evidence = item.get('evidence')
+        if not isinstance(evidence, list) or not evidence:
+            raise ValueError('verified interest evidence required')
+        safe = []
+        for entry in evidence:
+            if not isinstance(entry, Mapping):
+                raise ValueError('invalid evidence')
+            sid, locator = entry.get('source_id'), entry.get('locator')
+            if not isinstance(sid, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', sid) or not isinstance(locator, str) or not re.fullmatch(r'chars:[0-9]+-[0-9]+', locator):
+                raise ValueError('unsafe evidence reference')
+            when = _text(entry.get('date'), 'source date')
+            try:
+                if date.fromisoformat(when).isoformat() != when:
+                    raise ValueError('invalid date')
+            except ValueError as exc:
+                raise ValueError('invalid source date') from exc
+            digest = entry.get('sha256')
+            if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+                raise ValueError('invalid source hash')
+            if entry.get('attribution') not in attributions or entry.get('reference') != f'{sid}:{locator}':
+                raise ValueError('invalid evidence attribution or reference')
+            safe.append({k: entry[k] for k in ('source_id', 'date', 'locator', 'attribution', 'sha256', 'reference')})
+        projected.append({'id': ident, 'requirement': requirement, 'attributions': list(attributions), 'evidence': safe})
+    return {'version': version, 'corpus_version': corpus_version, 'interests': projected}
 
 
 def _coverage(value: Mapping[str, Any]) -> dict:
@@ -90,15 +115,17 @@ def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inter
         meeting = card.get('meeting_interest')
         if not isinstance(meeting, dict) or meeting.get('interest_id') not in ids:
             raise ValueError('unknown meeting interest')
-        _text(meeting.get('reference'), 'meeting reference')
-        if meeting.get('attribution') not in ids[meeting['interest_id']]['attributions']:
-            raise ValueError('unsupported attribution')
+        evidence = ids[meeting['interest_id']]['evidence']
+        if not any(e['reference'] == meeting.get('reference') and e['attribution'] == meeting.get('attribution') for e in evidence):
+            raise ValueError('unsupported meeting reference or attribution')
         readiness = card.get('source_readiness')
         refs = set(card['source_references'])
-        matching = [r for r in coverage['routes'] if refs <= _references(r) and r['availability'] == readiness]
+        matching = [r for r in coverage['routes'] if refs <= _references(r)]
         if not matching:
             raise ValueError('source references or readiness unsupported by coverage')
-        if not any(set(r['missing_evidence']) <= set(card['missing_evidence']) for r in matching):
+        if any(r['availability'] != readiness for r in matching):
+            raise ValueError('ambiguous or unsupported readiness')
+        if any(not set(r['missing_evidence']) <= set(card['missing_evidence']) for r in matching):
             raise ValueError('missing evidence omitted')
         ranking = card.get('ranking')
         if not isinstance(ranking, dict) or any(type(ranking.get(k)) not in (int, float) or not 0 <= ranking[k] <= 5 for k in SCORES):
@@ -125,12 +152,23 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
                                 'Укажите ограничения, проверку опровержения и вопросы аналитика. '
                                 'Различайте заказ и эпизод, длительность и трудоёмкость, план и факт, норму и оценку. '
                                 'Эффект сценария — только непроверенное исследование с недостающей методикой. '
+                                'Сформулируйте различные аналитические управленческие вопросы: по одной гипотезе на вопрос. '
+                                'Рассмотрите качество данных, покрытие техкарт, проверку нормативной и измеренной трудоёмкости, '
+                                'ресурсные ограничения графика с привязкой к обучающим интересам. '
+                                'Не утверждайте непроверенных фактов; выбирайте точную ссылку из свидетельств интереса. '
                                 'Неизвестную новизну укажите явно и оцените нулём.')}
     cards = generator(copy.deepcopy(context))
     run = {'generation_id': coverage['generation']['run_id'], 'knowledge_version': knowledge_version,
            'interest_version': interests['version'], 'scope': scope, 'coverage': coverage,
            'interest_context': interests, 'cards': copy.deepcopy(cards)}
     validate_pilot(run, coverage=coverage, interest_context=interests)
+    # Resolve references from the trusted projected map, never from free-form model text.
+    by_id = {item['id']: item for item in interests['interests']}
+    for card in run['cards']:
+        meeting = card['meeting_interest']
+        entry = next(e for e in by_id[meeting['interest_id']]['evidence']
+                     if e['reference'] == meeting['reference'] and e['attribution'] == meeting['attribution'])
+        meeting['reference'] = entry['reference']
     run['cards'].sort(key=lambda c: sum(c['ranking'][k] for k in SCORES), reverse=True)
     for number, card in enumerate(run['cards'], 1):
         card['number'] = number
@@ -143,9 +181,13 @@ def export_pilot(run: Mapping[str, Any], *, output_dir: Path, source_verificatio
     checks = source_verification.get('checks')
     if not isinstance(checks, list) or not checks or any(not isinstance(c, dict) or c.get('verified') is not True for c in checks):
         raise ValueError('all source checks must be verified')
-    if source_verification.get('interest_version', run['interest_version']) != run['interest_version']:
+    if source_verification.get('interest_version') != run['interest_version'] or source_verification.get('corpus_version') != run['interest_context'].get('corpus_version'):
         raise ValueError('source verification version mismatch')
     validate_pilot(run, coverage=run['coverage'], interest_context=run['interest_context'])
+    for item in _interests(run['interest_context'])['interests']:
+        for entry in item['evidence']:
+            if not any(c.get('interest_id') == item['id'] and all(c.get(k) == entry[k] for k in ('source_id', 'locator', 'date', 'sha256', 'attribution')) and c.get('verified') is True for c in checks):
+                raise ValueError('source verification does not match evidence')
     output_dir = Path(output_dir).resolve()
     repo = Path(__file__).resolve().parents[3]
     if output_dir == repo or repo in output_dir.parents:

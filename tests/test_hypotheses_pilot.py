@@ -32,9 +32,12 @@ def inputs():
     return {
         "scope": "насосы цеха A",
         "knowledge_version": "knowledge-1",
-        "interest_context": {"version": "interests-1", "interests": [
+        "interest_context": {"version": "interests-1", "corpus_version": "corpus-1", "interests": [
             {"id": "repeat", "requirement": "Изучить повторные ремонты",
-             "attributions": ["interpretation"]}]},
+             "attributions": ["interpretation"], "evidence": [
+                 {"source_id": "synthetic", "date": "2026-10-01", "locator": "chars:0-4",
+                  "attribution": "interpretation", "sha256": "a" * 64,
+                  "reference": "synthetic:chars:0-4"}]}]},
         "coverage": {"coverage_version": 1, "generation": {"run_id": "gen-1"},
                      "routes": [{"capability_id": "AN-REPAIR-EPISODES",
                                  "availability": "partial",
@@ -52,7 +55,7 @@ def cards():
         "scope": "насосы цеха A",
         "metrics_method": "Проверить эпизоды по подтверждённым ключам",
         "meeting_interest": {"interest_id": "repeat", "attribution": "interpretation",
-                             "reference": "Обобщение обсуждения ремонтов"},
+                             "reference": "synthetic:chars:0-4"},
         "source_references": ["ledger:repairs"],
         "source_readiness": "partial",
         "missing_evidence": ["связь заказов с эпизодами"],
@@ -139,7 +142,9 @@ def test_generator_receives_only_generalized_interests_and_no_holdout(pilot, inp
 
 def test_export_is_reproducible_and_preserves_verification(pilot, inputs, cards, tmp_path):
     run = generate(pilot, inputs, cards)
-    verification = {"verified": True, "checks": [{"source_id": "synthetic", "verified": True}]}
+    evidence = inputs['interest_context']['interests'][0]['evidence'][0]
+    verification = {"verified": True, "corpus_version": "corpus-1", "interest_version": "interests-1",
+                    "checks": [{**evidence, "interest_id": "repeat", "verified": True}]}
     first, second = tmp_path / "one", tmp_path / "two"
     pilot.export_pilot(run, output_dir=first, source_verification=verification)
     pilot.export_pilot(run, output_dir=second, source_verification=verification)

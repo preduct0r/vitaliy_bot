@@ -130,7 +130,11 @@ def build_and_assess_private_corpus(*, sources, training_map, holdout_topics, mo
         except (ValueError, OSError, KeyError, TypeError) as exc:
             blockers.append('provenance: ' + str(exc))
     if not blockers:
-        request = generator_context(split, training_map)
+        projected = generator_context(split, training_map)
+        # The independent holdout operator retains its stricter model boundary.
+        request = {"version": projected["version"], "interests": [
+            {k: item[k] for k in ("id", "requirement", "attributions")}
+            for item in projected["interests"]]}
         save('model_input', request)
         try:
             response = model(request)
