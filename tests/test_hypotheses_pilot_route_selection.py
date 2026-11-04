@@ -59,7 +59,8 @@ def test_shared_table_uses_selected_route_and_preserves_meeting_reference(inputs
     assert all(card["capability_id"] == "repair-episodes" for card in run["cards"])
     assert all(card["source_readiness"] == "partial" for card in run["cards"])
     assert all(card["missing_evidence"] == ["связь заказов с эпизодами"] for card in run["cards"])
-    assert all(card["meeting_interest"] == cards[0]["meeting_interest"] for card in run["cards"])
+    expected = {"interest_id": "repeat", **interests["interests"][0]["evidence"][0]}
+    assert all(card["meeting_interest"] == expected for card in run["cards"])
     pilot.validate_pilot(run, coverage=coverage, interest_context=interests)
 
 

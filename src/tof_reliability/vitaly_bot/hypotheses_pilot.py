@@ -119,10 +119,14 @@ def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inter
             for entry in value:
                 _text(entry, field)
         meeting = card.get('meeting_interest')
-        if not isinstance(meeting, dict) or meeting.get('interest_id') not in ids:
+        if not isinstance(meeting, dict) or not isinstance(meeting.get('interest_id'), str) or meeting['interest_id'] not in ids:
             raise ValueError('unknown meeting interest')
         evidence = ids[meeting['interest_id']]['evidence']
-        if not any(e['reference'] == meeting.get('reference') and e['attribution'] == meeting.get('attribution') for e in evidence):
+        fields = ('reference', 'attribution', 'source_id', 'date', 'locator', 'sha256')
+        # Historical exports carry reference and attribution only. If any metadata
+        # is present, require the entire binding to match one evidence entry.
+        present = fields if any(k in meeting for k in fields[2:]) else fields[:2]
+        if not any(all(meeting.get(k) == e[k] for k in present) for e in evidence):
             raise ValueError('unsupported meeting reference or attribution')
         capability = _text(card.get('capability_id'), f'card {number} capability_id')
         route = routes.get(capability)
@@ -155,7 +159,10 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
         raise RuntimeError('published server coverage unavailable: ' + str(exc)) from exc
     safe_routes = [{k: copy.deepcopy(r[k]) for k in ('capability_id', 'route_id', 'availability', 'missing_evidence') if k in r}
                    | {'source_references': sorted(_references(r))} for r in coverage['routes']]
-    context = {'scope': scope, 'knowledge_version': knowledge_version, 'interests': interests,
+    model_interests = {**interests, 'interests': [
+        {k: item[k] for k in ('id', 'requirement', 'attributions')}
+        for item in interests['interests']]}
+    context = {'scope': scope, 'knowledge_version': knowledge_version, 'interests': model_interests,
                'coverage': {'generation_id': coverage['generation']['run_id'], 'routes': safe_routes},
                'instructions': ('Предложите 5–7 гипотез, не выполняя анализ. Не выдумывайте источники, готовность или эффект. '
                                 'Укажите ограничения, проверку опровержения и вопросы аналитика. '
@@ -166,13 +173,15 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
                                 'Сформулируйте различные аналитические управленческие вопросы: по одной гипотезе на вопрос. '
                                 'Рассмотрите качество данных, покрытие техкарт, проверку нормативной и измеренной трудоёмкости, '
                                 'ресурсные ограничения графика с привязкой к обучающим интересам. '
-                                'Не утверждайте непроверенных фактов; выбирайте точную ссылку из свидетельств интереса. '
+                                'Не утверждайте непроверенных фактов; укажите только interest_id выбранного интереса. '
+                                'Интерпретация и пересказ третьего лица не являются подтверждённым прямым запросом. '
                                 'Неизвестную новизну укажите явно и оцените нулём.')}
     cards = generator(copy.deepcopy(context))
     run = {'generation_id': coverage['generation']['run_id'], 'knowledge_version': knowledge_version,
            'interest_version': interests['version'], 'scope': scope, 'coverage': coverage,
            'interest_context': interests, 'cards': copy.deepcopy(cards)}
     routes = {r['capability_id']: r for r in coverage['routes']}
+    by_id = {item['id']: item for item in interests['interests']}
     if isinstance(run['cards'], list):
         for number, card in enumerate(run['cards'], 1):
             if not isinstance(card, dict):
@@ -183,14 +192,19 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
             route = routes[capability]
             card['source_readiness'] = route['availability']
             card['missing_evidence'] = copy.deepcopy(route['missing_evidence'])
+            meeting = card.get('meeting_interest')
+            if not isinstance(meeting, dict) or not isinstance(meeting.get('interest_id'), str) or meeting['interest_id'] not in by_id:
+                raise ValueError('unknown meeting interest')
+            evidence = by_id[meeting['interest_id']]['evidence']
+            fields = ('reference', 'attribution', 'source_id', 'date', 'locator', 'sha256')
+            supplied = [k for k in fields if k in meeting]
+            if supplied and not {'reference', 'attribution'} <= set(supplied):
+                raise ValueError('unsupported meeting reference or attribution')
+            entry = next((e for e in evidence if all(meeting[k] == e[k] for k in supplied)), None)
+            if entry is None:
+                raise ValueError('unsupported meeting reference or attribution')
+            card['meeting_interest'] = {'interest_id': meeting['interest_id'], **entry}
     validate_pilot(run, coverage=coverage, interest_context=interests)
-    # Resolve references from the trusted projected map, never from free-form model text.
-    by_id = {item['id']: item for item in interests['interests']}
-    for card in run['cards']:
-        meeting = card['meeting_interest']
-        entry = next(e for e in by_id[meeting['interest_id']]['evidence']
-                     if e['reference'] == meeting['reference'] and e['attribution'] == meeting['attribution'])
-        meeting['reference'] = entry['reference']
     run['cards'].sort(key=lambda c: sum(c['ranking'][k] for k in SCORES), reverse=True)
     for number, card in enumerate(run['cards'], 1):
         card['number'] = number
@@ -227,8 +241,7 @@ def codex_generator(runner):
     string = {'type': 'string'}
     string_list = {'type': 'array', 'items': string}
     meeting = {'type': 'object', 'additionalProperties': False,
-               'properties': {k: string for k in ('interest_id', 'attribution', 'reference')},
-               'required': ['interest_id', 'attribution', 'reference']}
+               'properties': {'interest_id': string}, 'required': ['interest_id']}
     ranking = {'type': 'object', 'additionalProperties': False,
                'properties': {k: {'type': 'number'} for k in SCORES}, 'required': list(SCORES)}
     properties = {k: string for k in TEXT_FIELDS + ('source_readiness', 'capability_id')}
