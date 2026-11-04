@@ -200,3 +200,13 @@ def test_runner_adapter_uses_structured_schema(pilot, inputs, cards):
             return Result()
     generated = pilot.codex_generator(Runner())({'scope': 'насосы'})
     assert generated == cards
+
+
+def test_export_rejects_numeric_claim_added_after_generation(pilot, inputs, cards, tmp_path):
+    run = generate(pilot, inputs, cards)
+    run['cards'][0]['decision'] = 'Экономия составила пятнадцать рублей.'
+    evidence = inputs['interest_context']['interests'][0]['evidence'][0]
+    verification = {'verified': True, 'corpus_version': 'corpus-1', 'interest_version': 'interests-1',
+                    'checks': [{**evidence, 'interest_id': 'repeat', 'verified': True}]}
+    with pytest.raises(ValueError, match='(?i)numerical|numeric|числ'):
+        pilot.export_pilot(run, output_dir=tmp_path / 'blocked', source_verification=verification)

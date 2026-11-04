@@ -115,6 +115,7 @@ def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inter
     for number, card in enumerate(cards, 1):
         if not isinstance(card, dict) or card.get('number') != number:
             raise ValueError('cards must be numbered consecutively')
+        _validate_numeric_claims(card, run.get('scope', ''))
         for field in TEXT_FIELDS:
             _text(card.get(field), field)
         for field in LIST_FIELDS:
@@ -188,16 +189,48 @@ def _projection(interests, labels, audit):
     return entries
 
 
-def _validate_card_content(card, scope, topic, private_interests, verifier):
-    # Numeric facts in prose must occur in this request. IDs, scores and
-    # route metadata are structural and never evidence for numeric claims.
+_NUMERIC_CLAIM = re.compile(
+    r'\d|\b(?:нол[ьяюем]*|нул[ьяюем]*|один(?:а|о|у|ом|ой|им|их|ого|ому)?|'
+    r'одн(?:а|о|у|ой|им|их|ого|ому)|дв(?:а|е|ух|ум|умя)|'
+    r'тр(?:и|ёх|ех|ём|ем|емя)|четыр(?:е|ёх|ех|ём|ем|ьмя)|'
+    r'(?:пят|шест|сем|восем|восьм|девят|десят|одиннадцат|двенадцат|'
+    r'тринадцат|четырнадцат|пятнадцат|шестнадцат|семнадцат|восемнадцат|'
+    r'девятнадцат|двадцат|тридцат)(?:ь|и|ью)|'
+    r'полтор(?:а|ы|у)|дво(?:е|их|им|ими)|тро(?:е|их|им|ими)|'
+    r'вдвое|втрое|(?:пяти|шести|семи|восьми|девяноста)десяти|'
+    r'(?:двумя|тремя|четырьмя|пятью|шестью|семью|восемью|девятью)стами|'
+    r'(?:пятьдесят|шестьдесят|семьдесят|восемьдесят|девяносто|девяноста|сорок|сорока)|'
+    r'(?:сотн|тысяч)(?:я|и|е|у|ей|ам|ами|ах)?|'
+    r'(?:миллион|миллиард)(?:а|ов|у|ом|е|ы|ам|ами|ах)?|'
+    r'сто|ста|двести|двухсот|триста|трёхсот|трехсот|четыреста|'
+    r'четырёхсот|четырехсот|пятьсот|шестьсот|семьсот|восемьсот|девятьсот|'
+    r'тыс|млн|млрд)\b', re.IGNORECASE)
+
+
+def _case_statement(value):
+    # Preserve all words, punctuation and ordering inside a statement. Only
+    # whitespace, case and a terminal full stop are insignificant. Preserve
+    # question marks: asking about a number does not assert that number.
+    return ' '.join(value.casefold().split()).rstrip('.').rstrip()
+
+
+def _validate_numeric_claims(card, scope):
+    # No coverage metadata proves a case-scoped numeric ledger fact. Require
+    # the entire numeric field to reproduce the current request exactly;
+    # matching individual numbers cannot establish their units or context.
     prose = [card.get(k, '') for k in TEXT_FIELDS] + sum((card.get(k, []) for k in ('hard_questions',) if isinstance(card.get(k), list)), [])
     prose = [v for v in prose if isinstance(v, str)]
-    text = ' '.join(prose)
-    numeric = r'\d+(?:[.,]\d+)*(?:[eE][+-]?\d+)?|\b(?:один|одна|одно|одного|одной|два|две|двух|три|трёх|трех|четыре|четырёх|четырех|пять|пяти|шесть|шести|семь|семи|восемь|восьми|девять|девяти|ноль|нуль|миллион\w*|миллиард\w*|тысяч\w*|сотен|сотня\w*|сто|двести|триста|четыреста|пятьсот|шестьсот|семьсот|восемьсот|девятьсот|десять|двадцать|тридцать|сорок|пятьдесят|шестьдесят|семьдесят|восемьдесят|девяносто)\b'
-    numbers = lambda value: set(re.findall(numeric, value.casefold(), re.I))
-    if numbers(text) - numbers(scope):
+    if not isinstance(scope, str):
+        raise ValueError('scope must be text')
+    if any(_NUMERIC_CLAIM.search(value) and _case_statement(value) != _case_statement(scope)
+           for value in prose):
         raise ValueError('unsupported numerical value')
+
+
+def _validate_card_content(card, scope, topic, private_interests, verifier):
+    _validate_numeric_claims(card, scope)
+    prose = [card.get(k, '') for k in TEXT_FIELDS] + sum((card.get(k, []) for k in ('hard_questions',) if isinstance(card.get(k), list)), [])
+    text = ' '.join(v for v in prose if isinstance(v, str))
     # Avoid allowing other case identifiers and distinctive private tokens to
     # cross into this case even when a semantic verifier makes a mistake.
     approved = set(re.findall(r'[\w-]+', scope.casefold()))

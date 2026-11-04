@@ -142,8 +142,8 @@ def test_off_topic_cross_user_and_unverified_historical_claims_are_rejected(case
 
 
 def test_same_case_request_amount_can_be_used_and_verifier_sees_only_approved_facts(case):
-    request = "Проанализировать ремонты насосов при бюджете 120000 рублей"
-    case["cards"][0]["management_question"] = "Как проверить ремонты при бюджете 120000 рублей?"
+    request = "Как проверить ремонты насосов при бюджете 120000 рублей?"
+    case["cards"][0]["management_question"] = request
     verifier = Verifier()
     run = generate(case, scope=request, verifier=verifier)
     assert "120000" in run["cards"][0]["management_question"]
