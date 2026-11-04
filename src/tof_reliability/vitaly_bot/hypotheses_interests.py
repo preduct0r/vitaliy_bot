@@ -82,10 +82,12 @@ def chronological_holdout(index: Mapping[str, Any], dates: Sequence[str] = HOLDO
     holdout = [s for s in sources if s["date"] in dates_set]
     if {s["date"] for s in holdout} != dates_set:
         raise ValueError("missing holdout date")
-    training = [s for s in sources if s["date"] not in dates_set]
-    if any(s["date"] >= min(dates_set) for s in training):
+    later = [s for s in sources if s["date"] not in dates_set and _date(s["date"]) >= min(dates_set)]
+    # Preserve the original fixed evaluation's fail-closed contract.
+    if dates_set == set(HOLDOUT_DATES) and later:
         raise ValueError("training source violates chronological holdout")
-    return {"version": index["version"], "training": training, "holdout": holdout}
+    training = [s for s in sources if _date(s["date"]) < min(dates_set)]
+    return {"version": index["version"], "training": training, "holdout": holdout, "excluded": later}
 
 
 def validate_interest_map(profile: Mapping[str, Any], index: Mapping[str, Any]) -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Mapping, Sequence
 
-from .hypotheses_interests import ATTRIBUTIONS, HOLDOUT_DATES
+from .hypotheses_interests import ATTRIBUTIONS, HOLDOUT_DATES, _date
 
 
 def select_training_chunks(index: Mapping[str, Any], chunks: Sequence[Mapping[str, Any]], *,
@@ -12,9 +12,11 @@ def select_training_chunks(index: Mapping[str, Any], chunks: Sequence[Mapping[st
     sources = {s['id']: s for s in index['sources']}
     if len(sources) != len(index['sources']):
         raise ValueError('duplicate source id')
-    dates = set(holdout_dates)
+    dates = {_date(day) for day in holdout_dates}
+    if not dates:
+        raise ValueError('holdout dates required')
     return [dict(c) for c in chunks if c.get('source_id') in sources
-            and sources[c['source_id']]['date'] not in dates]
+            and _date(sources[c['source_id']]['date']) < min(dates)]
 
 
 def parse_chunk_extraction(record: Mapping[str, Any], *, chunk: Mapping[str, Any],
