@@ -6,8 +6,10 @@ contains no source text; interest identifiers are passed through as supplied.
 """
 from __future__ import annotations
 
+import hashlib
 import re
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any, Callable, Mapping
 
 from .hypotheses_interests import assess_provenance
 
@@ -78,3 +80,103 @@ def project_topics(profile: Mapping[str, Any], index: Mapping[str, Any]) -> list
         return result
     except (KeyError, TypeError, AttributeError) as exc:
         raise ValueError("invalid profile or source index") from exc
+
+
+def project_semantic_topics(
+    profile: Mapping[str, Any], index: Mapping[str, Any], *,
+    classifier: Callable[[dict], Any], verifier: Callable[[dict], Any],
+) -> list[dict[str, str]]:
+    """Run inside a private classification process, never in a generator context.
+
+    The two independently provided callables see private summaries and verified
+    excerpts. The caller is responsible for process isolation and for choosing
+    independent implementations; this interface cannot establish model independence.
+    Only high-confidence, independently supported, evidence-bound fixed labels
+    are returned. Keep private classifier/verifier audit logs outside Git.
+    """
+    if not callable(classifier) or not callable(verifier) or classifier is verifier:
+        raise ValueError("independent classifier and verifier required")
+    try:
+        if not isinstance(profile, Mapping) or not isinstance(index, Mapping):
+            raise ValueError("invalid profile or index")
+        if not index.get("version") or profile.get("corpus_version") != index["version"]:
+            raise ValueError("corpus version mismatch")
+        sources = index["sources"]
+        if not isinstance(sources, list):
+            raise ValueError("invalid sources")
+        source_ids = set()
+        for source in sources:
+            sid, digest, path = source["id"], source["sha256"], source["path"]
+            if not isinstance(sid, str) or not sid or sid in source_ids:
+                raise ValueError("invalid or duplicate source")
+            source_ids.add(sid)
+            if (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or not Path(path).is_absolute()
+                    or hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest):
+                raise ValueError("source hash verification failed")
+        interests = profile["interests"]
+        if not isinstance(interests, list):
+            raise ValueError("invalid interests")
+        if not interests:
+            return []
+        if not assess_provenance(profile, index)["verified"]:
+            raise ValueError("source provenance verification failed")
+        by_interest = {}
+        for item in interests:
+            ident = item["id"]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", ident):
+                raise ValueError("unsafe interest id")
+            evidence = {}
+            for entry in item["evidence"]:
+                key = (entry["source_id"], entry["locator"])
+                if key in evidence:
+                    raise ValueError("duplicate evidence")
+                evidence[key] = {k: entry[k] for k in ("source_id", "locator", "fragment", "attribution")}
+            by_interest[ident] = {"interest_id": ident, "requirement": item["requirement"],
+                                  "evidence": evidence}
+    except (KeyError, TypeError, AttributeError, OSError) as exc:
+        raise ValueError("invalid profile or source index") from exc
+
+    labels = {topic_id: label for topic_id, label, _ in _TOPICS}
+    private_input = {"interests": [
+        {"interest_id": item["interest_id"], "requirement": item["requirement"],
+         "evidence": [dict(e) for e in item["evidence"].values()]}
+        for item in by_interest.values()],
+        "topics": [{"topic_id": k, "description": v} for k, v in labels.items()]}
+    try:
+        candidates = classifier(private_input)
+    except Exception as exc:
+        raise ValueError("private classifier failed") from exc
+    if not isinstance(candidates, list):
+        raise ValueError("invalid classifier response")
+    seen = set()
+    checked = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            raise ValueError("invalid candidate")
+        try:
+            ident, topic = candidate["interest_id"], candidate["topic_id"]
+            source, locator = candidate["source_id"], candidate["locator"]
+            key = (ident, topic)
+            if key in seen:
+                raise ValueError("duplicate candidate")
+            seen.add(key)
+            if (ident not in by_interest or topic not in labels or candidate.get("confidence") != "high"
+                    or (source, locator) not in by_interest[ident]["evidence"]):
+                raise ValueError("unsupported candidate")
+            item = by_interest[ident]
+            checked.append((ident, topic, item, item["evidence"][(source, locator)]))
+        except (KeyError, TypeError) as exc:
+            raise ValueError("invalid candidate") from exc
+    result = []
+    for ident, topic, item, evidence in checked:
+        try:
+            verdict = verifier({"interest_id": ident, "requirement": item["requirement"],
+                                "topic_id": topic, "description": labels[topic],
+                                "evidence": dict(evidence),
+                                "all_evidence": [dict(e) for e in item["evidence"].values()]})
+        except Exception:
+            continue
+        if isinstance(verdict, Mapping) and verdict.get("supported") is True and verdict.get("confidence") == "high":
+            result.append({"topic_id": topic, "interest_id": ident, "description": labels[topic]})
+    return result
