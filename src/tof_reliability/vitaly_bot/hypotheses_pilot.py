@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import os
 import re
+import secrets
+import sqlite3
 import subprocess
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
@@ -21,6 +25,76 @@ LIST_FIELDS = ('source_references', 'missing_evidence', 'hard_questions')
 SCORES = ('utility', 'feasibility', 'interest', 'novelty')
 CARD_FIELDS = set(TEXT_FIELDS + LIST_FIELDS + ('number', 'capability_id', 'source_readiness', 'meeting_interest', 'ranking'))
 MEETING_FIELDS = {'interest_id', 'topic_id', 'reference', 'attribution', 'source_id', 'date', 'locator', 'sha256'}
+
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                     separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class TrustedRequest:
+    run_id: str
+    case_id: str
+    user_id: str
+    scope: str
+    token: str
+    digest: str
+
+
+class TrustedRequestStore:
+    """Separate private request store; result sealing is write-once."""
+    def __init__(self, path):
+        self.path = Path(path)
+        fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600) if not self.path.exists() else None
+        if fd is not None:
+            os.close(fd)
+        with sqlite3.connect(self.path) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS trusted_requests (run_id TEXT, case_id TEXT, user_id TEXT, scope TEXT, token TEXT UNIQUE, digest TEXT, result_digest TEXT, PRIMARY KEY(run_id, case_id, user_id))')
+
+    def create(self, request):
+        if not isinstance(request, Mapping) or set(request) != {'run_id', 'case_id', 'user_id', 'scope'}:
+            raise ValueError('invalid trusted request')
+        if any(not isinstance(request[k], str) or not request[k].strip() for k in ('run_id', 'case_id', 'user_id')) or not isinstance(request['scope'], str):
+            raise ValueError('invalid trusted request identity or scope')
+        values = dict(request, token=secrets.token_hex(32))
+        trusted = TrustedRequest(**values, digest=_digest(values))
+        try:
+            with sqlite3.connect(self.path) as db:
+                db.execute('INSERT INTO trusted_requests VALUES (?, ?, ?, ?, ?, ?, NULL)',
+                           (trusted.run_id, trusted.case_id, trusted.user_id, trusted.scope, trusted.token, trusted.digest))
+        except sqlite3.IntegrityError as exc:
+            raise ValueError('trusted request already exists') from exc
+        return trusted
+
+    def verify(self, trusted, run=None, *, sealed=False):
+        if not isinstance(trusted, TrustedRequest):
+            raise ValueError('trusted request binding required')
+        values = {k: getattr(trusted, k) for k in ('run_id', 'case_id', 'user_id', 'scope', 'token')}
+        with sqlite3.connect(self.path) as db:
+            row = db.execute('SELECT run_id, case_id, user_id, scope, token, digest, result_digest FROM trusted_requests WHERE token = ?', (trusted.token,)).fetchone()
+        if row is None or tuple(values.values()) != row[:5] or trusted.digest != row[5] or _digest(values) != row[5]:
+            raise ValueError('trusted request mismatch')
+        if run is not None and (run.get('request_binding') != trusted.token or run.get('scope') != trusted.scope):
+            raise ValueError('result request binding mismatch')
+        if sealed and (row[6] is None or _digest(run) != row[6]):
+            raise ValueError('result differs from trusted generation')
+        return trusted.scope
+
+    def seal(self, trusted, run):
+        self.verify(trusted, run)
+        with sqlite3.connect(self.path) as db:
+            cursor = db.execute('UPDATE trusted_requests SET result_digest = ? WHERE token = ? AND result_digest IS NULL', (_digest(run), trusted.token))
+            if cursor.rowcount != 1:
+                raise ValueError('trusted request already used')
+
+
+def _trusted_scope(trusted_context, trusted_store, run=None):
+    if trusted_context is None and trusted_store is None:
+        return ''
+    if not isinstance(trusted_store, TrustedRequestStore):
+        raise ValueError('trusted request store required')
+    return trusted_store.verify(trusted_context, run)
 
 
 def _check_card_fields(card):
@@ -109,7 +183,8 @@ def _references(route: Mapping[str, Any]) -> set[str]:
     return references
 
 
-def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], interest_context: Mapping[str, Any]) -> None:
+def _validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], interest_context: Mapping[str, Any], trusted_context=None, trusted_store=None) -> None:
+    trusted_scope = _trusted_scope(trusted_context, trusted_store, run)
     coverage = _coverage(coverage)
     interests = _interests(interest_context)
     if run.get('generation_id') != coverage['generation']['run_id'] or run.get('interest_version') != interests['version']:
@@ -128,7 +203,7 @@ def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inter
             raise ValueError('cards must be numbered consecutively')
         _check_card_fields(card)
         # The run and its scope are mutable, not an independently persisted request.
-        _validate_numeric_claims(card, '')
+        _validate_numeric_claims(card, trusted_scope, reject_roman=True)
         for field in TEXT_FIELDS:
             _text(card.get(field), field)
         for field in LIST_FIELDS:
@@ -172,6 +247,13 @@ def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inter
         if card['novelty'].casefold() in ('unknown', 'неизвестна', 'неизвестно') and ranking['novelty'] != 0:
             raise ValueError('unknown novelty cannot be scored as proven')
 
+
+
+def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], interest_context: Mapping[str, Any], trusted_context=None, trusted_store=None) -> None:
+    _validate_pilot(run, coverage=coverage, interest_context=interest_context,
+                    trusted_context=trusted_context, trusted_store=trusted_store)
+    if trusted_context is not None:
+        trusted_store.verify(trusted_context, run, sealed=True)
 
 
 def _projection(interests, labels, audit):
@@ -235,7 +317,7 @@ def _case_statement(value):
     return ' '.join(value.casefold().split()).rstrip('.').rstrip()
 
 
-def _validate_numeric_claims(card, scope):
+def _validate_numeric_claims(card, scope, *, reject_roman=False):
     # No coverage metadata proves a case-scoped numeric ledger fact. Require
     # the entire numeric field to reproduce the current request exactly;
     # matching individual numbers cannot establish their units or context.
@@ -243,6 +325,8 @@ def _validate_numeric_claims(card, scope):
     prose = [v for v in prose if isinstance(v, str)]
     if not isinstance(scope, str):
         raise ValueError('scope must be text')
+    if reject_roman and any(_ROMAN_CLAIM.search(value) for value in prose):
+        raise ValueError('unsupported numerical value')
     if any((_NUMERIC_CLAIM.search(value) or _ORDINAL_CLAIM.search(value) or _ROMAN_CLAIM.search(value))
            and _case_statement(value) != _case_statement(scope)
            for value in prose):
@@ -290,10 +374,13 @@ def _validate_card_content(card, scope, topic, private_interests, verifier):
     if not isinstance(verdict, Mapping) or verdict.get('supported') is not True or verdict.get('confidence') != 'high':
         raise ValueError('private verifier rejected or uncertain')
 
-def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapping[str, Any], coverage_provider, generator, verified_labels=None, verifier_audit=None, private_verifier=None) -> dict:
+def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapping[str, Any], coverage_provider, generator, verified_labels=None, verifier_audit=None, private_verifier=None, trusted_context=None, trusted_store=None) -> dict:
     _text(knowledge_version, 'knowledge version')
     if not isinstance(scope, str):
         raise ValueError('scope must be text')
+    trusted_scope = _trusted_scope(trusted_context, trusted_store)
+    if trusted_context is not None and trusted_scope != scope:
+        raise ValueError('trusted request scope mismatch')
     interests = _interests(interest_context)
     if not callable(generator) or not callable(private_verifier) or generator is private_verifier:
         raise ValueError('independent generator and private verifier required')
@@ -326,6 +413,8 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
            'interest_version': interests['version'], 'scope': scope, 'coverage': coverage,
            'interest_context': interests, 'verified_labels': copy.deepcopy(verified_labels),
            'verifier_audit': copy.deepcopy(verifier_audit), 'cards': copy.deepcopy(cards)}
+    if trusted_context is not None:
+        run['request_binding'] = trusted_context.token
     routes = {r['capability_id']: r for r in coverage['routes']}
     by_id = {item['id']: item for item in interests['interests']}
     if isinstance(run['cards'], list):
@@ -333,7 +422,7 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
             if not isinstance(card, dict):
                 raise ValueError(f'card {number}: expected object')
             _check_card_fields(card)
-            _validate_numeric_claims(card, '')
+            _validate_numeric_claims(card, trusted_scope, reject_roman=True)
             capability = _text(card.get('capability_id'), f'card {number} capability_id')
             if capability not in routes:
                 raise ValueError(f'card {number}: unknown capability_id {capability}')
@@ -357,14 +446,16 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
             _validate_card_content(card, scope, topic, interests, private_verifier)
             card['meeting_interest'] = {'interest_id': meeting['interest_id'], 'topic_id': topic, **entry}
 
-    validate_pilot(run, coverage=coverage, interest_context=interests)
+    _validate_pilot(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store)
     run['cards'].sort(key=lambda c: sum(c['ranking'][k] for k in SCORES), reverse=True)
     for number, card in enumerate(run['cards'], 1):
         card['number'] = number
+    if trusted_context is not None:
+        trusted_store.seal(trusted_context, run)
     return run
 
 
-def export_pilot(run: Mapping[str, Any], *, output_dir: Path, source_verification: Mapping[str, Any] | None) -> None:
+def export_pilot(run: Mapping[str, Any], *, output_dir: Path, source_verification: Mapping[str, Any] | None, trusted_context=None, trusted_store=None) -> None:
     if not isinstance(source_verification, Mapping) or source_verification.get('verified') is not True:
         raise ValueError('verified source report required')
     checks = source_verification.get('checks')
@@ -372,10 +463,24 @@ def export_pilot(run: Mapping[str, Any], *, output_dir: Path, source_verificatio
         raise ValueError('all source checks must be verified')
     if source_verification.get('interest_version') != run['interest_version'] or source_verification.get('corpus_version') != run['interest_context'].get('corpus_version'):
         raise ValueError('source verification version mismatch')
-    validate_pilot(run, coverage=run['coverage'], interest_context=run['interest_context'])
-    # No persisted, independent case/user/request binding is available to this
-    # offline API. A hash supplied by the mutable run would not establish one.
-    raise ValueError('trusted persisted request binding required for export')
+    validate_pilot(run, coverage=run['coverage'], interest_context=run['interest_context'], trusted_context=trusted_context, trusted_store=trusted_store)
+    if not isinstance(trusted_store, TrustedRequestStore) or trusted_context is None:
+        raise ValueError('trusted persisted request binding required for export')
+    trusted_store.verify(trusted_context, run, sealed=True)
+    for item in _interests(run['interest_context'])['interests']:
+        for entry in item['evidence']:
+            if not any(c.get('interest_id') == item['id'] and all(c.get(k) == entry[k] for k in ('source_id', 'locator', 'date', 'sha256', 'attribution')) and c.get('verified') is True for c in checks):
+                raise ValueError('source verification does not match evidence')
+    output_dir = Path(output_dir).resolve()
+    repo = Path(__file__).resolve().parents[3]
+    if output_dir == repo or repo in output_dir.parents:
+        raise ValueError('pilot outputs must be outside the checkout')
+    output_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    for name, value in (('pilot.json', run), ('source-verification.json', source_verification)):
+        data = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + '\n').encode('utf-8')
+        fd = os.open(output_dir / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(data)
 
 
 def codex_generator(runner):

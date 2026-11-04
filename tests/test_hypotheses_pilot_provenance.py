@@ -158,14 +158,19 @@ def test_export_binds_verified_hash_attribution_and_context(evidence, coverage, 
     index, profile, split = evidence
     context = interests.generator_context(split, profile)
     report = interests.assess_provenance(profile, index)
-    run = make_run(coverage, context)
-    pilot.export_pilot(run, output_dir=tmp_path / "good", source_verification=report)
+    store = pilot.TrustedRequestStore(tmp_path / 'trusted.sqlite')
+    trusted = store.create({'run_id': 'run', 'case_id': 'case', 'user_id': 'user', 'scope': ''})
+    run = pilot.generate_pilot(scope='', knowledge_version='knowledge-1', interest_context=context,
+                               coverage_provider=lambda: copy.deepcopy(coverage),
+                               generator=lambda _: project_cards(make_run(coverage, context)['cards']),
+                               trusted_context=trusted, trusted_store=store, **projection(context))
+    pilot.export_pilot(run, output_dir=tmp_path / "good", source_verification=report, trusted_context=trusted, trusted_store=store)
     for field, value in (("sha256", "a" * 64), ("attribution", "direct_request"),
                          ("date", "2026-10-03")):
         altered = copy.deepcopy(run)
         altered["interest_context"]["interests"][0]["evidence"][0][field] = value
         with pytest.raises(ValueError):
-            pilot.export_pilot(altered, output_dir=tmp_path / field, source_verification=report)
+            pilot.export_pilot(altered, output_dir=tmp_path / field, source_verification=report, trusted_context=trusted, trusted_store=store)
 
 
 def test_model_reference_must_match_selected_evidence(coverage, source_context):

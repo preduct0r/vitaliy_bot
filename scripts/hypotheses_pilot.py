@@ -6,13 +6,14 @@ import argparse
 import asyncio
 import json
 import os
+import uuid
 from pathlib import Path
 
 from tof_reliability.vitaly_bot.codex import CodexRunner
 from tof_reliability.vitaly_bot.config import load_config
 from tof_reliability.vitaly_bot.coverage import RemoteCoverageProvider
 from tof_reliability.vitaly_bot.hypotheses_interests import assess_provenance, generator_context, pilot_training_index
-from tof_reliability.vitaly_bot.hypotheses_pilot import codex_generator, export_pilot, generate_pilot, subprocess_verifier
+from tof_reliability.vitaly_bot.hypotheses_pilot import TrustedRequestStore, codex_generator, export_pilot, generate_pilot, subprocess_verifier
 
 
 def read(path: Path):
@@ -28,10 +29,20 @@ def main() -> int:
     parser.add_argument('--private-verifier', type=Path, required=True, help='separate executable JSON verifier')
     parser.add_argument('--knowledge-version', required=True)
     parser.add_argument('--scope', default='')
+    parser.add_argument('--case-id', required=True)
+    parser.add_argument('--user-id', required=True)
+    parser.add_argument('--trusted-store', type=Path, required=True, help='private SQLite file outside checkout')
     parser.add_argument('--coverage-request', type=Path, required=True, help='S2 request JSON')
     parser.add_argument('--output', type=Path, required=True, help='new private directory outside checkout')
     args = parser.parse_args()
     try:
+        store_path = args.trusted_store.resolve()
+        repo = Path(__file__).resolve().parents[1]
+        if store_path == repo or repo in store_path.parents:
+            raise ValueError('trusted store must be outside the checkout')
+        store = TrustedRequestStore(store_path)
+        trusted = store.create({'run_id': uuid.uuid4().hex, 'case_id': args.case_id,
+                                'user_id': args.user_id, 'scope': args.scope})
         index, profile = read(args.index), read(args.profile)
         training = pilot_training_index(index)
         verification = assess_provenance(profile, training)
@@ -46,8 +57,10 @@ def main() -> int:
                              verifier_audit=read(args.verifier_audit),
                              private_verifier=subprocess_verifier(args.private_verifier),
                              coverage_provider=lambda: asyncio.run(provider.build(request)),
-                             generator=codex_generator(CodexRunner(config)))
-        export_pilot(run, output_dir=args.output, source_verification=verification)
+                             generator=codex_generator(CodexRunner(config)),
+                             trusted_context=trusted, trusted_store=store)
+        export_pilot(run, output_dir=args.output, source_verification=verification,
+                     trusted_context=trusted, trusted_store=store)
         return 0
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         parser.exit(2, f'pilot blocked: {exc}\n')

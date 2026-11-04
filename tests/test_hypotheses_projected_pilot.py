@@ -141,11 +141,13 @@ def test_off_topic_cross_user_and_unverified_historical_claims_are_rejected(case
         generate(case, verifier=Verifier())
 
 
-def test_same_case_request_amount_can_be_used_and_verifier_sees_only_approved_facts(case):
+def test_same_case_request_amount_can_be_used_and_verifier_sees_only_approved_facts(case, tmp_path):
     request = "Как проверить ремонты насосов при бюджете 120000 рублей?"
     case["cards"][0]["management_question"] = request
     verifier = Verifier()
-    run = generate(case, scope=request, verifier=verifier)
+    store = pilot.TrustedRequestStore(tmp_path / 'trusted.sqlite')
+    trusted = store.create({'run_id': 'run', 'case_id': 'case', 'user_id': 'user', 'scope': request})
+    run = generate(case, scope=request, verifier=verifier, trusted_context=trusted, trusted_store=store)
     assert "120000" in run["cards"][0]["management_question"]
     assert verifier.calls
     context = json.dumps(verifier.calls, ensure_ascii=False)

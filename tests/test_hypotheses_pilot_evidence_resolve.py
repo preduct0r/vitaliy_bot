@@ -54,10 +54,10 @@ def inputs(tmp_path):
     return context, report, coverage, cards, text, str(source)
 
 
-def generate(context, coverage, cards):
+def generate(context, coverage, cards, **trusted):
     return pilot.generate_pilot(scope="насосы", knowledge_version="knowledge-1",
                                 interest_context=context, coverage_provider=lambda: copy.deepcopy(coverage),
-                                generator=lambda _: copy.deepcopy(project_cards(cards)), **projection(context))
+                                generator=lambda _: copy.deepcopy(project_cards(cards)), **projection(context), **trusted)
 
 
 def test_id_only_resolves_exact_evidence_deterministically_and_exports(inputs, tmp_path):
@@ -66,6 +66,10 @@ def test_id_only_resolves_exact_evidence_deterministically_and_exports(inputs, t
     first = generate(context, coverage, cards)
     second = generate(context, coverage, cards)
     assert first == second
+    store = pilot.TrustedRequestStore(tmp_path / 'trusted.sqlite')
+    trusted = store.create({'run_id': 'run', 'case_id': 'case', 'user_id': 'user', 'scope': 'насосы'})
+    first = generate(context, coverage, cards, trusted_context=trusted, trusted_store=store)
+    assert {k: v for k, v in first.items() if k != 'request_binding'} == second
     by_id = {item["id"]: item for item in context["interests"]}
     for card in first["cards"]:
         meeting = card["meeting_interest"]
@@ -75,7 +79,7 @@ def test_id_only_resolves_exact_evidence_deterministically_and_exports(inputs, t
                    for entry in entries)
     pilot.validate_pilot(first, coverage=coverage, interest_context=context)
     output = tmp_path / "export"
-    pilot.export_pilot(first, output_dir=output, source_verification=report)
+    pilot.export_pilot(first, output_dir=output, source_verification=report, trusted_context=trusted, trusted_store=store)
     exported = (output / "pilot.json").read_text(encoding="utf-8")
     assert "meeting-a:chars:0-9" in exported or "meeting-b:chars:10-17" in exported
     assert "meeting-b:chars:0-9" in exported
@@ -146,7 +150,9 @@ def test_existing_valid_reference_format_remains_supported_and_forgery_rejected(
 
 def test_export_still_rejects_failed_or_mismatched_provenance(inputs, tmp_path):
     context, report, coverage, cards, _, _ = inputs
-    run = generate(context, coverage, cards)
+    store = pilot.TrustedRequestStore(tmp_path / 'trusted.sqlite')
+    trusted = store.create({'run_id': 'run', 'case_id': 'case', 'user_id': 'user', 'scope': 'насосы'})
+    run = generate(context, coverage, cards, trusted_context=trusted, trusted_store=store)
     for mutation in ("failed", "hash", "attribution"):
         bad = copy.deepcopy(report)
         if mutation == "failed":
@@ -156,4 +162,4 @@ def test_export_still_rejects_failed_or_mismatched_provenance(inputs, tmp_path):
         else:
             bad["checks"][0]["attribution"] = "direct_request"
         with pytest.raises(ValueError):
-            pilot.export_pilot(run, output_dir=tmp_path / mutation, source_verification=bad)
+            pilot.export_pilot(run, output_dir=tmp_path / mutation, source_verification=bad, trusted_context=trusted, trusted_store=store)

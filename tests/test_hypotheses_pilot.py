@@ -70,12 +70,13 @@ def cards():
     } for i in range(1, 6)]
 
 
-def generate(pilot, inputs, cards, model=None, coverage=None):
+def generate(pilot, inputs, cards, model=None, coverage=None, **trusted):
     return pilot.generate_pilot(
         scope=inputs["scope"], knowledge_version=inputs["knowledge_version"],
         interest_context=inputs["interest_context"],
         coverage_provider=coverage or (lambda: copy.deepcopy(inputs["coverage"])),
         generator=model or (lambda context: copy.deepcopy(project_cards(cards))),
+        **trusted,
         **projection(inputs["interest_context"]),
     )
 
@@ -145,13 +146,15 @@ def test_generator_receives_only_generalized_interests_and_no_holdout(pilot, inp
 
 
 def test_export_is_reproducible_and_preserves_verification(pilot, inputs, cards, tmp_path):
-    run = generate(pilot, inputs, cards)
+    store = pilot.TrustedRequestStore(tmp_path / 'trusted.sqlite')
+    trusted = store.create({'run_id': 'run', 'case_id': 'case', 'user_id': 'user', 'scope': inputs['scope']})
+    run = generate(pilot, inputs, cards, trusted_context=trusted, trusted_store=store)
     evidence = inputs['interest_context']['interests'][0]['evidence'][0]
     verification = {"verified": True, "corpus_version": "corpus-1", "interest_version": "interests-1",
                     "checks": [{**evidence, "interest_id": "repeat", "verified": True}]}
     first, second = tmp_path / "one", tmp_path / "two"
-    pilot.export_pilot(run, output_dir=first, source_verification=verification)
-    pilot.export_pilot(run, output_dir=second, source_verification=verification)
+    pilot.export_pilot(run, output_dir=first, source_verification=verification, trusted_context=trusted, trusted_store=store)
+    pilot.export_pilot(run, output_dir=second, source_verification=verification, trusted_context=trusted, trusted_store=store)
     files = lambda root: {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
     assert files(first) and files(first) == files(second)
     assert b'"verified"' in b"\n".join(files(first).values())
