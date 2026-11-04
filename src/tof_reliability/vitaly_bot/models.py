@@ -14,8 +14,8 @@ class BotConfig:
     token: str
     state_dir: Path
     codex_bin: Path
-    model: str = "gpt-6-astra"
-    reasoning_effort: str = "xhigh"
+    model: str = "gpt-6.1-sol"
+    reasoning_effort: str = "high"
     poll_timeout: int = 30
     model_timeout_seconds: int = 480
     evidence_timeout_seconds: int = 180

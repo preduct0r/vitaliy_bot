@@ -747,7 +747,7 @@ def test_codex_command_is_isolated_and_schema_constrained(tmp_path: Path):
     assert "--ephemeral" in command
     assert "--output-schema" in command
     assert "read-only" in command
-    assert "gpt-6-astra" in command
+    assert "gpt-6.1-sol" in command
 
 
 def test_codex_timeout_stops_the_entire_cli_process_group(tmp_path: Path):
