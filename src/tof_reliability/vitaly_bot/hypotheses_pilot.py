@@ -311,8 +311,12 @@ def _validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inte
 
 
 def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], interest_context: Mapping[str, Any], trusted_context=None, trusted_store=None) -> None:
-    _validate_pilot(run, coverage=coverage, interest_context=interest_context,
-                    trusted_context=trusted_context, trusted_store=trusted_store)
+    if run.get('pilot_version') == DIMENSION_PILOT_VERSION:
+        _validate_dimension_run(run, coverage=coverage, interest_context=interest_context,
+                                trusted_context=trusted_context, trusted_store=trusted_store)
+    else:
+        _validate_pilot(run, coverage=coverage, interest_context=interest_context,
+                        trusted_context=trusted_context, trusted_store=trusted_store)
     if trusted_context is not None:
         trusted_store.verify(trusted_context, run, sealed=True)
 
@@ -668,3 +672,326 @@ def subprocess_verifier(path: Path):
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             raise ValueError('private verifier failed') from exc
     return verify
+
+DIMENSION_PILOT_VERSION = 'pilot-repair-dimensions.v1'
+
+# These are investigative requirements, not claims that a registry or ledger
+# currently contains complete, case-scoped records.
+DIMENSION_MISSING = {
+    'repair_episode_count_by_equipment_period': ['полнота и классификация ремонтных эпизодов по оборудованию и периодам не подтверждены'],
+    'repair_repeat_interval': ['полнота истории эпизодов и сопоставимость оборудования для интервалов не подтверждены'],
+    'repair_episode_causes': ['причины отказов и их связь с повторными ремонтами требуют проверки'],
+    'repair_cost_by_period_asset_work': ['полнота и связь затрат с оборудованием, периодом и работой не подтверждены'],
+    'repair_cost_per_action': ['различение заказа, действия и эпизода для расчёта стоимости требует проверки'],
+    'repair_plan_fact_reasons': ['сопоставимость плана и факта и причины отклонений требуют проверки'],
+    'repair_labor_norm_actual': ['измеренные фактические трудозатраты и сопоставимость с нормой не подтверждены'],
+    'repair_techcard_registry_completeness': ['независимый полный реестр оборудования и операций для проверки полноты техкарт не подтверждён'],
+    'repair_techcard_equipment_operations_coverage': ['независимый перечень ремонтируемого оборудования и операций и соответствие техкартам требуют проверки'],
+    'repair_verification_status_owner': ['статус проверки и ответственный требуют независимого подтверждения'],
+    'repair_material_cost_supply': ['поставки и доступность материалов к ремонту не подтверждены данными о списаниях'],
+    'repair_downtime': ['полнота простоев и их связь с ремонтами требуют проверки'],
+    'repair_criticality_decisions': ['связь критичности с принятыми ремонтными решениями требует проверки'],
+}
+
+
+def reconcile_dimension_projections(*, profile, source_index, v1_projection, v1_verdicts,
+                                    v2_projection, v2_verdicts):
+    """Recheck both private audits against the same source corpus before merging.
+
+    A conflict in either audit holds the entire interest/dimension pair. An
+    unsupported reference alone does not erase a separately supported one.
+    """
+    from .hypotheses_interests import assess_provenance
+    from .hypotheses_topic_projection import _CATALOGS, DIMENSION_VERSION
+
+    try:
+        if profile['corpus_version'] != source_index['version'] or not assess_provenance(profile, source_index)['verified']:
+            raise ValueError('source provenance verification failed')
+        sources = {}
+        for source in source_index['sources']:
+            path = Path(source['path'])
+            if (source['id'] in sources or not path.is_absolute()
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != source['sha256']):
+                raise ValueError('source hash or identifier mismatch')
+            sources[source['id']] = source
+        interests = {i['id']: i for i in profile['interests']}
+        if len(interests) != len(profile['interests']):
+            raise ValueError('duplicate interest')
+        records, groups, rejected = [], {}, []
+        for projection, verdicts in ((v1_projection, v1_verdicts), (v2_projection, v2_verdicts)):
+            catalog = _CATALOGS.get(projection['version'])
+            if catalog is None or not isinstance(verdicts, list):
+                raise ValueError('unsupported projection version or verdicts')
+            by_key = {}
+            for entry in verdicts:
+                key = tuple(entry[k] for k in ('interest_id', 'dimension_id', 'source_id', 'locator'))
+                if key in by_key or key[0] not in interests or key[1] not in catalog:
+                    raise ValueError('duplicate or unknown verdict')
+                if not any(e['source_id'] == key[2] and e['locator'] == key[3] for e in interests[key[0]]['evidence']):
+                    raise ValueError('verdict source not in interest')
+                verdict = entry.get('verdict', entry)
+                if not isinstance(verdict, Mapping) or type(verdict.get('supported')) is not bool or verdict.get('confidence') not in ('high', 'low') or type(verdict.get('conflicting', False)) is not bool:
+                    raise ValueError('invalid verdict')
+                by_key[key] = verdict
+                if verdict.get('conflicting'):
+                    groups[(key[0], key[1])] = True
+            for row in projection['dimensions']:
+                dim = row['dimension_id']
+                if dim not in catalog or (row['topic_id'], row['description']) != catalog[dim]:
+                    raise ValueError('projection catalog mismatch')
+                for entry in row['evidence']:
+                    key = (entry['interest_id'], dim, entry['source_id'], entry['locator'])
+                    if key not in by_key:
+                        raise ValueError('missing independent verdict')
+                    actual = [e for e in interests[key[0]]['evidence'] if e['source_id'] == key[2] and e['locator'] == key[3]]
+                    if len(actual) != 1 or any(entry.get(k) != actual[0].get(k) for k in ('source_id', 'locator', 'fragment', 'attribution')):
+                        raise ValueError('projection evidence mismatch')
+                    records.append((dim, dict(entry), by_key[key]))
+            for unconfirmed in projection.get('unconfirmed', []):
+                ident, dim = unconfirmed['interest_id'], unconfirmed['dimension_id']
+                if dim not in catalog or unconfirmed['topic_id'] != catalog[dim][0]:
+                    raise ValueError('invalid unconfirmed dimension')
+                for entry in unconfirmed['evidence']:
+                    key = (ident, dim, entry['source_id'], entry['locator'])
+                    if key not in by_key:
+                        raise ValueError('missing independent verdict for unconfirmed evidence')
+                    actual = [e for e in interests[ident]['evidence'] if e['source_id'] == key[2] and e['locator'] == key[3]]
+                    if len(actual) != 1 or any(entry.get(k) != actual[0].get(k) for k in ('source_id', 'locator', 'fragment', 'attribution')):
+                        raise ValueError('unconfirmed evidence mismatch')
+            rejected.extend(copy.deepcopy(projection.get('unconfirmed', [])))
+        rows = {}
+        for dim, entry, verdict in records:
+            ident = entry['interest_id']
+            if (groups.get((ident, dim)) or verdict['supported'] is not True
+                    or verdict['confidence'] != 'high'):
+                rejected.append({'interest_id': ident, 'dimension_id': dim,
+                                 'topic_id': _CATALOGS[DIMENSION_VERSION][dim][0],
+                                 'evidence': [copy.deepcopy(entry)], 'verdict': copy.deepcopy(verdict)})
+                continue
+            topic, desc = _CATALOGS[DIMENSION_VERSION][dim]
+            row = rows.setdefault(dim, {'dimension_id': dim, 'topic_id': topic, 'description': desc,
+                                       'interest_ids': set(), 'source_ids': set(), 'evidence': [], 'meetings': set()})
+            row['interest_ids'].add(ident)
+            row['source_ids'].add(entry['source_id'])
+            if entry not in row['evidence']:
+                row['evidence'].append(entry)
+            source = sources[entry['source_id']]
+            row['meetings'].add(source.get('meeting_id') or source.get('date') or source['id'])
+        for row in rows.values():
+            row['interest_ids'] = sorted(row['interest_ids'])
+            row['source_ids'] = sorted(row['source_ids'])
+            row['independent_meeting_count'] = len(row.pop('meetings'))
+        return {'version': DIMENSION_PILOT_VERSION, 'profile_version': profile['version'],
+                'corpus_version': source_index['version'], 'dimensions': list(rows.values()),
+                'unconfirmed': rejected}
+    except (KeyError, TypeError, OSError, AttributeError) as exc:
+        raise ValueError('invalid private projection or source corpus') from exc
+
+
+def _dimension_bindings(projection, interests, coverage):
+    from .hypotheses_topic_projection import _CATALOGS, DIMENSION_VERSION
+    if not isinstance(projection, Mapping) or projection.get('version') != DIMENSION_PILOT_VERSION:
+        raise ValueError('unsupported private dimension projection')
+    if projection.get('profile_version', interests['version']) != interests['version'] or projection.get('corpus_version', interests['corpus_version']) != interests['corpus_version']:
+        raise ValueError('dimension profile version mismatch')
+    if projection.get('generation_id', coverage['generation']['run_id']) != coverage['generation']['run_id']:
+        raise ValueError('dimension generation mismatch')
+    catalog = _CATALOGS[DIMENSION_VERSION]
+    by_id = {i['id']: i for i in interests['interests']}
+    bindings, seen = {}, set()
+    for row in projection.get('dimensions', []):
+        dim = row.get('dimension_id')
+        if dim in seen or dim not in catalog or (row.get('topic_id'), row.get('description')) != catalog[dim]:
+            raise ValueError('invalid dimension catalog entry')
+        seen.add(dim)
+        for entry in row.get('evidence', []):
+            ident = entry.get('interest_id')
+            if ident not in by_id or ident not in row.get('interest_ids', []) or entry.get('source_id') not in row.get('source_ids', []):
+                raise ValueError('invalid dimension interest evidence')
+            evidence = [e for e in by_id[ident]['evidence'] if all(e.get(k) == entry.get(k) for k in ('source_id', 'locator', 'attribution'))]
+            if len(evidence) != 1:
+                raise ValueError('dimension evidence is not bound to current interest')
+            bindings.setdefault((ident, dim), evidence[0])
+    return bindings
+
+
+def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=None, trusted_store=None):
+    from .hypotheses_topic_projection import _CATALOGS, DIMENSION_VERSION
+    trusted_scope = _trusted_scope(trusted_context, trusted_store, run)
+    interests = _interests(interest_context)
+    coverage = _coverage(coverage)
+    if run.get('generation_id') != coverage['generation']['run_id'] or run.get('interest_version') != interests['version']:
+        raise ValueError('snapshot version mismatch')
+    _text(run.get('knowledge_version'), 'knowledge version')
+    bindings = _dimension_bindings(run['dimension_projection'], interests, coverage)
+    catalog = _CATALOGS[DIMENSION_VERSION]
+    routes = {r['capability_id']: r for r in coverage['routes']}
+    cards = run.get('cards')
+    if not isinstance(cards, list) or not 5 <= len(cards) <= 7:
+        raise ValueError('five to seven cards required')
+    seen_dim, seen_decisions, seen_methods = set(), set(), set()
+    for n, card in enumerate(cards, 1):
+        if not isinstance(card, dict) or card.get('number') != n:
+            raise ValueError('cards must be numbered consecutively')
+        clone = copy.deepcopy(card)
+        meeting = clone.get('meeting_interest', {})
+        dim = meeting.pop('dimension_id', None)
+        _check_card_fields(clone)
+        topic = meeting.get('topic_id')
+        key = (meeting.get('interest_id'), dim)
+        if dim in seen_dim or dim not in catalog or catalog[dim][0] != topic or key not in bindings:
+            raise ValueError('invalid or duplicate dimension binding')
+        seen_dim.add(dim)
+        if any(meeting.get(k) != v for k, v in bindings[key].items()):
+            raise ValueError('dimension evidence mismatch')
+        for field in TEXT_FIELDS:
+            _text(card.get(field), field)
+        for field in LIST_FIELDS:
+            value = card.get(field)
+            if not isinstance(value, list) or (field != 'missing_evidence' and not value):
+                raise ValueError('invalid card list')
+            for item in value:
+                _text(item, field)
+        for field, seen in (('decision', seen_decisions), ('metrics_method', seen_methods)):
+            value = ' '.join(card[field].casefold().split()).strip(' .!?')
+            if value in seen:
+                raise ValueError('duplicate decision or method')
+            seen.add(value)
+        _validate_numeric_claims(card, trusted_scope, reject_roman=True)
+        _validate_case_scope(card, run['scope'])
+        route = routes.get(card.get('capability_id'))
+        if (route is None or route['availability'] == 'unavailable'
+                or route['capability_id'] not in TOPIC_ROUTES.get(topic, set()) or not _references(route)):
+            raise ValueError('ineligible dimension route')
+        required_missing = set(route['missing_evidence']) | set(DIMENSION_MISSING.get(dim, []))
+        if (card.get('source_readiness') != route['availability']
+                or set(card['source_references']) - _references(route)
+                or not required_missing <= set(card['missing_evidence'])):
+            raise ValueError('route evidence or readiness mismatch')
+        extra_missing = [item for item in card['missing_evidence'] if item not in required_missing]
+        _validate_numeric_claims(dict(card, hard_questions=extra_missing), trusted_scope, reject_roman=True)
+        allowed = set(re.findall(r'[\w-]+', run['scope'].casefold()))
+        private_tokens = {t.casefold() for item in interests['interests'] for value in item.values()
+                          if isinstance(value, str) for t in re.findall(r'[A-ZА-ЯЁ_]{4,}', value)
+                          if t.casefold() not in allowed}
+        if any(token in ' '.join(extra_missing).casefold() for token in private_tokens):
+            raise ValueError('private source token in missing evidence')
+        rank = card.get('ranking')
+        if not isinstance(rank, dict) or set(rank) != set(SCORES) or any(type(rank[k]) not in (int, float) or not 0 <= rank[k] <= 5 for k in SCORES):
+            raise ValueError('invalid ranking')
+        if card['novelty'].casefold() in ('unknown', 'неизвестна', 'неизвестно') and rank['novelty'] != 0:
+            raise ValueError('unknown novelty cannot be scored as proven')
+
+
+def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dimension_projection,
+                             coverage_provider, generator, private_verifier,
+                             trusted_context=None, trusted_store=None):
+    from .hypotheses_topic_projection import _CATALOGS, DIMENSION_VERSION
+    _text(knowledge_version, 'knowledge version')
+    if not isinstance(scope, str):
+        raise ValueError('scope must be text')
+    if trusted_context is not None and _trusted_scope(trusted_context, trusted_store) != scope:
+        raise ValueError('trusted request scope mismatch')
+    if not callable(generator) or not callable(private_verifier) or generator is private_verifier:
+        raise ValueError('independent generator and verifier required')
+    interests = _interests(interest_context)
+    try:
+        coverage = _coverage(coverage_provider())
+    except Exception as exc:
+        raise RuntimeError('published server coverage unavailable: ' + str(exc)) from exc
+    bindings = _dimension_bindings(dimension_projection, interests, coverage)
+    catalog = _CATALOGS[DIMENSION_VERSION]
+    available = {r['capability_id'] for r in coverage['routes'] if r['availability'] in ('available', 'partial') and _references(r)}
+    eligible = {dim for _, dim in bindings if TOPIC_ROUTES.get(catalog[dim][0], set()) & available}
+    if len(eligible) < 5:
+        raise ValueError('fewer than five eligible dimensions')
+    model_dimensions = [{'dimension_id': dim, 'topic_id': catalog[dim][0], 'description': catalog[dim][1],
+                         'interest_ids': sorted(ident for ident, d in bindings if d == dim),
+                         'missing_evidence': DIMENSION_MISSING.get(dim, [])} for dim in sorted(eligible)]
+    safe_routes = [{k: copy.deepcopy(r[k]) for k in ('capability_id', 'route_id', 'availability', 'missing_evidence') if k in r}
+                   | {'source_references': sorted(_references(r))} for r in coverage['routes']]
+    context = {'scope': scope, 'knowledge_version': knowledge_version, 'dimensions': model_dimensions,
+               'coverage': {'generation_id': coverage['generation']['run_id'], 'routes': safe_routes},
+               'eligible_dimension_routes': {dim: sorted(TOPIC_ROUTES[catalog[dim][0]] & available) for dim in sorted(eligible)},
+               'instructions': ('Предложите от пяти до семи полезных разных измерений с различными решениями и методами. '
+                                'Используйте только указанные измерения, интересы и маршруты. Сохраните область запроса. '
+                                'Не утверждайте факты, значения, прошлые события и эффект сценария. '
+                                'Укажите ограничения источников и отсутствующие данные, не выполняйте анализ. '
+                                'Верните interest_id, topic_id и dimension_id. Новизну при отсутствии данных укажите unknown с нулевой оценкой.')}
+    cards = generator(copy.deepcopy(context))
+    if not isinstance(cards, list) or not 5 <= len(cards) <= 7:
+        raise ValueError('five to seven cards required')
+    run = {'pilot_version': DIMENSION_PILOT_VERSION, 'generation_id': coverage['generation']['run_id'],
+           'knowledge_version': knowledge_version, 'interest_version': interests['version'], 'scope': scope,
+           'coverage': coverage, 'interest_context': interests, 'dimension_projection': copy.deepcopy(dimension_projection),
+           'cards': copy.deepcopy(cards)}
+    if trusted_context is not None:
+        run['request_binding'] = trusted_context.token
+    routes = {r['capability_id']: r for r in coverage['routes']}
+    for number, card in enumerate(run['cards'], 1):
+        if not isinstance(card, dict) or not isinstance(card.get('meeting_interest'), dict):
+            raise ValueError('invalid card')
+        meeting = card['meeting_interest']
+        key = (meeting.get('interest_id'), meeting.get('dimension_id'))
+        dim = key[1]
+        if key not in bindings or dim not in eligible or meeting.get('topic_id') != catalog[dim][0]:
+            raise ValueError('invalid dimension selection')
+        route = routes.get(card.get('capability_id'))
+        if route is None or route['availability'] == 'unavailable' or route['capability_id'] not in TOPIC_ROUTES.get(meeting['topic_id'], set()):
+            raise ValueError('invalid route')
+        supplied = {k: meeting[k] for k in bindings[key] if k in meeting}
+        if any(bindings[key][k] != v for k, v in supplied.items()):
+            raise ValueError('invalid supplied attribution')
+        card['meeting_interest'] = {'interest_id': key[0], 'topic_id': catalog[dim][0], 'dimension_id': dim, **bindings[key]}
+        card['number'] = number
+        card['source_readiness'] = route['availability']
+        proposed_missing = card.get('missing_evidence')
+        if not isinstance(proposed_missing, list) or any(not isinstance(x, str) or not x.strip() for x in proposed_missing):
+            raise ValueError('invalid proposed missing evidence')
+        missing_check = dict(card, hard_questions=proposed_missing)
+        _validate_numeric_claims(missing_check, scope, reject_roman=True)
+        allowed = set(re.findall(r'[\w-]+', scope.casefold()))
+        private_tokens = {t.casefold() for item in interests['interests'] for value in item.values()
+                          if isinstance(value, str) for t in re.findall(r'[A-ZА-ЯЁ_]{4,}', value)
+                          if t.casefold() not in allowed}
+        if any(token in ' '.join(proposed_missing).casefold() for token in private_tokens):
+            raise ValueError('private source token in missing evidence')
+        card['missing_evidence'] = list(dict.fromkeys([*proposed_missing, *route['missing_evidence'], *DIMENSION_MISSING.get(dim, [])]))
+    _validate_dimension_run(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store)
+    accepted, rejected = [], []
+    for card in run['cards']:
+        prose = ' '.join([card[k] for k in TEXT_FIELDS] + card['hard_questions'])
+        if re.search(r'\b(?:компани\w*|гарантированно|сценари\w*\s+(?:снизит|повысит|сократит))\b', prose, re.I):
+            raise ValueError('unsupported private fact or scenario effect')
+        dim = card['meeting_interest']['dimension_id']
+        def verify_dimension(request):
+            request['dimension_id'] = dim
+            request['missing_evidence'] = list(card['missing_evidence'])
+            selected_route = routes[card['capability_id']]
+            request['route'] = {'capability_id': selected_route['capability_id'],
+                                'availability': selected_route['availability'],
+                                'source_references': sorted(_references(selected_route)),
+                                'missing_evidence': list(card['missing_evidence'])}
+            request['other_directions'] = [
+                {'dimension_id': other['meeting_interest']['dimension_id'],
+                 'decision': other['decision'], 'metrics_method': other['metrics_method']}
+                for other in run['cards'] if other is not card]
+            request['description'] = catalog[dim][1]
+            request['instructions'] += ' Проверьте соответствие точному измерению и различимость решения и метода; не подтверждайте старые факты или эффект сценария.'
+            return private_verifier(request)
+        verdict = _validate_card_content(card, scope, card['meeting_interest']['topic_id'], interests, verify_dimension)
+        if verdict is None:
+            accepted.append(card)
+        else:
+            rejected.append({'card': copy.deepcopy(card), 'verdict': verdict})
+    if len(accepted) < 5:
+        raise ValueError('fewer than five verified cards remain')
+    run['cards'] = sorted(accepted, key=lambda c: sum(c['ranking'][k] for k in SCORES), reverse=True)
+    for number, card in enumerate(run['cards'], 1):
+        card['number'] = number
+    if rejected:
+        run['rejected_cards'] = rejected
+    _validate_dimension_run(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store)
+    if trusted_context is not None:
+        trusted_store.seal(trusted_context, run)
+    return run
