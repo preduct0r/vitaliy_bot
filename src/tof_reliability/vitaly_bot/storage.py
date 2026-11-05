@@ -296,9 +296,16 @@ class VitalyStore:
                                (user_id, run_id, card_number, expected_revision, _utc_now()))
 
     def cancel_hypotheses_feedback_input(self, user_id: int) -> bool:
+        return self.pop_hypotheses_feedback_input(user_id) is not None
+
+    def pop_hypotheses_feedback_input(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Cancel atomically while retaining the selected run and card for navigation."""
         with self._connect() as connection:
-            cursor = connection.execute('DELETE FROM hypotheses_feedback_input WHERE user_id = ?', (user_id,))
-            return cursor.rowcount == 1
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM hypotheses_feedback_input WHERE user_id = ?', (user_id,)).fetchone()
+            if row is not None:
+                connection.execute('DELETE FROM hypotheses_feedback_input WHERE user_id = ?', (user_id,))
+            return dict(row) if row is not None else None
 
     def submit_hypotheses_feedback_text(self, *, user_id: int, text: str, event_id: str, ttl_days: int = 4) -> Dict[str, Any]:
         if not isinstance(text, str) or not text.strip() or len(text) > 10000:

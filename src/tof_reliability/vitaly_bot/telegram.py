@@ -752,6 +752,17 @@ def build_router(runtime: TelegramRuntime) -> Router:
     def user_id(message: Message) -> Optional[int]:
         return message.from_user.id if message.from_user else None
 
+    def feedback_keyboard(owner: int, selection: Dict[str, Any]):
+        """Only restore navigation for the owner's currently active, unexpired run."""
+        service = runtime.service.hypotheses_service
+        if service is None:
+            raise StateError('Сервис недоступен')
+        run = service.get_run(user_id=owner, run_id=selection['run_id'])
+        with runtime.store._connect() as db:
+            runtime.store._feedback_target(db, run['id'], owner, selection['card_number'],
+                                           run['revision'], runtime.config.context_ttl_days)
+        return hypotheses_ui.keyboard(run, selection['card_number'])
+
     def assert_not_collecting_learning_input(message: Message) -> None:
         with runtime.store._connect() as db:
             pending = db.execute('SELECT 1 FROM hypotheses_feedback_input WHERE user_id = ?', (user_id(message),)).fetchone()
@@ -955,11 +966,20 @@ def build_router(runtime: TelegramRuntime) -> Router:
     async def cancel(message: Message) -> None:
         try:
             cancelled = runtime.store.cancel_feedback(message.chat.id, user_id(message))
+            selection = None
             if user_id(message) == message.chat.id:
-                cancelled = runtime.store.cancel_hypotheses_feedback_input(message.chat.id) or cancelled
+                selection = runtime.store.pop_hypotheses_feedback_input(message.chat.id)
+                cancelled = bool(selection) or cancelled
             cancelled = runtime.store.cancel_meeting(message.chat.id, user_id(message)) or cancelled
             if cancelled:
-                await send_with_retry(runtime.bot, message.chat.id, "Ввод отменён. Кейс и аудит не изменены.")
+                markup = None
+                if selection:
+                    try:
+                        markup = feedback_keyboard(message.chat.id, selection)
+                    except StateError:
+                        pass
+                await send_with_retry(runtime.bot, message.chat.id, "Ввод отменён. Кейс и аудит не изменены.",
+                                      reply_markup=markup)
             else:
                 await send_with_retry(runtime.bot, message.chat.id, "Нет ожидающего пояснения или загрузки встречи.")
         except Exception as error:
@@ -1150,15 +1170,20 @@ def build_router(runtime: TelegramRuntime) -> Router:
                 pending_hypothesis = db.execute('SELECT 1 FROM hypotheses_feedback_input WHERE user_id = ?', (user_id(message),)).fetchone()
                 replay = db.execute("SELECT 1 FROM hypotheses_feedback_events WHERE user_id=? AND event_id=? AND kind='text'",
                     (user_id(message), 'message:' + str(message.chat.id) + ':' + str(message.message_id))).fetchone()
-            if replay:
-                await send_with_retry(runtime.bot, message.chat.id, 'Это сообщение реакции уже принято.')
-                return
-            if pending_hypothesis:
+            if replay or pending_hypothesis:
                 if user_id(message) != message.chat.id:
                     raise StateError('Кейс принадлежит другому пользователю')
-                runtime.service.hypotheses_service.submit_feedback_text(user_id=message.chat.id, text=message.text,
+                result = runtime.service.hypotheses_service.submit_feedback_text(user_id=message.chat.id, text=message.text,
                     event_id='message:' + str(message.chat.id) + ':' + str(message.message_id))
-                await send_with_retry(runtime.bot, message.chat.id, 'Реакция сохранена отдельно от материалов кейса.')
+                try:
+                    markup = feedback_keyboard(message.chat.id, result)
+                except StateError:
+                    if not replay:
+                        raise
+                    markup = None
+                text = ('Это сообщение реакции уже принято.' if replay else
+                        'Реакция сохранена отдельно от материалов кейса.')
+                await send_with_retry(runtime.bot, message.chat.id, text, reply_markup=markup)
                 return
             pending_feedback = runtime.store.pending_feedback(message.chat.id, user_id(message))
             if pending_feedback:
