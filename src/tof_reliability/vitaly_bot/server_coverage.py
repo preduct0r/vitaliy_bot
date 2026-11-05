@@ -169,9 +169,12 @@ def _collect(generation: dict[str, Any], root: Path, ids: set[str], start: date 
     return results
 
 
-def build_coverage(request: dict[str, Any], *, generation_state_path: Path = GENERATION_STATE, root: Path = TOF_ROOT) -> dict[str, Any]:
+def build_coverage(request: dict[str, Any], *, generation_state_path: Path = GENERATION_STATE, root: Path = TOF_ROOT,
+                   max_generation_retries: int = 1) -> dict[str, Any]:
     ids, start, end = _request(request)
-    for _ in range(2):
+    if type(max_generation_retries) is not int or max_generation_retries not in (0, 1):
+        raise ValueError('invalid_generation_retry_limit')
+    for _ in range(1 + max_generation_retries):
         before = _generation(generation_state_path)
         # Resolve once: a moving symlink must not mix snapshot files.
         snapshot = {**before, 'ledger_path': str(Path(before['ledger_path']).resolve(strict=True)), 'catalog_path': str(Path(before['catalog_path']).resolve(strict=True))}

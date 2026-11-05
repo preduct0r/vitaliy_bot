@@ -72,6 +72,10 @@ class TrustedRequestStore:
             os.close(fd)
         with sqlite3.connect(self.path) as db:
             db.execute('CREATE TABLE IF NOT EXISTS trusted_requests (run_id TEXT, case_id TEXT, user_id TEXT, scope TEXT, token TEXT UNIQUE, digest TEXT, result_digest TEXT, PRIMARY KEY(run_id, case_id, user_id))')
+            db.execute('CREATE TABLE IF NOT EXISTS trusted_request_results (token TEXT PRIMARY KEY, result_json TEXT NOT NULL)')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(trusted_requests)')}
+            if 'result_json' in columns:
+                db.execute('INSERT OR IGNORE INTO trusted_request_results SELECT token, result_json FROM trusted_requests WHERE result_json IS NOT NULL')
 
     def create(self, request):
         if not isinstance(request, Mapping) or set(request) != {'run_id', 'case_id', 'user_id', 'scope'}:
@@ -82,11 +86,31 @@ class TrustedRequestStore:
         trusted = TrustedRequest(**values, digest=_digest(values))
         try:
             with sqlite3.connect(self.path) as db:
-                db.execute('INSERT INTO trusted_requests VALUES (?, ?, ?, ?, ?, ?, NULL)',
+                db.execute('INSERT INTO trusted_requests (run_id, case_id, user_id, scope, token, digest, result_digest) VALUES (?, ?, ?, ?, ?, ?, NULL)',
                            (trusted.run_id, trusted.case_id, trusted.user_id, trusted.scope, trusted.token, trusted.digest))
         except sqlite3.IntegrityError as exc:
             raise ValueError('trusted request already exists') from exc
         return trusted
+
+    def recover(self, request):
+        """Return the original binding and any sealed result after a crash."""
+        if not isinstance(request, Mapping) or set(request) != {'run_id', 'case_id', 'user_id', 'scope'}:
+            raise ValueError('invalid trusted request')
+        with sqlite3.connect(self.path) as db:
+            row = db.execute('SELECT r.token, r.digest, r.scope, x.result_json, r.result_digest FROM trusted_requests r LEFT JOIN trusted_request_results x ON x.token = r.token WHERE r.run_id = ? AND r.case_id = ? AND r.user_id = ?',
+                             (request['run_id'], request['case_id'], request['user_id'])).fetchone()
+        if row is None:
+            return self.create(request), None
+        if row[2] != request['scope']:
+            raise ValueError('trusted request mismatch')
+        trusted = TrustedRequest(**dict(request), token=row[0], digest=row[1])
+        self.verify(trusted)
+        if row[4] is not None and row[3] is None:
+            raise ValueError('sealed result cannot be recovered')
+        result = json.loads(row[3]) if row[3] is not None else None
+        if result is not None:
+            self.verify(trusted, result, sealed=True)
+        return trusted, result
 
     def verify(self, trusted, run=None, *, sealed=False):
         if not isinstance(trusted, TrustedRequest):
@@ -105,9 +129,12 @@ class TrustedRequestStore:
     def seal(self, trusted, run):
         self.verify(trusted, run)
         with sqlite3.connect(self.path) as db:
-            cursor = db.execute('UPDATE trusted_requests SET result_digest = ? WHERE token = ? AND result_digest IS NULL', (_digest(run), trusted.token))
+            cursor = db.execute('UPDATE trusted_requests SET result_digest = ? WHERE token = ? AND result_digest IS NULL',
+                                (_digest(run), trusted.token))
             if cursor.rowcount != 1:
                 raise ValueError('trusted request already used')
+            db.execute('INSERT INTO trusted_request_results (token, result_json) VALUES (?, ?)',
+                       (trusted.token, json.dumps(run, ensure_ascii=False, sort_keys=True, allow_nan=False)))
 
 
 def _trusted_scope(trusted_context, trusted_store, run=None):
@@ -1055,7 +1082,7 @@ def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=
 
 def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dimension_projection,
                              coverage_provider, generator, private_verifier,
-                             trusted_context=None, trusted_store=None):
+                             trusted_context=None, trusted_store=None, result_metadata=None):
     from .hypotheses_topic_projection import _CATALOGS, DIMENSION_VERSION
     _text(knowledge_version, 'knowledge version')
     if not isinstance(scope, str):
@@ -1207,6 +1234,11 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
     if rejected:
         run['rejected_cards'] = rejected
     _validate_dimension_run(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store)
+    if result_metadata is not None:
+        metadata = result_metadata(copy.deepcopy(run))
+        if not isinstance(metadata, dict):
+            raise ValueError('invalid private result metadata')
+        run['service_metadata'] = copy.deepcopy(metadata)
     if trusted_context is not None:
         trusted_store.seal(trusted_context, run)
     return run

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import shutil
 import sqlite3
 import uuid
@@ -28,6 +28,14 @@ def _local_now(now: Optional[datetime] = None) -> datetime:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _load_json(value: Optional[str], fallback: Any) -> Any:
@@ -155,6 +163,162 @@ class VitalyStore:
             )
             self._migrate_case_columns(connection)
             self._initialize_learning_schema(connection)
+            self._initialize_hypotheses_schema(connection)
+
+    @staticmethod
+    def _initialize_hypotheses_schema(connection: sqlite3.Connection) -> None:
+        """Add private run state without changing the legacy case/job schema."""
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS hypotheses_runs (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+                case_id TEXT NOT NULL REFERENCES cases(id),
+                chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                user_request TEXT NOT NULL, case_hash TEXT NOT NULL,
+                artifact_hashes_json TEXT NOT NULL,
+                profile_version TEXT NOT NULL, knowledge_package_id TEXT,
+                knowledge_version TEXT, interest_version TEXT, generation_id TEXT,
+                cards_json TEXT NOT NULL DEFAULT '[]',
+                revision INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL, error TEXT,
+                created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS hypotheses_feedback_events (
+                user_id INTEGER NOT NULL, event_id TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES hypotheses_runs(id),
+                card_number INTEGER NOT NULL, kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL, result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, event_id)
+            );
+            CREATE TABLE IF NOT EXISTS hypotheses_feedback_input (
+                user_id INTEGER PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES hypotheses_runs(id),
+                card_number INTEGER NOT NULL, expected_revision INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+        """)
+        columns = {row['name'] for row in connection.execute('PRAGMA table_info(hypotheses_runs)')}
+        if 'artifact_snapshot_json' not in columns:
+            connection.execute("ALTER TABLE hypotheses_runs ADD COLUMN artifact_snapshot_json TEXT NOT NULL DEFAULT '[]'")
+        if 'knowledge_hash' not in columns:
+            connection.execute('ALTER TABLE hypotheses_runs ADD COLUMN knowledge_hash TEXT')
+        if 'coverage_json' not in columns:
+            connection.execute('ALTER TABLE hypotheses_runs ADD COLUMN coverage_json TEXT')
+
+    @staticmethod
+    def _hypotheses_run(row: sqlite3.Row) -> Dict[str, Any]:
+        value = dict(row)
+        value['cards'] = _load_json(value.pop('cards_json'), [])
+        value['artifact_hashes'] = _load_json(value.pop('artifact_hashes_json'), [])
+        value['coverage'] = _load_json(value.pop('coverage_json'), None)
+        return value
+
+    def hypotheses_run(self, *, user_id: int, job_id: Optional[str] = None,
+                       run_id: Optional[str] = None) -> Dict[str, Any]:
+        if (job_id is None) == (run_id is None):
+            raise ValueError('Укажите ровно один идентификатор')
+        with self._connect() as connection:
+            if job_id is not None:
+                row = connection.execute('SELECT * FROM hypotheses_runs WHERE job_id = ? AND user_id = ?', (job_id, user_id)).fetchone()
+            else:
+                row = connection.execute('SELECT * FROM hypotheses_runs WHERE id = ? AND user_id = ?', (run_id, user_id)).fetchone()
+        if row is None:
+            raise StateError('Результат не найден')
+        return self._hypotheses_run(row)
+
+    @staticmethod
+    def _feedback_target(connection: sqlite3.Connection, run_id: str, user_id: int,
+                         card_number: int, expected_revision: int, ttl_days: int = 4) -> tuple[sqlite3.Row, list]:
+        row = connection.execute('SELECT * FROM hypotheses_runs WHERE id = ? AND user_id = ?', (run_id, user_id)).fetchone()
+        if row is None or row['status'] != 'completed':
+            raise StateError('Результат не найден')
+        latest = connection.execute("SELECT id FROM hypotheses_runs WHERE case_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", (row['case_id'],)).fetchone()
+        if latest is None or latest['id'] != run_id or row['revision'] != expected_revision:
+            raise StateError('Кнопка устарела')
+        case = connection.execute('SELECT * FROM cases WHERE id = ?', (row['case_id'],)).fetchone()
+        active = connection.execute('SELECT id FROM cases WHERE chat_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1', (row['chat_id'],)).fetchone()
+        last = VitalyStore._as_utc_datetime(str(case['last_user_activity_at'] or case['updated_at'] or case['created_at'])) if case else None
+        if (case is None or case['status'] == 'expired' or active is None or active['id'] != row['case_id'] or
+                last is None or last < datetime.now(timezone.utc) - timedelta(days=ttl_days)):
+            raise StateError('Контекст кейса истёк')
+        cards = _load_json(row['cards_json'], [])
+        if type(card_number) is not int or not 1 <= card_number <= len(cards):
+            raise StateError('Карточка не найдена')
+        return row, cards
+
+    @staticmethod
+    def _feedback_duplicate(connection: sqlite3.Connection, user_id: int, event_id: str,
+                            run_id: str, card_number: int, kind: str, payload: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(event_id, str) or not event_id.strip() or len(event_id) > 200:
+            raise ValueError('Некорректный идентификатор события')
+        row = connection.execute('SELECT * FROM hypotheses_feedback_events WHERE user_id = ? AND event_id = ?', (user_id, event_id)).fetchone()
+        if row is None:
+            return None
+        if (row['run_id'], row['card_number'], row['kind'], row['payload_json']) != (run_id, card_number, kind, payload):
+            raise StateError('Идентификатор события уже использован')
+        return _load_json(row['result_json'], {})
+
+    def record_hypotheses_feedback(self, *, run_id: str, user_id: int, card_number: int,
+                                   decision: str, expected_revision: int, event_id: str, ttl_days: int = 4) -> Dict[str, Any]:
+        if decision not in {'plan', 'selected', 'already_done', 'not_useful', 'busko_reaction'}:
+            raise ValueError('Неизвестное решение')
+        payload = _json({'decision': decision})
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            duplicate = self._feedback_duplicate(connection, user_id, event_id, run_id, card_number, 'decision', payload)
+            if duplicate is not None:
+                return duplicate
+            row, cards = self._feedback_target(connection, run_id, user_id, card_number, expected_revision, ttl_days)
+            feedback = dict(cards[card_number - 1].get('feedback') or {})
+            feedback['reaction' if decision == 'busko_reaction' else 'decision'] = decision
+            cards[card_number - 1]['feedback'] = feedback
+            result = {'run_id': run_id, 'card_number': card_number, 'revision': row['revision'] + 1,
+                      'decision': decision, 'learning_status': 'pending_quality_gate'}
+            connection.execute('UPDATE hypotheses_runs SET cards_json = ?, revision = ? WHERE id = ?', (_json(cards), result['revision'], run_id))
+            connection.execute('INSERT INTO hypotheses_feedback_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                               (user_id, event_id, run_id, card_number, 'decision', payload, _json(result), _utc_now()))
+            return result
+
+    def begin_hypotheses_feedback_input(self, *, run_id: str, user_id: int, card_number: int,
+                                        expected_revision: int, ttl_days: int = 4) -> None:
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            self._feedback_target(connection, run_id, user_id, card_number, expected_revision, ttl_days)
+            connection.execute('INSERT OR REPLACE INTO hypotheses_feedback_input VALUES (?, ?, ?, ?, ?)',
+                               (user_id, run_id, card_number, expected_revision, _utc_now()))
+
+    def cancel_hypotheses_feedback_input(self, user_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute('DELETE FROM hypotheses_feedback_input WHERE user_id = ?', (user_id,))
+            return cursor.rowcount == 1
+
+    def submit_hypotheses_feedback_text(self, *, user_id: int, text: str, event_id: str, ttl_days: int = 4) -> Dict[str, Any]:
+        if not isinstance(text, str) or not text.strip() or len(text) > 10000:
+            raise ValueError('Некорректный отзыв')
+        if not isinstance(event_id, str) or not event_id.strip() or len(event_id) > 200:
+            raise ValueError('Некорректный идентификатор события')
+        payload = _json({'text': text})
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            old = connection.execute('SELECT * FROM hypotheses_feedback_events WHERE user_id = ? AND event_id = ?', (user_id, event_id)).fetchone()
+            if old is not None:
+                duplicate = self._feedback_duplicate(connection, user_id, event_id, old['run_id'], old['card_number'], 'text', payload)
+                return duplicate
+            pending = connection.execute('SELECT * FROM hypotheses_feedback_input WHERE user_id = ?', (user_id,)).fetchone()
+            if pending is None:
+                raise StateError('Нет ожидаемого отзыва')
+            row, cards = self._feedback_target(connection, pending['run_id'], user_id, pending['card_number'], pending['expected_revision'], ttl_days)
+            feedback = dict(cards[pending['card_number'] - 1].get('feedback') or {})
+            feedback['text'] = text
+            cards[pending['card_number'] - 1]['feedback'] = feedback
+            result = {'run_id': row['id'], 'card_number': pending['card_number'], 'revision': row['revision'] + 1,
+                      'learning_status': 'pending_quality_gate'}
+            connection.execute('UPDATE hypotheses_runs SET cards_json = ?, revision = ? WHERE id = ?', (_json(cards), result['revision'], row['id']))
+            connection.execute('INSERT INTO hypotheses_feedback_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                               (user_id, event_id, row['id'], pending['card_number'], 'text', payload, _json(result), _utc_now()))
+            connection.execute('DELETE FROM hypotheses_feedback_input WHERE user_id = ?', (user_id,))
+            return result
 
     @staticmethod
     def _migrate_case_columns(connection: sqlite3.Connection) -> None:
@@ -835,6 +999,59 @@ class VitalyStore:
             )
         return self.get_job(job_id)
 
+    def begin_hypotheses_run(self, case_id: str, chat_id: int, user_id: int, description: str,
+                             *, ttl_days: int = 4, knowledge_version: Optional[str] = None,
+                             interest_version: Optional[str] = None, knowledge_hash: Optional[str] = None,
+                             expected_profile: Optional[tuple] = None) -> Dict[str, Any]:
+        """Atomically admit a case job and its initial, content-bound run."""
+        if not isinstance(description, str) or len(description) > 10000 or ttl_days < 1:
+            raise ValueError("Некорректное описание или срок контекста")
+        # Legacy cases belong to private chats, whose Telegram chat and user
+        # identifiers coincide. Never let a caller attach a different owner.
+        if user_id != chat_id:
+            raise StateError("Кейс принадлежит другому пользователю")
+        now = _utc_now()
+        job_id, run_id = uuid.uuid4().hex, uuid.uuid4().hex
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM cases WHERE id = ?", (case_id,)).fetchone()
+            latest = connection.execute("SELECT id FROM cases WHERE chat_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", (chat_id,)).fetchone()
+            if row is None or row['chat_id'] != chat_id or latest is None or latest['id'] != case_id or row['status'] == 'expired':
+                raise StateError("Активный кейс не найден")
+            if expected_profile is not None and (row['profile_version'], row['knowledge_package_id']) != expected_profile:
+                raise StateError('Профиль кейса изменился')
+            last = self._as_utc_datetime(str(row['last_user_activity_at'] or row['updated_at'] or row['created_at']))
+            if last is None or last < datetime.now(timezone.utc) - timedelta(days=ttl_days):
+                raise StateError("Контекст кейса истёк")
+            if row['mode'] in {'grilling', 'stopping'}:
+                raise StateError("Завершите репетицию командой /stop")
+            active = connection.execute("SELECT 1 FROM jobs WHERE case_id = ? AND status IN ('queued', 'running')", (case_id,)).fetchone()
+            if row['activity'] != 'idle' or active:
+                raise self._busy_error(row)
+            artifacts = connection.execute("SELECT id, sha256, local_path, normalized_text_path FROM artifacts WHERE case_id = ? ORDER BY id", (case_id,)).fetchall()
+            hashes = [str(a['sha256']) for a in artifacts]
+            artifact_snapshot = []
+            for artifact in artifacts:
+                original = Path(artifact['local_path'])
+                if not original.is_file() or _file_hash(original) != artifact['sha256']:
+                    raise StateError('Материал кейса изменился или недоступен')
+                normalized = Path(artifact['normalized_text_path']) if artifact['normalized_text_path'] else None
+                normalized_hash = _file_hash(normalized) if normalized and normalized.is_file() else None
+                artifact_snapshot.append({'id': artifact['id'], 'sha256': artifact['sha256'], 'normalized_sha256': normalized_hash})
+            snapshot = {'case_id': case_id, 'request': description, 'artifacts': artifact_snapshot,
+                        'profile_version': row['profile_version'], 'knowledge_package_id': row['knowledge_package_id']}
+            digest = hashlib.sha256(_json(snapshot).encode('utf-8')).hexdigest()
+            connection.execute("INSERT INTO jobs(id, case_id, chat_id, kind, payload_json, status, created_at) VALUES (?, ?, ?, 'hypotheses', ?, 'queued', ?)",
+                               (job_id, case_id, chat_id, _json({'run_id': run_id}), now))
+            connection.execute("""INSERT INTO hypotheses_runs(id, job_id, case_id, chat_id, user_id, user_request,
+                case_hash, artifact_hashes_json, profile_version, knowledge_package_id, status, created_at, artifact_snapshot_json,
+                knowledge_version, interest_version, knowledge_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
+                (run_id, job_id, case_id, chat_id, user_id, description, digest, _json(hashes), row['profile_version'], row['knowledge_package_id'], now, _json(artifact_snapshot), knowledge_version, interest_version, knowledge_hash))
+            connection.execute("UPDATE cases SET activity = 'queued', activity_detail = ?, activity_started_at = ?, active_job_id = ?, updated_at = ? WHERE id = ?",
+                               ('Ожидаю общей очереди', now, job_id, now, case_id))
+        return self.get_job(job_id)
+
     def queue_finish(self, case_id: str, chat_id: int, *, detail: str = "Готовлю итог репетиции") -> Optional[Dict[str, Any]]:
         """Schedule one final scorecard after stopping or the final question."""
 
@@ -1054,10 +1271,13 @@ class VitalyStore:
 
     def mark_job_running(self, job_id: str) -> None:
         with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
             result = connection.execute(
                 "UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = ? WHERE id = ? AND status = 'queued'",
                 (_utc_now(), job_id),
             )
+            if result.rowcount == 1:
+                connection.execute("UPDATE hypotheses_runs SET status = 'running', started_at = COALESCE(started_at, ?) WHERE job_id = ? AND status = 'queued'", (_utc_now(), job_id))
         if result.rowcount != 1:
             raise StateError("Задача уже не ожидает запуска")
         job = self.get_job(job_id)
@@ -1113,10 +1333,18 @@ class VitalyStore:
     def finish_job(self, job_id: str, error: Optional[str] = None) -> None:
         status = "failed" if error else "completed"
         with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
             connection.execute(
                 "UPDATE jobs SET status = ?, error = ?, finished_at = ? WHERE id = ?",
                 (status, error, _utc_now(), job_id),
             )
+            connection.execute("UPDATE hypotheses_runs SET status = ?, error = ?, finished_at = ? WHERE job_id = ?",
+                               (status, error, _utc_now(), job_id))
+            if error:
+                connection.execute("UPDATE hypotheses_runs SET cards_json = '[]', generation_id = NULL, coverage_json = NULL WHERE job_id = ?", (job_id,))
+            connection.execute("""UPDATE cases SET active_job_id = NULL, activity = 'idle', activity_detail = '',
+                               activity_started_at = NULL, updated_at = ? WHERE active_job_id = ?
+                               AND EXISTS (SELECT 1 FROM hypotheses_runs WHERE job_id = ?)""", (_utc_now(), job_id, job_id))
 
     def finish_learning_job(self, job_id: str, error: Optional[str] = None) -> None:
         with self._connect() as connection:
@@ -1162,6 +1390,7 @@ class VitalyStore:
         )
         with self._connect() as connection:
             connection.execute("UPDATE jobs SET status = 'queued', started_at = NULL WHERE status = 'running'")
+            connection.execute("UPDATE hypotheses_runs SET status = 'queued' WHERE status = 'running' AND job_id IN (SELECT id FROM jobs WHERE status = 'queued')")
             connection.execute(
                 """UPDATE cases
                    SET activity = 'queued', activity_detail = 'Восстанавливаю задачу после перезапуска',

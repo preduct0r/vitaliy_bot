@@ -16,6 +16,7 @@ from .profile import VitalyProfile
 from .storage import VitalyStore
 from .corrections import Corrections, correct_point
 from .learning_runtime import LearningManager, LearningOutcome
+from .hypotheses_service import HypothesesService
 
 
 class StructuredRunner(Protocol):
@@ -181,6 +182,7 @@ class VitalyService:
         config: BotConfig,
         runner: Optional[StructuredRunner] = None,
         evidence_provider: Optional[EvidenceProvider] = None,
+        hypotheses_service: Optional[HypothesesService] = None,
     ) -> None:
         self.store = store
         self.profile = profile
@@ -190,6 +192,9 @@ class VitalyService:
         self.runner: StructuredRunner = runner or CodexRunner(config)
         self.evidence_provider: EvidenceProvider = evidence_provider or RemoteLedgerEvidenceProvider(config)
         self.learning = LearningManager(store, profile, config, self.runner)
+        self.hypotheses_service = hypotheses_service
+        if hypotheses_service is not None and hypotheses_service.runner is not self.runner:
+            raise ValueError('hypotheses must share the existing model runner')
 
     def new_case(self, chat_id: int) -> Dict[str, Any]:
         version, package_id = self.learning.profile_version_for_new_case()
@@ -437,6 +442,10 @@ class VitalyService:
 
     async def execute(self, job: Dict[str, Any]) -> JobOutcome:
         kind = job["kind"]
+        if kind == 'hypotheses':
+            if self.hypotheses_service is None:
+                raise StateError('Сервис гипотез не настроен')
+            return JobOutcome('hypotheses', job['case_id'], await self.hypotheses_service.execute(job))
         if kind == "review_correction":
             result = await correct_point(self, job)
             self.store.capture_point_correction(
