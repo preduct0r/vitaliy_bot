@@ -155,6 +155,53 @@ def persisted(hypotheses, job, owner=101):
     return hypotheses.get_run(job_id=job['id'], user_id=owner)
 
 
+def test_new_hypothesis_run_uses_only_approved_generic_learning_rules(tmp_path, dimension_case):
+    store, service, hypotheses, runner, _, _, _ = make_runtime(tmp_path, dimension_case)
+    package = store.active_knowledge_package()
+    data = package['package']
+    data['analysis_rules'] = [{'transfer_key': 'separate_fact_from_scenario',
+                               'guidance': 'PRIVATE_OTHER_USER_FACT_SHOULD_NOT_APPEAR'}]
+    with store._connect() as db:
+        db.execute('UPDATE knowledge_packages SET package_json=? WHERE id=?',
+                   (json.dumps(data), package['id']))
+    case = service.new_case(101)
+    job = submit(hypotheses, case)
+    _, failures = asyncio.run(drain(store, service, job))
+    assert not failures
+    prompts = [prompt for prompt, schema in runner.calls if 'cards' in schema['properties']]
+    assert prompts and 'separate_fact_from_scenario' in prompts[0]
+    assert 'PRIVATE_OTHER_USER_FACT_SHOULD_NOT_APPEAR' not in prompts[0]
+
+
+def test_hypothesis_model_stages_are_visible_in_case_status(tmp_path, dimension_case):
+    store, service, hypotheses, runner, _, _, _ = make_runtime(tmp_path, dimension_case)
+    case = service.new_case(101)
+    job = submit(hypotheses, case)
+    original = runner.run
+    stages = []
+    async def capture(prompt, schema, image_paths=None):
+        stages.append(store.get_case(case['id'])['activity_detail'])
+        return await original(prompt, schema, image_paths)
+    runner.run = capture
+    _, failures = asyncio.run(drain(store, service, job))
+    assert not failures
+    assert any('гипотез' in stage.lower() for stage in stages)
+    assert any('провер' in stage.lower() for stage in stages)
+
+
+def test_recovered_s4a_job_keeps_its_original_knowledge_binding(tmp_path, dimension_case):
+    from tof_reliability.vitaly_bot.hypotheses_service import _digest
+    store, service, hypotheses, runner, _, knowledge, _ = make_runtime(tmp_path, dimension_case)
+    case = service.new_case(101)
+    job = submit(hypotheses, case)
+    old_hash = _digest(knowledge.load(case['profile_version'], case['knowledge_package_id']))
+    with store._connect() as db:
+        db.execute('UPDATE hypotheses_runs SET knowledge_hash=? WHERE job_id=?', (old_hash, job['id']))
+    _, failures = asyncio.run(drain(store, service, job))
+    assert not failures
+    assert persisted(hypotheses, job)['status'] == 'completed'
+
+
 def test_trusted_binding_and_sealed_result_recover_without_rebinding(tmp_path):
     store = TrustedRequestStore(tmp_path / 'requests.sqlite')
     request = {'run_id': 'run', 'case_id': 'case', 'user_id': '101', 'scope': ''}

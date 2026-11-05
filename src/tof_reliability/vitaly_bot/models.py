@@ -31,6 +31,7 @@ class BotConfig:
     # colleague's daytime use of the bot.
     learning_run_hour: int = 4
     operator_user_ids: Tuple[int, ...] = ()
+    hypotheses_development: Optional[Dict[str, str]] = None
 
 
 @dataclass(frozen=True)

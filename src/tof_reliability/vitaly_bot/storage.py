@@ -197,6 +197,12 @@ class VitalyStore:
                 card_number INTEGER NOT NULL, expected_revision INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS hypotheses_learning_assessments (
+                user_id INTEGER NOT NULL, event_id TEXT NOT NULL,
+                transfer_key TEXT, status TEXT NOT NULL,
+                PRIMARY KEY (user_id, event_id),
+                FOREIGN KEY (user_id, event_id) REFERENCES hypotheses_feedback_events(user_id, event_id)
+            );
         """)
         columns = {row['name'] for row in connection.execute('PRAGMA table_info(hypotheses_runs)')}
         if 'artifact_snapshot_json' not in columns:
@@ -278,6 +284,7 @@ class VitalyStore:
             connection.execute('UPDATE hypotheses_runs SET cards_json = ?, revision = ? WHERE id = ?', (_json(cards), result['revision'], run_id))
             connection.execute('INSERT INTO hypotheses_feedback_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                                (user_id, event_id, run_id, card_number, 'decision', payload, _json(result), _utc_now()))
+            self._schedule_hypotheses_learning(connection)
             return result
 
     def begin_hypotheses_feedback_input(self, *, run_id: str, user_id: int, card_number: int,
@@ -317,8 +324,45 @@ class VitalyStore:
             connection.execute('UPDATE hypotheses_runs SET cards_json = ?, revision = ? WHERE id = ?', (_json(cards), result['revision'], row['id']))
             connection.execute('INSERT INTO hypotheses_feedback_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                                (user_id, event_id, row['id'], pending['card_number'], 'text', payload, _json(result), _utc_now()))
+            self._schedule_hypotheses_learning(connection)
             connection.execute('DELETE FROM hypotheses_feedback_input WHERE user_id = ?', (user_id,))
             return result
+
+    @staticmethod
+    def _schedule_hypotheses_learning(connection: sqlite3.Connection) -> None:
+        existing = connection.execute("SELECT 1 FROM learning_jobs WHERE kind = 'knowledge_generate' AND status IN ('scheduled','queued') LIMIT 1").fetchone()
+        if not existing:
+            VitalyStore._insert_learning_job(connection, chat_id=0, user_id=None, kind='knowledge_generate',
+                submission_id=None, payload={'hypotheses_feedback': True}, now=_utc_now(), status='scheduled')
+
+    def pending_hypotheses_learning(self, limit: int = 8) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("""SELECT e.* FROM hypotheses_feedback_events e
+                LEFT JOIN hypotheses_learning_assessments a ON a.user_id=e.user_id AND a.event_id=e.event_id
+                WHERE a.event_id IS NULL ORDER BY e.created_at, e.rowid LIMIT ?""", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def finish_hypotheses_assessment(self, user_id: int, event_id: str, key: Optional[str]) -> None:
+        with self._connect() as connection:
+            connection.execute('INSERT OR IGNORE INTO hypotheses_learning_assessments VALUES (?, ?, ?, ?)',
+                               (user_id, event_id, key, 'accepted' if key else 'insufficient'))
+
+    def hypotheses_learning_sources(self) -> List[Dict[str, Any]]:
+        from .learning import TRANSFERABLE_ANALYSIS_RULES
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM hypotheses_learning_assessments WHERE status='accepted' ORDER BY rowid").fetchall()
+        sources = []
+        for row in rows:
+            key = str(row['transfer_key'])
+            if key not in TRANSFERABLE_ANALYSIS_RULES:
+                continue
+            source_id = 'hf-' + hashlib.sha256((str(row['user_id']) + '\0' + row['event_id']).encode()).hexdigest()[:32]
+            template = TRANSFERABLE_ANALYSIS_RULES[key]
+            sources.append({'id': source_id, 'source_kind': 'feedback', 'hypothesis_transfer_key': key,
+                            'text': template['trigger'] + ' ' + template['guidance'],
+                            'result': {'source_document_id': 'hypothesis-feedback:' + source_id,
+                                       'transfer_key': key}})
+        return sources
 
     @staticmethod
     def _migrate_case_columns(connection: sqlite3.Connection) -> None:
@@ -2491,6 +2535,7 @@ class VitalyStore:
             value = self._learning_row(row)
             value["source_kind"] = "meeting"
             values.append(value)
+        values.extend(self.hypotheses_learning_sources())
         return values
 
     def learning_sources_by_ids(self, source_ids: Sequence[str]) -> List[Dict[str, Any]]:
@@ -2725,7 +2770,7 @@ class VitalyStore:
             and user_learning is None
             and running_learning is None
             and automatic_learning is None
-            and bool(self.learning_sources())
+            and bool(self.learning_sources() or self.pending_hypotheses_learning(limit=1))
         )
 
     def queue_learning_cycle(self, run_hour: int, *, now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
@@ -2780,17 +2825,27 @@ class VitalyStore:
             if control is None or int(control["auto_update_paused"] or 0):
                 return []
             rows = connection.execute(
-                """SELECT id FROM learning_jobs
+                """SELECT id, kind, payload_json FROM learning_jobs
                    WHERE status = 'scheduled' AND kind IN ('knowledge_generate', 'knowledge_verify')
                    ORDER BY created_at, id"""
             ).fetchall()
             if not rows:
                 return []
-            connection.execute(
-                """UPDATE learning_jobs SET status = 'queued'
-                   WHERE status = 'scheduled' AND kind IN ('knowledge_generate', 'knowledge_verify')"""
-            )
-            return [self._get_learning_job(connection, str(row["id"])) for row in rows]
+            local_now = _local_now(now)
+            full_control = connection.execute('SELECT last_cycle_at FROM learning_control WHERE id = 1').fetchone()
+            last = self._as_utc_datetime(str(full_control['last_cycle_at'] or ''))
+            resumed = []
+            for row in rows:
+                own_cycle = bool(_load_json(row['payload_json'], {}).get('hypotheses_feedback'))
+                if own_cycle and last is not None and last.astimezone(local_now.tzinfo).date() >= local_now.date():
+                    continue
+                connection.execute("UPDATE learning_jobs SET status='queued' WHERE id=?", (row['id'],))
+                resumed.append(self._get_learning_job(connection, str(row['id'])))
+                if own_cycle:
+                    stamp = local_now.astimezone(timezone.utc).isoformat()
+                    connection.execute('UPDATE learning_control SET last_cycle_at=?, updated_at=? WHERE id=1', (stamp, stamp))
+                    last = local_now
+            return resumed
 
     def create_learning_model_run(self, job_id: str, kind: str, model: str, reasoning_effort: str) -> str:
         run_id = uuid.uuid4().hex

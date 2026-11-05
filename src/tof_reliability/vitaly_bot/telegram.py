@@ -24,12 +24,14 @@ from .profile import load_default_profile
 from .service import FifoWorker, JobOutcome, VitalyService
 from .storage import VitalyStore
 from . import correction_ui
+from . import hypotheses_ui
 
 
 HELP_TEXT = (
     "Это симулятор жёсткой проверки перед встречей, а не настоящий Виталий.\n\n"
     "1. Отправьте до 10 файлов или текст и дождитесь сообщения «Файл обработан».\n"
     "2. /review — получить аудит материалов.\n"
+    "/hypotheses [описание] — предложить аналитические гипотезы.\n"
     "3. /grill — пройти конечную репетицию вопрос за вопросом.\n"
     "4. /stop — прекратить вопросы и получить итоговый разбор.\n"
     "5. /status — увидеть этап, очередь и ошибку.\n\n"
@@ -339,6 +341,27 @@ class TelegramRuntime:
         self.store = VitalyStore(config.state_dir, config.knowledge_dir)
         self.profile = load_default_profile()
         self.service = VitalyService(self.store, self.profile, config)
+        if config.hypotheses_development:
+            from .coverage import RemoteCoverageProvider
+            from .hypotheses_pilot import TrustedRequestStore
+            from .hypotheses_service import HypothesesService
+            from . import hypotheses_knowledge
+
+            class CaseBoundDevelopmentKnowledge:
+                def load(inner, profile_version, knowledge_package_id):
+                    package = self.store.get_knowledge_package(knowledge_package_id)
+                    if str(package['package']['profile']['version']) != profile_version:
+                        raise StateError('Профиль не соответствует пакету кейса')
+                    loader = hypotheses_knowledge.VerifiedKnowledgeLoader(
+                        **config.hypotheses_development, profile_version=profile_version,
+                        knowledge_package_id=knowledge_package_id)
+                    return loader.load(profile_version, knowledge_package_id)
+
+            self.service.hypotheses_service = HypothesesService(
+                store=self.store, config=config, runner=self.service.runner,
+                coverage_provider=RemoteCoverageProvider(timeout_seconds=config.evidence_timeout_seconds),
+                knowledge_loader=CaseBoundDevelopmentKnowledge(),
+                trusted_store=TrustedRequestStore(config.state_dir / 'hypotheses-trusted.sqlite3'))
         self.worker = FifoWorker(self.store, self.service, self._completed, self._failed)
         self._progress_tasks: Dict[str, asyncio.Task[Any]] = {}
         self._progress_text: Dict[str, str] = {}
@@ -570,6 +593,14 @@ class TelegramRuntime:
         chat_id = int(job["chat_id"])
         case_id = str(job["case_id"])
         case = self.store.get_case(case_id)
+        if outcome.kind == "hypotheses":
+            if case.get('active_job_id') and case['active_job_id'] != job['id']:
+                await send_with_retry(self.bot, chat_id, 'Предыдущий результат устарел: уже запущена новая задача.')
+                return
+            await self._end_progress(case_id, chat_id, "✅ Гипотезы готовы.")
+            run = self.service.hypotheses_service.get_run(user_id=chat_id, run_id=outcome.payload['run_id'])
+            await hypotheses_ui.send(self.bot, chat_id, 'Выберите карточку гипотезы:', hypotheses_ui.keyboard(run))
+            return
         if outcome.kind == "review":
             self.store.settle_job(case_id, mode="ready")
             await self._end_progress(case_id, chat_id, "✅ Аудит материалов готов.")
@@ -644,6 +675,9 @@ class TelegramRuntime:
         chat_id = int(job["chat_id"])
         case_id = str(job["case_id"])
         case = self.store.get_case(case_id)
+        if job['kind'] == 'hypotheses' and case.get('active_job_id') and case['active_job_id'] != job['id']:
+            await send_with_retry(self.bot, chat_id, 'Предыдущая задача не завершилась: ' + user_error(error))
+            return
         if case.get("stop_requested"):
             await send_with_retry(self.bot, chat_id, "Текущий этап не завершился, но новых вопросов не будет.")
             await self._complete_stopped_grill(case_id, chat_id)
@@ -715,6 +749,10 @@ def build_router(runtime: TelegramRuntime) -> Router:
         return message.from_user.id if message.from_user else None
 
     def assert_not_collecting_learning_input(message: Message) -> None:
+        with runtime.store._connect() as db:
+            pending = db.execute('SELECT 1 FROM hypotheses_feedback_input WHERE user_id = ?', (user_id(message),)).fetchone()
+        if pending:
+            raise StateError('Сначала отправьте отзыв о гипотезе или отмените его командой /cancel.')
         if runtime.store.pending_feedback(message.chat.id, user_id(message)):
             raise StateError("Сначала отправьте или отмените пояснение к общей обратной связи командой /cancel.")
         if runtime.store.pending_meeting(message.chat.id, user_id(message)):
@@ -752,6 +790,73 @@ def build_router(runtime: TelegramRuntime) -> Router:
             await runtime.queue(case["id"], message.chat.id, "review")
         except Exception as error:
             await send_with_retry(runtime.bot, message.chat.id, user_error(error))
+
+    @router.message(Command("hypotheses"))
+    async def hypotheses(message: Message) -> None:
+        try:
+            assert_not_collecting_learning_input(message)
+            if user_id(message) != message.chat.id:
+                raise StateError('Кейс принадлежит другому пользователю')
+            service = runtime.service.hypotheses_service
+            if service is None:
+                raise StateError('Тестовый сервис гипотез не настроен')
+            case = await runtime.case_for_user(message.chat.id)
+            description = (message.text or '').partition(' ')[2].strip()
+            job = service.submit(case_id=case['id'], chat_id=message.chat.id,
+                                 user_id=user_id(message), description=description)
+            runtime.worker.notify()
+            run = service.get_run(user_id=user_id(message), job_id=job['id'])
+            import json
+            ids = {item['id'] for item in json.loads(run['artifact_snapshot_json'])}
+            names = [a['original_name'] for a in runtime.store.artifacts(case['id']) if a['id'] in ids]
+            await hypotheses_ui.send(runtime.bot, message.chat.id,
+                'Материалы текущего кейса: ' + ('; '.join(names) if names else 'нет; запуск без файлов') + '.')
+            await runtime._ensure_progress(case['id'], message.chat.id)
+        except Exception as error:
+            await send_with_retry(runtime.bot, message.chat.id, user_error(error))
+
+    @router.callback_query(F.data.startswith('hy:'))
+    async def hypothesis_callback(query: CallbackQuery) -> None:
+        if not query.message:
+            await query.answer('Кнопка недоступна', show_alert=True)
+            return
+        chat_id = query.message.chat.id
+        try:
+            if query.from_user.id != chat_id:
+                raise StateError('Кнопка недоступна другому пользователю')
+            with runtime.store._connect() as db:
+                pending = db.execute('SELECT 1 FROM hypotheses_feedback_input WHERE user_id=?', (chat_id,)).fetchone()
+            if pending:
+                raise StateError('Сначала отправьте реакцию или отмените ввод командой /cancel')
+            _, run_id, revision, action, number = str(query.data).split(':')
+            revision, number = int(revision), int(number)
+            service = runtime.service.hypotheses_service
+            if service is None:
+                raise StateError('Сервис недоступен')
+            with runtime.store._connect() as db:
+                row, cards = runtime.store._feedback_target(db, run_id, chat_id, number, revision,
+                                                            runtime.config.context_ttl_days)
+            run = service.get_run(user_id=chat_id, run_id=run_id)
+            if action in ('v', 'p'):
+                await query.answer()
+                await hypotheses_ui.send(runtime.bot, chat_id, hypotheses_ui.render(cards[number - 1], plan=action == 'p'),
+                                         hypotheses_ui.keyboard(run, number))
+                return
+            decisions = {'s': 'selected', 'd': 'already_done', 'n': 'not_useful', 'b': 'busko_reaction'}
+            if action not in decisions:
+                raise StateError('Кнопка устарела')
+            result = service.record_feedback(run_id=run_id, user_id=chat_id, card_number=number,
+                decision=decisions[action], expected_revision=revision, event_id='telegram:' + query.id)
+            if action == 'b':
+                service.begin_feedback_input(run_id=run_id, user_id=chat_id, card_number=number,
+                                             expected_revision=result['revision'])
+            await query.answer()
+            updated = service.get_run(user_id=chat_id, run_id=run_id)
+            message = 'Отметка сохранена.' + (' Отправьте текст реакции или /cancel.' if action == 'b' else '')
+            await hypotheses_ui.send(runtime.bot, chat_id, message, hypotheses_ui.keyboard(updated, number))
+        except Exception as error:
+            await query.answer(user_error(error), show_alert=True)
+            await send_with_retry(runtime.bot, chat_id, user_error(error))
 
     @router.message(Command("grill"))
     async def grill(message: Message) -> None:
@@ -794,6 +899,10 @@ def build_router(runtime: TelegramRuntime) -> Router:
     @router.message(Command("meeting"))
     async def meeting(message: Message) -> None:
         try:
+            with runtime.store._connect() as db:
+                pending = db.execute('SELECT 1 FROM hypotheses_feedback_input WHERE user_id=?', (user_id(message),)).fetchone()
+            if pending:
+                raise StateError('Сначала отправьте реакцию или отмените ввод командой /cancel')
             intake = runtime.store.begin_meeting(message.chat.id, user_id(message))
             prefix = "Незавершённая загрузка восстановлена. " if intake.pop("resumed", False) else "Новый транскрипт будет храниться отдельно от текущего кейса. "
             await send_with_retry(
@@ -842,6 +951,8 @@ def build_router(runtime: TelegramRuntime) -> Router:
     async def cancel(message: Message) -> None:
         try:
             cancelled = runtime.store.cancel_feedback(message.chat.id, user_id(message))
+            if user_id(message) == message.chat.id:
+                cancelled = runtime.store.cancel_hypotheses_feedback_input(message.chat.id) or cancelled
             cancelled = runtime.store.cancel_meeting(message.chat.id, user_id(message)) or cancelled
             if cancelled:
                 await send_with_retry(runtime.bot, message.chat.id, "Ввод отменён. Кейс и аудит не изменены.")
@@ -892,6 +1003,11 @@ def build_router(runtime: TelegramRuntime) -> Router:
             await send_with_retry(runtime.bot, message.chat.id, user_error(error))
 
     async def reject_feedback_file_if_pending(message: Message) -> bool:
+        with runtime.store._connect() as db:
+            pending = db.execute('SELECT 1 FROM hypotheses_feedback_input WHERE user_id = ?', (user_id(message),)).fetchone()
+        if pending:
+            await send_with_retry(runtime.bot, message.chat.id, 'Ожидается текст реакции или /cancel; файл не добавлен.')
+            return True
         if runtime.store.pending_feedback(message.chat.id, user_id(message)) is not None:
             await send_with_retry(
                 runtime.bot,
@@ -1026,6 +1142,20 @@ def build_router(runtime: TelegramRuntime) -> Router:
             return
         case: Optional[Dict[str, Any]] = None
         try:
+            with runtime.store._connect() as db:
+                pending_hypothesis = db.execute('SELECT 1 FROM hypotheses_feedback_input WHERE user_id = ?', (user_id(message),)).fetchone()
+                replay = db.execute("SELECT 1 FROM hypotheses_feedback_events WHERE user_id=? AND event_id=? AND kind='text'",
+                    (user_id(message), 'message:' + str(message.chat.id) + ':' + str(message.message_id))).fetchone()
+            if replay:
+                await send_with_retry(runtime.bot, message.chat.id, 'Это сообщение реакции уже принято.')
+                return
+            if pending_hypothesis:
+                if user_id(message) != message.chat.id:
+                    raise StateError('Кейс принадлежит другому пользователю')
+                runtime.service.hypotheses_service.submit_feedback_text(user_id=message.chat.id, text=message.text,
+                    event_id='message:' + str(message.chat.id) + ':' + str(message.message_id))
+                await send_with_retry(runtime.bot, message.chat.id, 'Реакция сохранена отдельно от материалов кейса.')
+                return
             pending_feedback = runtime.store.pending_feedback(message.chat.id, user_id(message))
             if pending_feedback:
                 job = runtime.store.submit_feedback(str(pending_feedback["id"]), message.text)
@@ -1160,6 +1290,7 @@ async def run_bot(config: Optional[BotConfig] = None) -> None:
                 [
                     BotCommand(command="new", description="новый кейс"),
                     BotCommand(command="review", description="аудит материалов"),
+                    BotCommand(command="hypotheses", description="аналитические гипотезы"),
                     BotCommand(command="grill", description="начать репетицию"),
                     BotCommand(command="stop", description="остановить и получить итог"),
                     BotCommand(command="status", description="состояние и очередь"),

@@ -60,6 +60,15 @@ def load_config(environ: Optional[Dict[str, str]] = None, require_token: bool = 
         raise InputError("VITALY_BOT_LEARNING_RUN_HOUR должен быть целым часом от 0 до 23") from error
     if not 0 <= learning_run_hour <= 23:
         raise InputError("VITALY_BOT_LEARNING_RUN_HOUR должен быть целым часом от 0 до 23")
+    hypotheses_development = None
+    if values.get('VITALY_BOT_HYPOTHESES_DEVELOPMENT') == '1':
+        fields = {'corpus_dir': 'VITALY_BOT_HYPOTHESES_CORPUS_DIR',
+                  'original_dir': 'VITALY_BOT_HYPOTHESES_ORIGINAL_DIR',
+                  'adjudication_dir': 'VITALY_BOT_HYPOTHESES_ADJUDICATION_DIR',
+                  'manifest_sha256': 'VITALY_BOT_HYPOTHESES_MANIFEST_SHA256'}
+        hypotheses_development = {key: values.get(env_key, '').strip() for key, env_key in fields.items()}
+        if not all(hypotheses_development.values()) or len(hypotheses_development['manifest_sha256']) != 64:
+            raise InputError('Для тестового сервиса гипотез нужны каталоги аудита и его SHA-256')
     return BotConfig(
         token=token,
         state_dir=state_dir,
@@ -75,4 +84,5 @@ def load_config(environ: Optional[Dict[str, str]] = None, require_token: bool = 
         min_free_bytes=int(values.get("VITALY_BOT_MIN_FREE_BYTES", str(2 * 1024 * 1024 * 1024))),
         learning_run_hour=learning_run_hour,
         operator_user_ids=operator_user_ids,
+        hypotheses_development=hypotheses_development,
     )
