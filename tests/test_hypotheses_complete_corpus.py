@@ -51,7 +51,7 @@ def corpus(tmp_path):
     add('excluded', 'baseline', 'excluded', '2026-09-01', 'EXCLUDED CANARY')
     add('different', 'baseline', 'different-person', '2026-09-01', 'OTHER PERSON CANARY')
     add('disputed', 'transcript', 'disputed', '2026-09-01', 'DISPUTED CANARY')
-    add('late', 'transcript', 'accepted', '2026-09-17', 'HOLDOUT CANARY')
+    add('late', 'transcript', 'accepted', '2026-10-26', 'HOLDOUT CANARY')
     # Duplicate content under another identity must not produce a second extraction.
     add('duplicate', 'baseline', 'accepted', '2026-09-01', texts['s00'], indexed=False)
     (index_dir / 'source-index.json').write_text(json.dumps({'sources': sources}))

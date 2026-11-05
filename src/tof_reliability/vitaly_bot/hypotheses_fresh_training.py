@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .hypotheses_extract_runner import _write
 
-CUTOFF = date(2026, 9, 17)
+CUTOFF = date(2026, 10, 26)
 VERSION = 'fresh-training-v1'
 
 

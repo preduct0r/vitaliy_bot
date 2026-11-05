@@ -36,7 +36,7 @@ def corpus():
     index = {'sources': [
         {'id': sid, 'date': date, 'sha256': digest(texts[sid])}
         for sid, date in [('early', '2026-09-16'), ('early2', '2026-09-01'),
-                          ('holdout', '2026-09-17'), ('later', '2026-10-26')]
+                          ('holdout', '2026-10-26'), ('later', '2026-10-30')]
     ]}
     chunks = [{'id': 'chunk-' + sid, 'source_id': sid, 'start': 0,
                'end': len(text), 'sha256': digest(text)}
