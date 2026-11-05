@@ -311,7 +311,7 @@ def _validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inte
 
 
 def validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], interest_context: Mapping[str, Any], trusted_context=None, trusted_store=None) -> None:
-    if run.get('pilot_version') == DIMENSION_PILOT_VERSION:
+    if run.get('pilot_version') in (DIMENSION_PILOT_VERSION, EVIDENCE_PILOT_VERSION):
         _validate_dimension_run(run, coverage=coverage, interest_context=interest_context,
                                 trusted_context=trusted_context, trusted_store=trusted_store)
     else:
@@ -396,11 +396,12 @@ def _validate_numeric_claims(card, scope, *, reject_roman=False):
     if isinstance(hard_questions, list):
         fields.extend(('hard_questions', value) for value in hard_questions)
     fields = [(key, value) for key, value in fields if isinstance(value, str)]
-    prose = [value for _, value in fields]
     if not isinstance(scope, str):
         raise ValueError('scope must be text')
-    if reject_roman and any(_ROMAN_CLAIM.search(value) for value in prose):
-        raise ValueError('unsupported numerical value')
+    if reject_roman:
+        for key, value in fields:
+            if _ROMAN_CLAIM.search(value):
+                raise ValueError(f"card {card.get('number', '?')} {key}: unsupported numerical value")
     for key, value in fields:
         numeric_text = value
         # In this narrow interrogative construction, "одного ремонта" names
@@ -412,7 +413,7 @@ def _validate_numeric_claims(card, scope, *, reject_roman=False):
         if ((_NUMERIC_CLAIM.search(numeric_text) or _ORDINAL_CLAIM.search(numeric_text)
              or _ROMAN_CLAIM.search(numeric_text))
                 and _case_statement(value) != _case_statement(scope)):
-            raise ValueError('unsupported numerical value')
+            raise ValueError(f"card {card.get('number', '?')} {key}: unsupported numerical value")
 
 
 def _validate_card_content(card, scope, topic, private_interests, verifier):
@@ -669,8 +670,14 @@ def codex_generator(runner):
               'required': ['cards']}
     def generate(context):
         prompt = 'Верните JSON с карточками гипотез на русском языке. Контекст:\n' + json.dumps(context, ensure_ascii=False, sort_keys=True)
+        request_schema = copy.deepcopy(schema)
+        if 'dimensions' in context:
+            request_schema['properties']['cards']['maxItems'] = MAX_CANDIDATES
+            binding = request_schema['properties']['cards']['items']['properties']['meeting_interest']
+            binding['properties']['dimension_id'] = string
+            binding['required'].append('dimension_id')
         try:
-            return asyncio.run(runner.run(prompt, schema)).value['cards']
+            return asyncio.run(runner.run(prompt, request_schema)).value['cards']
         except ModelError as exc:
             raise RuntimeError(f'model error {exc.code}: {exc.detail}') from exc
     return generate
@@ -691,6 +698,10 @@ def subprocess_verifier(path: Path):
     return verify
 
 DIMENSION_PILOT_VERSION = 'pilot-repair-dimensions.v1'
+EVIDENCE_PILOT_VERSION = 'pilot-repair-evidence-priority.v1'
+MAX_CANDIDATES = 12
+NO_VERIFIED_ROUTE = 'NO-VERIFIED-ROUTE'
+ROUTE_GAP = 'для этого направления в проверенном наборе маршрутов применимый маршрут не подтверждён'
 
 # These are investigative requirements, not claims that a registry or ledger
 # currently contains complete, case-scoped records.
@@ -790,7 +801,7 @@ def reconcile_dimension_projections(*, profile, source_index, v1_projection, v1_
                                        'interest_ids': set(), 'source_ids': set(), 'evidence': [], 'meetings': set()})
             row['interest_ids'].add(ident)
             row['source_ids'].add(entry['source_id'])
-            if entry not in row['evidence']:
+            if not any(all(e.get(k) == entry.get(k) for k in ('interest_id', 'source_id', 'locator', 'attribution')) for e in row['evidence']):
                 row['evidence'].append(entry)
             source = sources[entry['source_id']]
             row['meetings'].add(source.get('meeting_id') or source.get('date') or source['id'])
@@ -803,6 +814,45 @@ def reconcile_dimension_projections(*, profile, source_index, v1_projection, v1_
                 'unconfirmed': rejected}
     except (KeyError, TypeError, OSError, AttributeError) as exc:
         raise ValueError('invalid private projection or source corpus') from exc
+
+
+def bind_expanded_projection(*, profile, source_index, projection):
+    """Bind an independently audited expanded projection to its exact corpus.
+
+    This checks provenance and counts; the caller must retain and verify the
+    independent semantic audit that produced the projection.
+    """
+    from .hypotheses_interests import assess_provenance
+    from .hypotheses_topic_projection import DIMENSION_VERSION
+    try:
+        if (projection['version'] != DIMENSION_VERSION or projection['profile_sha256'] != _digest(profile)
+                or projection['index_sha256'] != _digest(source_index)
+                or projection['profile_version'] != profile['version']
+                or projection['corpus_version'] != source_index['version']
+                or not assess_provenance(profile, source_index)['verified']):
+            raise ValueError('expanded projection provenance mismatch')
+        sources = {s['id']: s for s in source_index['sources']}
+        if len(sources) != len(source_index['sources']):
+            raise ValueError('duplicate sources')
+        interests = {i['id']: i for i in profile['interests']}
+        bound_projection = copy.deepcopy(projection)
+        for row in bound_projection['dimensions']:
+            meetings = set()
+            attribution_meetings = {}
+            for e in row['evidence']:
+                item = interests[e['interest_id']]
+                if not any(all(x.get(k) == e.get(k) for k in ('source_id', 'locator', 'fragment', 'attribution')) for x in item['evidence']):
+                    raise ValueError('expanded projection evidence mismatch')
+                source = sources[e['source_id']]
+                meeting = source.get('meeting_id') or source.get('date') or source['id']
+                meetings.add(meeting)
+                attribution_meetings.setdefault(e['attribution'], set()).add(meeting)
+            if not meetings or len(meetings) != row['independent_meeting_count']:
+                raise ValueError('expanded projection meeting count mismatch')
+            row['attribution_meeting_counts'] = {key: len(value) for key, value in attribution_meetings.items()}
+        return {**bound_projection, 'version': DIMENSION_PILOT_VERSION}
+    except (KeyError, TypeError, AttributeError, OSError) as exc:
+        raise ValueError('invalid expanded projection') from exc
 
 
 def _dimension_bindings(projection, interests, coverage):
@@ -832,7 +882,22 @@ def _dimension_bindings(projection, interests, coverage):
     return bindings
 
 
-def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=None, trusted_store=None):
+def _dimension_routes(coverage):
+    """Represent an unmapped direction as a pilot gap, not a server dataset."""
+    routes = {r['capability_id']: r for r in coverage['routes']}
+    if NO_VERIFIED_ROUTE in routes:
+        raise ValueError('reserved route identifier in server coverage')
+    routes[NO_VERIFIED_ROUTE] = {'capability_id': NO_VERIFIED_ROUTE, 'route_id': None,
+                                 'availability': 'unavailable', 'source_references': [],
+                                 'missing_evidence': [ROUTE_GAP]}
+    return routes
+
+
+def _topic_routes(topic):
+    return TOPIC_ROUTES.get(topic) or {NO_VERIFIED_ROUTE}
+
+
+def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=None, trusted_store=None, candidate_pool=False):
     from .hypotheses_topic_projection import _CATALOGS, DIMENSION_VERSION
     trusted_scope = _trusted_scope(trusted_context, trusted_store, run)
     interests = _interests(interest_context)
@@ -842,10 +907,11 @@ def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=
     _text(run.get('knowledge_version'), 'knowledge version')
     bindings = _dimension_bindings(run['dimension_projection'], interests, coverage)
     catalog = _CATALOGS[DIMENSION_VERSION]
-    routes = {r['capability_id']: r for r in coverage['routes']}
+    routes = (_dimension_routes(coverage) if run.get('pilot_version') == EVIDENCE_PILOT_VERSION
+              else {r['capability_id']: r for r in coverage['routes']})
     cards = run.get('cards')
-    if not isinstance(cards, list) or not 5 <= len(cards) <= 7:
-        raise ValueError('five to seven cards required')
+    if not isinstance(cards, list) or not 5 <= len(cards) <= (MAX_CANDIDATES if candidate_pool else 7):
+        raise ValueError('invalid candidate pool or fewer than five cards')
     seen_dim, seen_decisions, seen_methods = set(), set(), set()
     for n, card in enumerate(cards, 1):
         if not isinstance(card, dict) or card.get('number') != n:
@@ -865,7 +931,7 @@ def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=
             _text(card.get(field), field)
         for field in LIST_FIELDS:
             value = card.get(field)
-            if not isinstance(value, list) or (field != 'missing_evidence' and not value):
+            if not isinstance(value, list) or (field not in ('missing_evidence', 'source_references') and not value):
                 raise ValueError('invalid card list')
             for item in value:
                 _text(item, field)
@@ -877,9 +943,13 @@ def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=
         _validate_numeric_claims(card, trusted_scope, reject_roman=True)
         _validate_case_scope(card, run['scope'])
         route = routes.get(card.get('capability_id'))
-        if (route is None or route['availability'] == 'unavailable'
-                or route['capability_id'] not in TOPIC_ROUTES.get(topic, set()) or not _references(route)):
+        if (route is None or route['capability_id'] not in (_topic_routes(topic) if run.get('pilot_version') == EVIDENCE_PILOT_VERSION else TOPIC_ROUTES.get(topic, set()))
+                or (route['availability'] == 'unavailable' and (run.get('pilot_version') != EVIDENCE_PILOT_VERSION
+                    or _references(route) or not route['missing_evidence']))
+                or (route['availability'] != 'unavailable' and not _references(route))):
             raise ValueError('ineligible dimension route')
+        if route['availability'] != 'unavailable' and not card['source_references']:
+            raise ValueError('available route requires a selected source reference')
         required_missing = set(route['missing_evidence']) | set(DIMENSION_MISSING.get(dim, []))
         if (card.get('source_readiness') != route['availability']
                 or set(card['source_references']) - _references(route)
@@ -918,33 +988,61 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
         raise RuntimeError('published server coverage unavailable: ' + str(exc)) from exc
     bindings = _dimension_bindings(dimension_projection, interests, coverage)
     catalog = _CATALOGS[DIMENSION_VERSION]
-    available = {r['capability_id'] for r in coverage['routes'] if r['availability'] in ('available', 'partial') and _references(r)}
-    eligible = {dim for _, dim in bindings if TOPIC_ROUTES.get(catalog[dim][0], set()) & available}
+    routes = _dimension_routes(coverage)
+    available = {r['capability_id'] for r in routes.values()
+                 if (r['availability'] in ('available', 'partial') and _references(r))
+                 or (r['availability'] == 'unavailable' and not _references(r) and r['missing_evidence'])}
+    eligible = {dim for _, dim in bindings if _topic_routes(catalog[dim][0]) & available}
     if len(eligible) < 5:
         raise ValueError('fewer than five eligible dimensions')
+    rows = {row['dimension_id']: row for row in dimension_projection['dimensions']}
+    for dim in eligible:
+        row = rows[dim]
+        if type(row.get('independent_meeting_count')) is not int or row['independent_meeting_count'] < 1 or not row.get('evidence'):
+            raise ValueError('verified independent meeting count and attribution required')
+        if any(e.get('attribution') not in ATTRIBUTIONS for e in row['evidence']):
+            raise ValueError('source attribution required')
+        counts = row.get('attribution_meeting_counts')
+        if counts is not None and (not isinstance(counts, dict)
+                or set(counts) != {e['attribution'] for e in row['evidence']}
+                or any(type(n) is not int or not 1 <= n <= row['independent_meeting_count'] for n in counts.values())
+                or sum(counts.values()) < row['independent_meeting_count']):
+            raise ValueError('invalid attribution meeting counts')
     model_dimensions = [{'dimension_id': dim, 'topic_id': catalog[dim][0], 'description': catalog[dim][1],
+                         'independent_meeting_count': rows[dim]['independent_meeting_count'],
+                         'attributions': sorted({e['attribution'] for e in rows[dim]['evidence']}),
+                         'attribution_meeting_counts': copy.deepcopy(rows[dim].get('attribution_meeting_counts', {})),
                          'interest_ids': sorted(ident for ident, d in bindings if d == dim),
                          'missing_evidence': DIMENSION_MISSING.get(dim, [])} for dim in sorted(eligible)]
     safe_routes = [{k: copy.deepcopy(r[k]) for k in ('capability_id', 'route_id', 'availability', 'missing_evidence') if k in r}
-                   | {'source_references': sorted(_references(r))} for r in coverage['routes']]
+                   | {'source_references': sorted(_references(r))} for r in routes.values()]
     context = {'scope': scope, 'knowledge_version': knowledge_version, 'dimensions': model_dimensions,
                'coverage': {'generation_id': coverage['generation']['run_id'], 'routes': safe_routes},
-               'eligible_dimension_routes': {dim: sorted(TOPIC_ROUTES[catalog[dim][0]] & available) for dim in sorted(eligible)},
-               'instructions': ('Предложите от пяти до семи полезных разных измерений с различными решениями и методами. '
+               'eligible_dimension_routes': {dim: sorted(_topic_routes(catalog[dim][0]) & available) for dim in sorted(eligible)},
+               'instructions': ('Предложите до 12 разных кандидатов (не менее пяти), чтобы после независимой проверки осталось 5–7. '
+                                'Приоритет: повторяющиеся подтверждённые потребности, полезные различные решения; интерпретация и пересказ третьего лица не прямой запрос. Общий счёт встреч включает все виды атрибуции; только attribution_meeting_counts отдельно считает встречи по каждому виду. '
+                                'Недоступные источники допускаются только как исследование отсутствующих данных без результата или расчёта. '
                                 'Используйте только указанные измерения, интересы и маршруты. Сохраните область запроса. '
-                                'Не утверждайте факты, значения, прошлые события и эффект сценария. '
+                                'Не утверждайте факты, значения, прошлые события и эффект сценария; эффект сценария только как планируемое исследование. '
+                                'В текстовых полях и вопросах не используйте цифры и числительные, включая слова один, два, первый; переформулируйте без них. '
+                                'NO-VERIFIED-ROUTE означает лишь отсутствие подтверждённого сопоставления в этом пилоте, не отсутствие данных на сервере. '
                                 'Укажите ограничения источников и отсутствующие данные, не выполняйте анализ. '
                                 'Верните interest_id, topic_id и dimension_id. Новизну при отсутствии данных укажите unknown с нулевой оценкой.')}
     cards = generator(copy.deepcopy(context))
-    if not isinstance(cards, list) or not 5 <= len(cards) <= 7:
-        raise ValueError('five to seven cards required')
-    run = {'pilot_version': DIMENSION_PILOT_VERSION, 'generation_id': coverage['generation']['run_id'],
+    if not isinstance(cards, list) or not 5 <= len(cards) <= MAX_CANDIDATES:
+        raise ValueError('five to twelve candidates required')
+    try:
+        final_coverage = _coverage(coverage_provider())
+    except Exception as exc:
+        raise RuntimeError('published server coverage unavailable: ' + str(exc)) from exc
+    if final_coverage != coverage:
+        raise ValueError('published server generation or coverage changed during pilot')
+    run = {'pilot_version': EVIDENCE_PILOT_VERSION, 'generation_id': coverage['generation']['run_id'],
            'knowledge_version': knowledge_version, 'interest_version': interests['version'], 'scope': scope,
            'coverage': coverage, 'interest_context': interests, 'dimension_projection': copy.deepcopy(dimension_projection),
            'cards': copy.deepcopy(cards)}
     if trusted_context is not None:
         run['request_binding'] = trusted_context.token
-    routes = {r['capability_id']: r for r in coverage['routes']}
     for number, card in enumerate(run['cards'], 1):
         if not isinstance(card, dict) or not isinstance(card.get('meeting_interest'), dict):
             raise ValueError('invalid card')
@@ -954,7 +1052,7 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
         if key not in bindings or dim not in eligible or meeting.get('topic_id') != catalog[dim][0]:
             raise ValueError('invalid dimension selection')
         route = routes.get(card.get('capability_id'))
-        if route is None or route['availability'] == 'unavailable' or route['capability_id'] not in TOPIC_ROUTES.get(meeting['topic_id'], set()):
+        if route is None or route['capability_id'] not in available or route['capability_id'] not in _topic_routes(meeting['topic_id']):
             raise ValueError('invalid route')
         supplied = {k: meeting[k] for k in bindings[key] if k in meeting}
         if any(bindings[key][k] != v for k, v in supplied.items()):
@@ -974,7 +1072,7 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
         if any(token in ' '.join(proposed_missing).casefold() for token in private_tokens):
             raise ValueError('private source token in missing evidence')
         card['missing_evidence'] = list(dict.fromkeys([*proposed_missing, *route['missing_evidence'], *DIMENSION_MISSING.get(dim, [])]))
-    _validate_dimension_run(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store)
+    _validate_dimension_run(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store, candidate_pool=True)
     accepted, rejected = [], []
     for card in run['cards']:
         prose = ' '.join([card[k] for k in TEXT_FIELDS] + card['hard_questions'])
@@ -983,6 +1081,7 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
         dim = card['meeting_interest']['dimension_id']
         def verify_dimension(request):
             request['dimension_id'] = dim
+            request['source_evidence'] = copy.deepcopy(bindings[(card['meeting_interest']['interest_id'], dim)])
             request['missing_evidence'] = list(card['missing_evidence'])
             selected_route = routes[card['capability_id']]
             request['route'] = {'capability_id': selected_route['capability_id'],
@@ -1002,8 +1101,24 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
         else:
             rejected.append({'card': copy.deepcopy(card), 'verdict': verdict})
     if len(accepted) < 5:
-        raise ValueError('fewer than five verified cards remain')
-    run['cards'] = sorted(accepted, key=lambda c: sum(c['ranking'][k] for k in SCORES), reverse=True)
+        error = ValueError('fewer than five verified cards remain: ' + '; '.join(r['verdict']['reason'] for r in rejected))
+        error.rejected_cards = rejected
+        raise error
+    try:
+        if _coverage(coverage_provider()) != coverage:
+            raise ValueError('published server generation or coverage changed during review')
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise RuntimeError('published server coverage unavailable: ' + str(exc)) from exc
+    def priority(card):
+        row = rows[card['meeting_interest']['dimension_id']]
+        attrs = {e['attribution'] for e in row['evidence']}
+        strength = 2 if 'direct_request' in attrs else 1 if 'interpretation' in attrs else 0
+        counts = row.get('attribution_meeting_counts', {})
+        attributed = counts.get('direct_request' if strength == 2 else 'interpretation' if strength == 1 else 'third_party', 0)
+        return (strength, attributed, row['independent_meeting_count'], sum(card['ranking'][k] for k in SCORES))
+    run['cards'] = sorted(accepted, key=priority, reverse=True)[:7]
     for number, card in enumerate(run['cards'], 1):
         card['number'] = number
     if rejected:
