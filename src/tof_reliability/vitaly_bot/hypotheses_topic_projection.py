@@ -7,6 +7,7 @@ contains no source text; interest identifiers are passed through as supplied.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -239,6 +240,7 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
         if not index.get("version") or profile.get("corpus_version") != index["version"]:
             raise ValueError("corpus version mismatch")
         sources = {}
+        texts = {}
         for source in index["sources"]:
             sid, path, digest = source["id"], Path(source["path"]), source["sha256"]
             if (not isinstance(sid, str) or not _SAFE_ID.fullmatch(sid) or sid in sources
@@ -246,7 +248,10 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
                     or not re.fullmatch(r"[0-9a-f]{64}", digest)
                     or hashlib.sha256(path.read_bytes()).hexdigest() != digest):
                 raise ValueError("invalid source or hash")
+            if source.get("date") in {"2026-10-26", "2026-10-28", "2026-10-30"}:
+                raise ValueError("heldout source in training index")
             sources[sid] = source
+            texts[sid] = path.read_text(encoding="utf-8")
         interests = profile["interests"]
         if not isinstance(interests, list):
             raise ValueError("invalid interests")
@@ -262,7 +267,10 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
                 key = (entry["source_id"], entry["locator"])
                 if key in evidence:
                     raise ValueError("duplicate evidence")
-                evidence[key] = {k: entry[k] for k in ("source_id", "locator", "fragment", "attribution")}
+                start, end = map(int, re.fullmatch(r"chars:(\d+)-(\d+)", entry["locator"]).groups())
+                evidence[key] = {**{k: entry[k] for k in ("source_id", "locator", "fragment", "attribution")},
+                                 "sha256": sources[entry["source_id"]]["sha256"],
+                                 "context": texts[entry["source_id"]][max(0, start - 500):end + 300]}
             by_interest[ident] = {"interest_id": ident, "requirement": item["requirement"], "evidence": evidence}
     except (KeyError, TypeError, AttributeError, OSError) as exc:
         raise ValueError("invalid profile or source index") from exc
@@ -336,7 +344,12 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
         row["source_ids"] = sorted(row["source_ids"])
         row["independent_meeting_count"] = len(row.pop("meetings"))
         rows.append(row)
-    return {"version": DIMENSION_VERSION, "dimensions": rows, "unconfirmed": unconfirmed}
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                         separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {"version": DIMENSION_VERSION, "corpus_version": index["version"],
+            "profile_version": profile.get("version"), "profile_sha256": digest(profile),
+            "index_sha256": digest(index), "dimensions": rows, "unconfirmed": unconfirmed}
 
 
 def dimensions_for_generator(projection: Mapping[str, Any]) -> dict:
