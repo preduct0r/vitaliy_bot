@@ -183,7 +183,7 @@ def project_semantic_topics(
 
 
 # Descriptions are application-owned; neither model may write generator text.
-DIMENSION_VERSION = "repair-analytics-dimensions.v1"
+DIMENSION_VERSION = "repair-analytics-dimensions.v2"
 _DIMENSIONS = {
     "repair_episode_count_by_equipment_period": ("maintenance_history_repeated_episodes", "Число и виды ремонтных эпизодов по оборудованию и периодам."),
     "repair_repeat_interval": ("maintenance_history_repeated_episodes", "Интервалы между повторными ремонтными эпизодами оборудования."),
@@ -203,6 +203,25 @@ _DIMENSIONS = {
     "repair_data_quality": ("maintenance_data_quality", "Качество и полнота данных о ремонтах оборудования."),
     "repair_implementation_measurability": ("implementation_measurability", "Измеримость результатов внедрения изменений в ремонте."),
 }
+_DIMENSIONS_V1 = dict(_DIMENSIONS)
+_DIMENSIONS["repair_techcard_equipment_operations_coverage"] = (
+    "techcard_coverage_verification",
+    "Сопоставление ремонтируемого оборудования и операций с наличием и различиями технологических карт.",
+)
+_METHODOLOGY = {
+    "repair_techcard_equipment_operations_coverage": (
+        "Для вывода о полноте нужен независимый базовый перечень оборудования и операций; "
+        "это метод проверки, а не обязательное содержание исходной цитаты."
+    ),
+}
+_EVIDENCE_CONTRACT = (
+    "Отличайте прямое требование в источнике от обоснованного аналитического вывода "
+    "и пересказа третьего лица; не приписывайте вывод или пересказ как прямую цитату. "
+    "Методологические условия не обязаны дословно присутствовать в запросе. "
+    "Не относящаяся к измерению ссылка не является противоречием; подлинный конфликт "
+    "одного предмета и области сохраняет неопределённость."
+)
+_CATALOGS = {"repair-analytics-dimensions.v1": _DIMENSIONS_V1, DIMENSION_VERSION: _DIMENSIONS}
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 
@@ -248,9 +267,10 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
     except (KeyError, TypeError, AttributeError, OSError) as exc:
         raise ValueError("invalid profile or source index") from exc
 
-    catalog = [{"dimension_id": key, "topic_id": topic, "description": desc}
+    catalog = [{"dimension_id": key, "topic_id": topic, "description": desc,
+                **({"methodology": _METHODOLOGY[key]} if key in _METHODOLOGY else {})}
                for key, (topic, desc) in _DIMENSIONS.items()]
-    private_input = {"version": DIMENSION_VERSION, "dimensions": catalog,
+    private_input = {"version": DIMENSION_VERSION, "dimensions": catalog, "evidence_contract": _EVIDENCE_CONTRACT,
                      "interests": [{"interest_id": i["interest_id"], "requirement": i["requirement"],
                                     "evidence": list(i["evidence"].values())} for i in by_interest.values()]}
     try:
@@ -282,6 +302,7 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
             try:
                 verdict = verifier({"interest_id": ident, "requirement": item["requirement"],
                                     "dimension_id": dim, "topic_id": topic, "description": desc,
+                                    "methodology": _METHODOLOGY.get(dim, ""), "evidence_contract": _EVIDENCE_CONTRACT,
                                     "evidence": dict(evidence), "all_evidence": list(item["evidence"].values())})
             except Exception:
                 verdict = None
@@ -320,16 +341,18 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
 
 def dimensions_for_generator(projection: Mapping[str, Any]) -> dict:
     """Rebuild a minimal payload from the fixed catalog, never copy private text."""
-    if projection.get("version") != DIMENSION_VERSION:
+    version = projection.get("version")
+    if version not in _CATALOGS:
         raise ValueError("unsupported dimension version")
+    catalog = _CATALOGS[version]
     rows = []
     for row in projection["dimensions"]:
         dim = row["dimension_id"]
-        if dim not in _DIMENSIONS or row.get("topic_id") != _DIMENSIONS[dim][0]:
+        if dim not in catalog or row.get("topic_id") != catalog[dim][0]:
             raise ValueError("invalid dimension")
         ids, sources = row["interest_ids"], row["source_ids"]
         if not all(isinstance(i, str) and _SAFE_ID.fullmatch(i) for i in [*ids, *sources]):
             raise ValueError("unsafe identifier")
-        rows.append({"dimension_id": dim, "topic_id": _DIMENSIONS[dim][0],
-                     "description": _DIMENSIONS[dim][1], "interest_ids": list(ids), "source_ids": list(sources)})
-    return {"version": DIMENSION_VERSION, "dimensions": rows}
+        rows.append({"dimension_id": dim, "topic_id": catalog[dim][0],
+                     "description": catalog[dim][1], "interest_ids": list(ids), "source_ids": list(sources)})
+    return {"version": version, "dimensions": rows}

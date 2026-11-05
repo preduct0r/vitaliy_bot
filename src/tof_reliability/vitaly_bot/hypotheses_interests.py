@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 HOLDOUT_DATES = ("2026-10-26", "2026-10-28", "2026-10-30")
-ATTRIBUTIONS = {"direct_request", "interpretation", "third_party_paraphrase"}
+ATTRIBUTIONS = {"direct_request", "interpretation", "third_party_paraphrase", "third_party"}
 
 
 def _required(value: Any, label: str) -> str:
