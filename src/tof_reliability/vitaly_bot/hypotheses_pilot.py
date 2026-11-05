@@ -440,6 +440,28 @@ def _validate_card_content(card, scope, topic, private_interests, verifier):
         raise ValueError('private verifier rejected or uncertain')
     return None
 
+
+def _validate_case_scope(card, request):
+    """Fail closed on detectable scope loss or unsupported completed agreement.
+
+    This is deliberately not a general Russian semantic parser. The independent
+    verifier remains responsible for all other claims and scope interpretation.
+    """
+    value = _text(card.get('scope'), 'scope').casefold()
+    request = request.casefold()
+    for match in re.finditer(r'\bсогласованн\w*\s+[\w-]+', value):
+        if match.group() not in request:
+            raise ValueError('unsupported prior agreement in card scope')
+    # Retain the requested pump qualifier, not just a generic equipment label.
+    # The inflection of насос may vary; qualifiers must be copied verbatim.
+    equipment = re.search(r'\bнасос\w*([^,;.!?]*)', request)
+    if equipment:
+        # A budget condition is not part of the equipment name or location.
+        qualifier = re.split(r'\s+при\s+бюджет\w*\b', equipment.group(1), maxsplit=1)[0].strip()
+        candidate = re.search(r'\bнасос\w*([^,;.!?]*)', value)
+        if not candidate or (qualifier and qualifier not in candidate.group(1)):
+            raise ValueError('current user equipment scope missing from card')
+
 def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapping[str, Any], coverage_provider, generator, verified_labels=None, verifier_audit=None, private_verifier=None, trusted_context=None, trusted_store=None) -> dict:
     _text(knowledge_version, 'knowledge version')
     if not isinstance(scope, str):
@@ -470,6 +492,9 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
                    if r['availability'] in ('available', 'partial') and _references(r)})
                    for topic in sorted(eligible)},
                'instructions': ('Предложите 5–7 гипотез, не выполняя анализ. При наличии семи доступных подтверждённых тем и применимых маршрутов дайте семь карточек с различными topic_id и отдельным управленческим решением в каждой. Не выдумывайте источники, готовность или эффект. '
+                                'В поле scope каждой карточки явно сохраните оборудование и все его уточнения из текущего запроса пользователя; не расширяйте область. '
+                                'Не называйте перечень, объекты или период согласованными, если текущее обращение этого прямо не подтверждает: неизвестное предложите определить и согласовать до анализа. '
+                                'Отсутствующие источники и данные указывайте как условия проверки, не как установленные факты; не расширяйте задачу аналитика за пределы подтверждённой темы. '
                                 'Выбирайте только пары из eligible_topic_routes и подтверждённые связи interest_id и topic_id. '
                                 'Различайте план и факт, ресурсный график, периодичность ТО и надёжность, норму и фактические трудозатраты, готовность и стоимость материалов, проверку покрытия техкарт, эпизоды и качество данных только при подтверждённой теме и применимом маршруте. '
                                 'Каждую карточку отдельно проверит проверяющий качества; формулируйте только проверяемые вопросы и явно указывайте ограничения данных. '
@@ -507,6 +532,7 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
                 raise ValueError(f'card {number}: expected object')
             _check_card_fields(card)
             _validate_numeric_claims(card, trusted_scope, reject_roman=True)
+            _validate_case_scope(card, scope)
             capability = _text(card.get('capability_id'), f'card {number} capability_id')
             if capability not in routes:
                 raise ValueError(f'card {number}: unknown capability_id {capability}')
