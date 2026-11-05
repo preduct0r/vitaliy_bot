@@ -180,3 +180,156 @@ def project_semantic_topics(
         if isinstance(verdict, Mapping) and verdict.get("supported") is True and verdict.get("confidence") == "high":
             result.append({"topic_id": topic, "interest_id": ident, "description": labels[topic]})
     return result
+
+
+# Descriptions are application-owned; neither model may write generator text.
+DIMENSION_VERSION = "repair-analytics-dimensions.v1"
+_DIMENSIONS = {
+    "repair_episode_count_by_equipment_period": ("maintenance_history_repeated_episodes", "Число и виды ремонтных эпизодов по оборудованию и периодам."),
+    "repair_repeat_interval": ("maintenance_history_repeated_episodes", "Интервалы между повторными ремонтными эпизодами оборудования."),
+    "repair_episode_causes": ("maintenance_history_repeated_episodes", "Причины отказов и повторных ремонтов оборудования."),
+    "repair_cost_by_period_asset_work": ("mtr_cost_supply", "Затраты на ремонт по периодам, оборудованию и видам работ."),
+    "repair_cost_per_action": ("mtr_cost_supply", "Стоимость отдельного ремонтного действия с различением заказа и ремонтного эпизода."),
+    "repair_plan_fact_reasons": ("maintenance_plan_fact", "Сопоставление плана и факта ремонта и причин отклонений."),
+    "repair_labor_norm_actual": ("labor_norm_observed_measurement", "Сопоставление нормативных и фактических трудозатрат на ремонт."),
+    "repair_techcard_registry_completeness": ("techcard_coverage_verification", "Полнота ремонтных технологических карт относительно независимого реестра."),
+    "repair_verification_status_owner": ("techcard_coverage_verification", "Статус и ответственный за проверку ремонтной документации и данных."),
+    "repair_material_readiness": ("maintenance_scheduling_resource_load", "Готовность материалов до запланированного ремонта."),
+    "repair_personnel_readiness": ("maintenance_scheduling_resource_load", "Готовность персонала до запланированного ремонта."),
+    "repair_resource_load_schedule": ("maintenance_scheduling_resource_load", "График ремонтов и загрузка ремонтных ресурсов."),
+    "repair_material_cost_supply": ("mtr_cost_supply", "Стоимость и поставки материалов для ремонта."),
+    "repair_downtime": ("equipment_downtime", "Простои оборудования, связанные с ремонтом."),
+    "repair_criticality_decisions": ("equipment_criticality", "Связь критичности оборудования с решениями о ремонте."),
+    "repair_data_quality": ("maintenance_data_quality", "Качество и полнота данных о ремонтах оборудования."),
+    "repair_implementation_measurability": ("implementation_measurability", "Измеримость результатов внедрения изменений в ремонте."),
+}
+_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+
+
+def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, Any], *,
+                                classifier: Callable[[dict], Any], verifier: Callable[[dict], Any]) -> dict:
+    """Project verified private evidence; caller must isolate independent model processes.
+
+    The supplied source index defines the boundary, including holdout exclusions.
+    Every excerpt and source hash is checked before either component is called.
+    Audit evidence is private and must never be passed to a generator.
+    """
+    if not callable(classifier) or not callable(verifier) or classifier is verifier:
+        raise ValueError("independent classifier and verifier required")
+    try:
+        if not index.get("version") or profile.get("corpus_version") != index["version"]:
+            raise ValueError("corpus version mismatch")
+        sources = {}
+        for source in index["sources"]:
+            sid, path, digest = source["id"], Path(source["path"]), source["sha256"]
+            if (not isinstance(sid, str) or not _SAFE_ID.fullmatch(sid) or sid in sources
+                    or not path.is_absolute() or not isinstance(digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != digest):
+                raise ValueError("invalid source or hash")
+            sources[sid] = source
+        interests = profile["interests"]
+        if not isinstance(interests, list):
+            raise ValueError("invalid interests")
+        if interests and not assess_provenance(profile, index)["verified"]:
+            raise ValueError("source provenance verification failed")
+        by_interest = {}
+        for item in interests:
+            ident = item["id"]
+            if not isinstance(ident, str) or not _SAFE_ID.fullmatch(ident) or ident in by_interest:
+                raise ValueError("invalid interest id")
+            evidence = {}
+            for entry in item["evidence"]:
+                key = (entry["source_id"], entry["locator"])
+                if key in evidence:
+                    raise ValueError("duplicate evidence")
+                evidence[key] = {k: entry[k] for k in ("source_id", "locator", "fragment", "attribution")}
+            by_interest[ident] = {"interest_id": ident, "requirement": item["requirement"], "evidence": evidence}
+    except (KeyError, TypeError, AttributeError, OSError) as exc:
+        raise ValueError("invalid profile or source index") from exc
+
+    catalog = [{"dimension_id": key, "topic_id": topic, "description": desc}
+               for key, (topic, desc) in _DIMENSIONS.items()]
+    private_input = {"version": DIMENSION_VERSION, "dimensions": catalog,
+                     "interests": [{"interest_id": i["interest_id"], "requirement": i["requirement"],
+                                    "evidence": list(i["evidence"].values())} for i in by_interest.values()]}
+    try:
+        candidates = classifier(private_input) if interests else []
+    except Exception as exc:
+        raise ValueError("private classifier failed") from exc
+    if not isinstance(candidates, list):
+        raise ValueError("invalid classifier response")
+    groups = {}
+    seen = set()
+    for c in candidates:
+        try:
+            ident, dim, topic, sid, loc = (c[k] for k in ("interest_id", "dimension_id", "topic_id", "source_id", "locator"))
+            key = (ident, dim, sid, loc)
+            if (key in seen or ident not in by_interest or dim not in _DIMENSIONS
+                    or topic != _DIMENSIONS[dim][0] or (sid, loc) not in by_interest[ident]["evidence"]):
+                raise ValueError("invalid or duplicate candidate")
+            seen.add(key)
+            groups.setdefault((ident, dim), []).append((sid, loc, c.get("confidence")))
+        except (KeyError, TypeError) as exc:
+            raise ValueError("invalid candidate") from exc
+    confirmed, unconfirmed = {}, []
+    for (ident, dim), refs in groups.items():
+        item = by_interest[ident]
+        topic, desc = _DIMENSIONS[dim]
+        checked = []
+        for sid, loc, confidence in refs:
+            evidence = item["evidence"][(sid, loc)]
+            try:
+                verdict = verifier({"interest_id": ident, "requirement": item["requirement"],
+                                    "dimension_id": dim, "topic_id": topic, "description": desc,
+                                    "evidence": dict(evidence), "all_evidence": list(item["evidence"].values())})
+            except Exception:
+                verdict = None
+            supported = (confidence == "high" and isinstance(verdict, Mapping)
+                         and verdict.get("supported") is True and verdict.get("confidence") == "high"
+                         and not verdict.get("conflicting"))
+            conflicting = isinstance(verdict, Mapping) and bool(verdict.get("conflicting"))
+            checked.append((evidence, supported, conflicting))
+        # A contradiction holds the binding; a merely unsupported reference is
+        # retained separately without erasing independently supported excerpts.
+        conflict = any(conflicting for _, _, conflicting in checked)
+        rejected = [e for e, ok, _ in checked if conflict or not ok]
+        if rejected:
+            unconfirmed.append({"interest_id": ident, "dimension_id": dim, "topic_id": topic,
+                                "evidence": [dict(e) for e in rejected]})
+        accepted = [e for e, ok, _ in checked if ok and not conflict]
+        if not accepted:
+            continue
+        row = confirmed.setdefault(dim, {"dimension_id": dim, "topic_id": topic, "description": desc,
+                                         "interest_ids": set(), "source_ids": set(), "evidence": [], "meetings": set()})
+        row["interest_ids"].add(ident)
+        for evidence in accepted:
+            sid = evidence["source_id"]
+            row["source_ids"].add(sid)
+            row["evidence"].append({"interest_id": ident, **evidence})
+            source = sources[sid]
+            row["meetings"].add(source.get("meeting_id") or source.get("date") or sid)
+    rows = []
+    for row in confirmed.values():
+        row["interest_ids"] = sorted(row["interest_ids"])
+        row["source_ids"] = sorted(row["source_ids"])
+        row["independent_meeting_count"] = len(row.pop("meetings"))
+        rows.append(row)
+    return {"version": DIMENSION_VERSION, "dimensions": rows, "unconfirmed": unconfirmed}
+
+
+def dimensions_for_generator(projection: Mapping[str, Any]) -> dict:
+    """Rebuild a minimal payload from the fixed catalog, never copy private text."""
+    if projection.get("version") != DIMENSION_VERSION:
+        raise ValueError("unsupported dimension version")
+    rows = []
+    for row in projection["dimensions"]:
+        dim = row["dimension_id"]
+        if dim not in _DIMENSIONS or row.get("topic_id") != _DIMENSIONS[dim][0]:
+            raise ValueError("invalid dimension")
+        ids, sources = row["interest_ids"], row["source_ids"]
+        if not all(isinstance(i, str) and _SAFE_ID.fullmatch(i) for i in [*ids, *sources]):
+            raise ValueError("unsafe identifier")
+        rows.append({"dimension_id": dim, "topic_id": _DIMENSIONS[dim][0],
+                     "description": _DIMENSIONS[dim][1], "interest_ids": list(ids), "source_ids": list(sources)})
+    return {"version": DIMENSION_VERSION, "dimensions": rows}
