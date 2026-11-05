@@ -897,6 +897,68 @@ def _topic_routes(topic):
     return TOPIC_ROUTES.get(topic) or {NO_VERIFIED_ROUTE}
 
 
+def _balanced_dimension_selection(cards, rows):
+    """Select verified cards using bounded evidence, utility and route signals.
+
+    Recurrence is a saturation curve, not a count of source fragments.  When
+    per-attribution meeting counts exist, use their weighted proportions;
+    otherwise only the strongest observed attribution is known. Availability
+    comes from the validated route, independently of the model's estimate.
+    A modest marginal bonus rewards new routes, topic families and distinct
+    decision/method wording in a pool larger than the output. Word overlap is
+    only a reproducible diversity heuristic, not a semantic verifier; the
+    independent review screens equivalence before this selection. No family
+    has a reserved slot.
+    """
+    attribution = {'direct_request': 1.0, 'interpretation': 0.35,
+                   'third_party': 0.0, 'third_party_paraphrase': 0.0}
+    readiness = {'available': 1.0, 'partial': 0.5, 'unavailable': 0.0}
+
+    def base(card):
+        row = rows[card['meeting_interest']['dimension_id']]
+        count = row['independent_meeting_count']
+        counts = row.get('attribution_meeting_counts', {})
+        if counts:
+            # Different attribution types can occur in the same meeting.
+            attributed = sum(attribution[k] * n for k, n in counts.items()) / sum(counts.values())
+        else:
+            attributed = max(attribution[e['attribution']] for e in row['evidence'])
+        rank = card['ranking']
+        return (0.30 * count / (count + 2) + 0.25 * attributed
+                + 0.20 * rank['utility'] / 5 + 0.12 * rank['feasibility'] / 5
+                + 0.05 * rank['interest'] / 5 + 0.08 * readiness[card['source_readiness']])
+
+    remaining = list(cards)
+    selected = []
+    diversify = len(remaining) > 7
+
+    def similarity(a, b):
+        def overlap(field):
+            left = set(re.findall(r'\w+', a[field].casefold()))
+            right = set(re.findall(r'\w+', b[field].casefold()))
+            return len(left & right) / len(left | right) if left | right else 1.0
+        return (overlap('decision') + overlap('metrics_method')) / 2
+
+    while remaining and len(selected) < 7:
+        capabilities = {c['capability_id'] for c in selected}
+        families = {c['meeting_interest']['topic_id'] for c in selected}
+
+        def key(card):
+            bonus = 0.0
+            if diversify and selected:
+                if card['capability_id'] not in capabilities and card['capability_id'] != NO_VERIFIED_ROUTE:
+                    bonus += 0.18
+                if card['meeting_interest']['topic_id'] not in families:
+                    bonus += 0.10
+                bonus += 0.08 * (1 - max(similarity(card, other) for other in selected))
+            return (-(base(card) + bonus), card['meeting_interest']['dimension_id'])
+
+        chosen = min(remaining, key=key)
+        remaining.remove(chosen)
+        selected.append(chosen)
+    return selected
+
+
 def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=None, trusted_store=None, candidate_pool=False):
     from .hypotheses_topic_projection import _CATALOGS, DIMENSION_VERSION
     trusted_scope = _trusted_scope(trusted_context, trusted_store, run)
@@ -1114,14 +1176,7 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
         raise
     except Exception as exc:
         raise RuntimeError('published server coverage unavailable: ' + str(exc)) from exc
-    def priority(card):
-        row = rows[card['meeting_interest']['dimension_id']]
-        attrs = {e['attribution'] for e in row['evidence']}
-        strength = 2 if 'direct_request' in attrs else 1 if 'interpretation' in attrs else 0
-        counts = row.get('attribution_meeting_counts', {})
-        attributed = counts.get('direct_request' if strength == 2 else 'interpretation' if strength == 1 else 'third_party', 0)
-        return (strength, attributed, row['independent_meeting_count'], sum(card['ranking'][k] for k in SCORES))
-    run['cards'] = sorted(accepted, key=priority, reverse=True)[:7]
+    run['cards'] = _balanced_dimension_selection(accepted, rows)
     for number, card in enumerate(run['cards'], 1):
         card['number'] = number
     if rejected:
