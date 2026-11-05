@@ -29,45 +29,60 @@ def pilot():
         return MissingPilot()
 
 
+SYNTHETIC_DIRECTIONS = [
+    ("repeat", "maintenance_history_repeated_episodes", "AN-REPAIR-EPISODES", "Проверить историю ремонтов оборудования и повторные ремонтные эпизоды"),
+    ("plan", "maintenance_plan_fact", "AN-PLAN-FACT", "Сравнить плановые и фактические показатели ремонта оборудования"),
+    ("mtr", "mtr_cost_supply", "AN-MTR-COST", "Проверить стоимость МТР и поставки для ремонта оборудования"),
+    ("downtime", "equipment_downtime", "AN-DOWNTIME", "Проверить простои оборудования при ремонте"),
+    ("criticality", "equipment_criticality", "AN-EQUIPMENT-CRITICALITY", "Проверить критичность оборудования при ремонте"),
+]
+
+
 @pytest.fixture
 def inputs():
-    return {
-        "scope": "насосы цеха A",
-        "knowledge_version": "knowledge-1",
-        "interest_context": {"version": "interests-1", "corpus_version": "corpus-1", "interests": [
-            {"id": "repeat", "requirement": "Изучить повторные ремонты",
-             "attributions": ["interpretation"], "evidence": [
-                 {"source_id": "synthetic", "date": "2026-10-01", "locator": "chars:0-4",
-                  "attribution": "interpretation", "sha256": "a" * 64,
-                  "reference": "synthetic:chars:0-4"}]}]},
-        "coverage": {"coverage_version": 1, "generation": {"run_id": "gen-1"},
-                     "routes": [{"capability_id": "AN-REPAIR-EPISODES",
-                                 "availability": "partial",
-                                 "missing_evidence": ["связь заказов с эпизодами"],
-                                 "source_references": ["ledger:repairs"]}]},
-    }
+    import hashlib
+    from pathlib import Path
+    source = (Path(__file__).parent / "fixtures/synthetic_repair_topics.txt").read_text(encoding="utf-8")
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    interests = []
+    for ident, topic, route, text in SYNTHETIC_DIRECTIONS:
+        sid = 'synthetic' if ident == 'repeat' else 'synthetic-' + ident
+        start = source.index(text)
+        locator = f'chars:{start}-{start + len(text)}'
+        interests.append({'id': ident, 'requirement': text, 'attributions': ['interpretation'],
+                          'evidence': [{'source_id': sid, 'date': '2026-10-01', 'locator': locator,
+                                        'attribution': 'interpretation', 'sha256': digest,
+                                        'reference': f'{sid}:{locator}', 'fragment': text}]})
+    return {'scope': 'насосы цеха A', 'knowledge_version': 'knowledge-1',
+            'interest_context': {'version': 'interests-1', 'corpus_version': 'corpus-1', 'interests': interests},
+            'coverage': {'coverage_version': 1, 'generation': {'run_id': 'gen-1'}, 'routes': [
+                {'capability_id': route, 'availability': 'partial',
+                 'missing_evidence': ['связь заказов с эпизодами'], 'source_references': ['ledger:repairs']}
+                for _, _, route, _ in SYNTHETIC_DIRECTIONS]}}
 
 
 @pytest.fixture
 def cards():
-    return distinct_directions([{
-        "number": i,
-        "capability_id": "AN-REPAIR-EPISODES",
-        "management_question": f"Какие причины повторного ремонта {chr(1040 + i)}?",
-        "decision": "Определить приоритет проверки",
-        "scope": "насосы цеха A",
-        "metrics_method": "Проверить эпизоды по подтверждённым ключам",
-        "meeting_interest": {"interest_id": "repeat", "attribution": "interpretation",
-                             "reference": "synthetic:chars:0-4"},
-        "source_references": ["ledger:repairs"],
-        "source_readiness": "partial",
-        "missing_evidence": ["связь заказов с эпизодами"],
-        "falsification": "Повторы не отличаются от базового уровня",
-        "hard_questions": ["Как определён эпизод?"],
-        "analyst_brief": "Проверить ключи и период до расчёта",
-        "novelty": "unknown",
-        "ranking": {"utility": 5, "feasibility": 3, "interest": 4, "novelty": 0},
-    } for i in range(1, 6)])
+    from pathlib import Path
+    source = (Path(__file__).parent / 'fixtures/synthetic_repair_topics.txt').read_text(encoding='utf-8')
+    result = []
+    for i, (ident, topic, route, text) in enumerate(SYNTHETIC_DIRECTIONS, 1):
+        sid = 'synthetic' if ident == 'repeat' else 'synthetic-' + ident
+        start = source.index(text)
+        locator = f'chars:{start}-{start + len(text)}'
+        result.append({
+            'number': i, 'capability_id': route,
+            'management_question': f'Как проверить: {text}?',
+            'decision': f'Выбрать проверку: {text}', 'scope': 'насосы цеха A',
+            'metrics_method': f'Сопоставить данные: {text}',
+            'meeting_interest': {'interest_id': ident, 'topic_id': topic, 'attribution': 'interpretation',
+                                 'reference': f'{sid}:{locator}'},
+            'source_references': ['ledger:repairs'], 'source_readiness': 'partial',
+            'missing_evidence': ['связь заказов с эпизодами'],
+            'falsification': 'Повторы не отличаются от базового уровня',
+            'hard_questions': ['Как определён эпизод?'], 'analyst_brief': 'Проверить ключи и период до расчёта',
+            'novelty': 'unknown', 'ranking': {'utility': 5, 'feasibility': 3, 'interest': 4, 'novelty': 0}})
+    return result
 
 
 def generate(pilot, inputs, cards, model=None, coverage=None, **trusted):
@@ -151,7 +166,7 @@ def test_export_is_reproducible_and_preserves_verification(pilot, inputs, cards,
     run = generate(pilot, inputs, cards, trusted_context=trusted, trusted_store=store)
     evidence = inputs['interest_context']['interests'][0]['evidence'][0]
     verification = {"verified": True, "corpus_version": "corpus-1", "interest_version": "interests-1",
-                    "checks": [{**evidence, "interest_id": "repeat", "verified": True}]}
+                    "checks": [{**e, "interest_id": i["id"], "verified": True} for i in inputs["interest_context"]["interests"] for e in i["evidence"]]}
     first, second = tmp_path / "one", tmp_path / "two"
     pilot.export_pilot(run, output_dir=first, source_verification=verification, trusted_context=trusted, trusted_store=store)
     pilot.export_pilot(run, output_dir=second, source_verification=verification, trusted_context=trusted, trusted_store=store)

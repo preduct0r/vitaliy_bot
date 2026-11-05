@@ -5,43 +5,25 @@ import json
 import pytest
 
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
+from test_hypotheses_pilot import inputs as legacy_inputs, cards as legacy_cards
+from pilot_projection_support import projection
 
 
 @pytest.fixture
 def synthetic_case():
-    topic = 'maintenance_history_repeated_episodes'
-    evidence = {'source_id': 'synthetic-source', 'date': '2030-01-01',
-                'locator': 'chars:0-10', 'attribution': 'interpretation',
-                'sha256': 'a' * 64, 'reference': 'synthetic-source:chars:0-10'}
-    interests = {'version': 'i1', 'corpus_version': 'c1', 'interests': [
-        {'id': 'repeat', 'requirement': 'PRIVATE_SOURCE_SECRET 987654321',
-         'attributions': ['interpretation'], 'evidence': [evidence],
-         'fragment': 'PRIVATE_TRANSCRIPT_SENTINEL'},
-    ]}
-    labels = [{'interest_id': 'repeat', 'topic_id': topic,
-               'description': 'История ремонтов оборудования и повторные ремонтные эпизоды.'}]
-    audit = [{'interest_id': 'repeat', 'topic_id': topic, 'source_id': 'synthetic-source',
-              'locator': 'chars:0-10', 'verdict': {'supported': True, 'confidence': 'high'}}]
-    coverage = {'coverage_version': 1, 'generation': {'run_id': 'synthetic-gen'}, 'routes': [
-        {'capability_id': 'repairs', 'availability': 'partial',
-         'missing_evidence': ['связь заказов с эпизодами'],
-         'source_references': ['ledger:repairs']},
-        {'capability_id': 'labor', 'availability': 'unavailable',
-         'missing_evidence': ['фактическая трудоёмкость'], 'source_references': []},
-    ]}
-    card = {'number': 1, 'capability_id': 'repairs',
-            'management_question': 'Как проверить причины повторного ремонта?',
-            'decision': 'Выбрать проверку причин повторных ремонтов', 'scope': 'насосы',
-            'metrics_method': 'Сопоставить ключи ремонтных эпизодов',
-            'meeting_interest': {'interest_id': 'repeat', 'topic_id': topic},
-            'source_references': ['ledger:repairs'], 'source_readiness': 'partial',
-            'missing_evidence': ['связь заказов с эпизодами'],
-            'falsification': 'Повторы не отличаются от базового уровня',
-            'hard_questions': ['Как определён эпизод?'],
-            'analyst_brief': 'Проверить источники', 'novelty': 'unknown',
-            'ranking': {'utility': 3, 'feasibility': 3, 'interest': 3, 'novelty': 0}}
-    cards = [dict(copy.deepcopy(card), number=n) for n in range(1, 6)]
-    return interests, labels, audit, coverage, cards
+    data = legacy_inputs.__wrapped__()
+    interests = data['interest_context']
+    interests['interests'][0]['requirement'] += ' PRIVATE_SOURCE_SECRET 987654321'
+    interests['interests'][0]['fragment'] = 'PRIVATE_TRANSCRIPT_SENTINEL'
+    projected = projection(interests)
+    coverage = data['coverage']
+    coverage['routes'].append({'capability_id': 'AN-TECHCARD-LABOR', 'availability': 'unavailable',
+                               'missing_evidence': ['фактическая трудоёмкость'], 'source_references': []})
+    cards = legacy_cards.__wrapped__()
+    for card in cards:
+        card['decision'] = 'Выбрать проверку причин повторных ремонтов'
+        card['metrics_method'] = 'Сопоставить ключи ремонтных эпизодов'
+    return interests, projected['verified_labels'], projected['verifier_audit'], coverage, cards
 
 
 def generate(case, generator, verifier=None):
@@ -99,7 +81,7 @@ def test_unsupported_historical_amount_is_rejected_even_if_verifier_approves(syn
 
 def test_cross_route_source_cannot_prove_missing_labor_data(synthetic_case):
     cards = copy.deepcopy(synthetic_case[-1])
-    cards[0].update(capability_id='labor', source_references=['ledger:repairs'])
+    cards[0].update(capability_id='AN-TECHCARD-LABOR', source_references=['ledger:repairs'])
     with pytest.raises(ValueError, match='(?i)reference|source|route|источник'):
         generate(synthetic_case, lambda _: cards)
 

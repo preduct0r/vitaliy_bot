@@ -7,6 +7,7 @@ import json
 import pytest
 
 from pilot_projection_support import LABEL, TOPIC, distinct_directions, project_cards, projection
+from test_hypotheses_pilot_evidence_resolve import inputs as resolved_inputs
 
 from tof_reliability.vitaly_bot import hypotheses_interests as interests
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
@@ -155,15 +156,13 @@ def test_projection_rejects_unverified_evidence_and_unsafe_ids(evidence):
         interests.generator_context(split, profile)
 
 
-def test_export_binds_verified_hash_attribution_and_context(evidence, coverage, tmp_path):
-    index, profile, split = evidence
-    context = interests.generator_context(split, profile)
-    report = interests.assess_provenance(profile, index)
+def test_export_binds_verified_hash_attribution_and_context(resolved_inputs, tmp_path):
+    context, report, coverage, cards, _, _ = resolved_inputs
     store = pilot.TrustedRequestStore(tmp_path / 'trusted.sqlite')
     trusted = store.create({'run_id': 'run', 'case_id': 'case', 'user_id': 'user', 'scope': ''})
     run = pilot.generate_pilot(scope='', knowledge_version='knowledge-1', interest_context=context,
                                coverage_provider=lambda: copy.deepcopy(coverage),
-                               generator=lambda _: project_cards(make_run(coverage, context)['cards']),
+                               generator=lambda _: project_cards(copy.deepcopy(cards)),
                                trusted_context=trusted, trusted_store=store, **projection(context))
     pilot.export_pilot(run, output_dir=tmp_path / "good", source_verification=report, trusted_context=trusted, trusted_store=store)
     for field, value in (("sha256", "a" * 64), ("attribution", "direct_request"),
@@ -206,9 +205,9 @@ def test_coverage_cannot_claim_unavailable_sources_or_omit_gaps(coverage, source
         pilot.validate_pilot(run, coverage=coverage, interest_context=source_context)
 
 
-def test_generation_requests_distinct_analytical_questions_and_preserves_schema(coverage, source_context):
+def test_generation_requests_distinct_analytical_questions_and_preserves_schema(resolved_inputs):
+    source_context, _, coverage, cards, _, _ = resolved_inputs
     seen = {}
-    cards = make_run(coverage, source_context)["cards"]
 
     class Runner:
         async def run(self, prompt, schema):

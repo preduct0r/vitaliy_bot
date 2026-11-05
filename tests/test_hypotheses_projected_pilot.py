@@ -10,7 +10,8 @@ import json
 
 import pytest
 
-from pilot_projection_support import distinct_directions
+from pilot_projection_support import distinct_directions, projection
+from test_hypotheses_pilot import inputs as legacy_inputs, cards as legacy_cards
 
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
 
@@ -31,27 +32,23 @@ def case():
         {"id": "other", "requirement": "OTHER_CASE_PRIVATE_REQUEST 87654321",
          "attributions": ["interpretation"], "evidence": [dict(evidence)]},
     ]}
+    legacy = legacy_inputs.__wrapped__()
+    evidence = copy.deepcopy(legacy['interest_context']['interests'][0]['evidence'][0])
+    interests['interests'][0]['evidence'] = [evidence]
+    interests['interests'][0]['requirement'] += ' ' + legacy['interest_context']['interests'][0]['requirement']
+    interests['interests'].extend(copy.deepcopy(legacy['interest_context']['interests'][1:]))
     labels = [{"interest_id": "repeat", "topic_id": TOPIC, "description": LABEL}]
-    audit = [{"interest_id": "repeat", "topic_id": TOPIC, "source_id": "meeting-a",
-              "locator": "chars:0-10", "verdict": {"supported": True, "confidence": "high"}}]
-    coverage = {"coverage_version": 1, "generation": {"run_id": "gen-1"}, "routes": [
-        {"capability_id": "repair-episodes", "availability": "partial",
-         "missing_evidence": ["связь заказов с эпизодами"],
-         "source_references": ["ledger:repairs"]}]}
-    cards = [{"number": n, "capability_id": "repair-episodes",
-              "management_question": "Как проверить причины повторного ремонта?",
-              "decision": "Выбрать проверку", "scope": "насосы",
-              "metrics_method": "Проверить ключи эпизодов",
-              "meeting_interest": {"interest_id": "repeat", "topic_id": TOPIC},
-              "source_references": ["ledger:repairs"], "source_readiness": "partial",
-              "missing_evidence": ["связь заказов с эпизодами"],
-              "falsification": "Повторы не отличаются от базового уровня",
-              "hard_questions": ["Как определён эпизод?"],
-              "analyst_brief": "Проверить источники", "novelty": "unknown",
-              "ranking": {"utility": 3, "feasibility": 3, "interest": 3, "novelty": 0}}
-             for n in range(1, 6)]
-    return {"interests": interests, "labels": labels, "audit": audit,
-            "coverage": coverage, "cards": distinct_directions(cards), "evidence": evidence}
+    audit = [{"interest_id": "repeat", "topic_id": TOPIC, "source_id": evidence["source_id"],
+              "locator": evidence["locator"], "verdict": {"supported": True, "confidence": "high"}}]
+    extra = projection({'interests': interests['interests'][2:]})
+    labels.extend(extra['verified_labels'])
+    audit.extend(extra['verifier_audit'])
+    coverage = legacy['coverage']
+    cards = legacy_cards.__wrapped__()
+    cards[0]['meeting_interest'] = {'interest_id': 'repeat', 'topic_id': TOPIC}
+    return {'interests': interests, 'labels': labels, 'audit': audit,
+            'coverage': coverage, 'cards': cards, 'evidence': evidence}
+
 
 
 class Verifier:
@@ -90,9 +87,10 @@ def test_only_canonical_projection_reaches_generator_and_selected_source_is_atta
     assert len(verifier.calls) >= len(run["cards"])
     for card in run["cards"]:
         meeting = card["meeting_interest"]
-        assert meeting["interest_id"] == "repeat" and meeting["topic_id"] == TOPIC
-        for key, value in case["evidence"].items():
-            assert meeting[key] == value
+        item = next(i for i in case["interests"]["interests"] if i["id"] == meeting["interest_id"])
+        assert any(all(meeting.get(k) == v for k, v in evidence.items() if k != "fragment")
+                   for evidence in item["evidence"])
+    assert run["cards"][0]["meeting_interest"]["topic_id"] == TOPIC
 
 
 @pytest.mark.parametrize("damage", ["missing", "wrong_interest", "wrong_topic", "wrong_label",

@@ -26,6 +26,27 @@ SCORES = ('utility', 'feasibility', 'interest', 'novelty')
 CARD_FIELDS = set(TEXT_FIELDS + LIST_FIELDS + ('number', 'capability_id', 'source_readiness', 'meeting_interest', 'ranking'))
 MEETING_FIELDS = {'interest_id', 'topic_id', 'reference', 'attribution', 'source_id', 'date', 'locator', 'sha256'}
 
+# These are conservative investigative associations derived from the registered
+# route descriptions, not registry-declared topic mappings or proof of data.
+# MTR covers write-offs and cost, not supply readiness; techcard labor covers
+# normative and order hours, not proof of measured labor. Gaps must remain
+# explicit. Resource scheduling and implementation effects have no such route.
+TOPIC_ROUTES = {
+    'maintenance_history_repeated_episodes': {'AN-REPAIR-EPISODES'},
+    'maintenance_plan_fact': {'AN-PLAN-FACT'},
+    'mtr_cost_supply': {'AN-MTR-COST'},
+    'equipment_downtime': {'AN-DOWNTIME'},
+    'labor_norm_observed_measurement': {'AN-TECHCARD-LABOR'},
+    'equipment_criticality': {'AN-EQUIPMENT-CRITICALITY'},
+    'techcard_coverage_verification': {'AN-TECHCARD-LABOR'},
+}
+
+
+def _eligible_topics(bindings, routes):
+    available = {r['capability_id'] for r in routes
+                 if r['availability'] in ('available', 'partial') and _references(r)}
+    return {topic for _, topic in bindings if TOPIC_ROUTES.get(topic, set()) & available}
+
 
 def _digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -198,6 +219,20 @@ def _validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inte
     if 'verified_labels' in run or 'verifier_audit' in run:
         projection_bindings = _projection(interests, run.get('verified_labels'), run.get('verifier_audit'))
     routes = {r['capability_id']: r for r in coverage['routes']}
+    if projection_bindings is not None:
+        eligible = _eligible_topics(projection_bindings, coverage['routes'])
+        if len(eligible) < 5:
+            raise ValueError('insufficient verified eligible topics with applicable routes')
+        topics = [c.get('meeting_interest', {}).get('topic_id') for c in cards if isinstance(c, dict)]
+        if len(topics) != len(set(topics)):
+            raise ValueError('duplicate topic: distinct directions required')
+        if (len(eligible) >= 7 and len(cards) != 7) or len(cards) > len(eligible):
+            raise ValueError('breadth requires seven distinct eligible topics when available')
+        if len(eligible) < 7:
+            expected = {'eligible_topic_ids': sorted(eligible),
+                        'reason': f'Доступно только {len(eligible)} подтверждённых тем с применимыми маршрутами; выбрано {len(cards)}.'}
+            if run.get('breadth_justification') != expected:
+                raise ValueError('breadth justification does not match eligible topics')
     for number, card in enumerate(cards, 1):
         if not isinstance(card, dict) or card.get('number') != number:
             raise ValueError('cards must be numbered consecutively')
@@ -233,6 +268,10 @@ def _validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inte
         route = routes.get(capability)
         if route is None:
             raise ValueError(f'card {number}: unknown capability_id {capability}')
+        if route['availability'] == 'unavailable':
+            raise ValueError(f'card {number}: unavailable route {capability}')
+        if projection_bindings is not None and capability not in TOPIC_ROUTES.get(meeting['topic_id'], set()):
+            raise ValueError(f'card {number}: incompatible topic and route')
         refs = set(card['source_references'])
         unsupported = refs - _references(route)
         if unsupported:
@@ -390,13 +429,23 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
         coverage = _coverage(coverage_provider())
     except Exception as exc:
         raise RuntimeError('published server coverage unavailable: ' + str(exc)) from exc
+    eligible = _eligible_topics(bindings, coverage['routes'])
+    if len(eligible) < 5:
+        raise ValueError('insufficient verified eligible topics with applicable routes')
     safe_routes = [{k: copy.deepcopy(r[k]) for k in ('capability_id', 'route_id', 'availability', 'missing_evidence') if k in r}
                    | {'source_references': sorted(_references(r))} for r in coverage['routes']]
     model_interests = [{k: label[k] for k in ('interest_id', 'topic_id', 'description')}
                        for label in verified_labels]
     context = {'scope': scope, 'knowledge_version': knowledge_version, 'interests': model_interests,
                'coverage': {'generation_id': coverage['generation']['run_id'], 'routes': safe_routes},
-               'instructions': ('Предложите 5–7 гипотез, не выполняя анализ. Не выдумывайте источники, готовность или эффект. '
+               'eligible_topic_routes': {topic: sorted(TOPIC_ROUTES[topic] & {
+                   r['capability_id'] for r in coverage['routes']
+                   if r['availability'] in ('available', 'partial') and _references(r)})
+                   for topic in sorted(eligible)},
+               'instructions': ('Предложите 5–7 гипотез, не выполняя анализ. При наличии семи доступных подтверждённых тем и применимых маршрутов дайте семь карточек с различными topic_id и отдельным управленческим решением в каждой. Не выдумывайте источники, готовность или эффект. '
+                                'Выбирайте только пары из eligible_topic_routes и подтверждённые связи interest_id и topic_id. '
+                                'Различайте план и факт, ресурсный график, периодичность ТО и надёжность, норму и фактические трудозатраты, готовность и стоимость материалов, проверку покрытия техкарт, эпизоды и качество данных только при подтверждённой теме и применимом маршруте. '
+                                'Каждую карточку отдельно проверит проверяющий качества; формулируйте только проверяемые вопросы и явно указывайте ограничения данных. '
                                 'Укажите ограничения, проверку опровержения и вопросы аналитика. '
                                 'Различайте заказ и эпизод, длительность и трудоёмкость, план и факт, норму и оценку. '
                                 'Выберите точный capability_id одного маршрута и только его source_references; '
@@ -418,6 +467,9 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
            'interest_version': interests['version'], 'scope': scope, 'coverage': coverage,
            'interest_context': interests, 'verified_labels': copy.deepcopy(verified_labels),
            'verifier_audit': copy.deepcopy(verifier_audit), 'cards': copy.deepcopy(cards)}
+    if len(eligible) < 7:
+        run['breadth_justification'] = {'eligible_topic_ids': sorted(eligible),
+                                        'reason': f'Доступно только {len(eligible)} подтверждённых тем с применимыми маршрутами; выбрано {len(cards)}.'}
     if trusted_context is not None:
         run['request_binding'] = trusted_context.token
     routes = {r['capability_id']: r for r in coverage['routes']}
@@ -432,6 +484,8 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
             if capability not in routes:
                 raise ValueError(f'card {number}: unknown capability_id {capability}')
             route = routes[capability]
+            if route['availability'] == 'unavailable':
+                raise ValueError(f'card {number}: unavailable route {capability}')
             card['source_readiness'] = route['availability']
             card['missing_evidence'] = copy.deepcopy(route['missing_evidence'])
             meeting = card.get('meeting_interest')
@@ -440,6 +494,8 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
             topic = meeting.get('topic_id')
             if (meeting['interest_id'], topic) not in bindings:
                 raise ValueError('unknown projected interest and topic')
+            if capability not in TOPIC_ROUTES.get(topic, set()):
+                raise ValueError(f'card {number}: incompatible topic and route')
             entry = bindings[(meeting['interest_id'], topic)]
             fields = ('reference', 'attribution', 'source_id', 'date', 'locator', 'sha256')
             supplied = [k for k in fields if k in meeting]

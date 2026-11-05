@@ -8,50 +8,47 @@ import pytest
 
 from pilot_projection_support import LABEL, TOPIC, distinct_directions, project_cards, projection
 
+from test_hypotheses_pilot import SYNTHETIC_DIRECTIONS, inputs as legacy_inputs, cards as legacy_cards
 from tof_reliability.vitaly_bot import hypotheses_interests as interests
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
 
 
 @pytest.fixture
 def inputs(tmp_path):
-    text = "SYNTHETIC_PRIVATE_MEETING_CONTENT"
-    source = tmp_path / "meeting.txt"
-    source.write_text(text, encoding="utf-8")
+    text = 'SYNTHETIC_PRIVATE_MEETING_CONTENT\n' + '\n'.join(d[3] for d in SYNTHETIC_DIRECTIONS)
+    source = tmp_path / 'meeting.txt'
+    source.write_text(text, encoding='utf-8')
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
-    index = {"version": "corpus-1", "sources": [
-        {"id": "meeting-a", "date": "2026-10-01", "kind": "transcript",
-         "sha256": digest, "path": str(source)},
-        {"id": "meeting-b", "date": "2026-10-02", "kind": "transcript",
-         "sha256": digest, "path": str(source)},
-    ]}
-    profile = {"version": "interests-1", "corpus_version": "corpus-1", "interests": [
-        {"id": "repeat", "requirement": "Проверить повторы", "evidence": [
-            {"source_id": "meeting-a", "locator": "chars:0-9", "fragment": text[:9],
-             "attribution": "interpretation"},
-            {"source_id": "meeting-b", "locator": "chars:10-17", "fragment": text[10:17],
-             "attribution": "direct_request"}]},
-        {"id": "labor", "requirement": "Проверить трудоёмкость", "evidence": [
-            {"source_id": "meeting-b", "locator": "chars:0-9", "fragment": text[:9],
-             "attribution": "direct_request"}]},
-    ]}
-    split = {"version": "corpus-1", "training": index["sources"], "holdout": []}
+    index = {'version': 'corpus-1', 'sources': [
+        {'id': 'meeting-a', 'date': '2026-10-01', 'kind': 'transcript', 'sha256': digest, 'path': str(source)},
+        {'id': 'meeting-b', 'date': '2026-10-02', 'kind': 'transcript', 'sha256': digest, 'path': str(source)}]}
+    profile = {'version': 'interests-1', 'corpus_version': 'corpus-1', 'interests': []}
+    for n, (ident, topic, route, requirement) in enumerate(SYNTHETIC_DIRECTIONS):
+        if ident == 'plan':
+            ident = 'labor'
+        start = text.index(requirement)
+        source_id = 'meeting-a' if n == 0 else 'meeting-b'
+        evidence = [{'source_id': source_id, 'locator': f'chars:{start}-{start + len(requirement)}',
+                     'fragment': requirement, 'attribution': 'interpretation'}]
+        if n == 0:
+            evidence.append({'source_id': 'meeting-b', 'locator': 'chars:10-17',
+                             'fragment': text[10:17], 'attribution': 'direct_request'})
+        if n == 1:
+            evidence.append({'source_id': 'meeting-b', 'locator': 'chars:0-9',
+                             'fragment': text[:9], 'attribution': 'direct_request'})
+        profile['interests'].append({'id': ident, 'requirement': requirement, 'evidence': evidence})
+    split = {'version': 'corpus-1', 'training': index['sources'], 'holdout': []}
     context = interests.generator_context(split, profile)
     report = interests.assess_provenance(profile, index)
-    assert report["verified"]
-    coverage = {"coverage_version": 1, "generation": {"run_id": "gen-1"}, "routes": [
-        {"capability_id": "repairs", "availability": "partial",
-         "missing_evidence": ["ключи эпизодов"], "source_references": ["ledger:repairs"]}]}
-    cards = [{"number": n, "capability_id": "repairs",
-              "management_question": f"Как проверить повторы {chr(1040 + n)}?", "decision": "Выбрать проверку",
-              "scope": "насосы", "metrics_method": "Проверить ключи",
-              "meeting_interest": {"interest_id": "repeat"},
-              "source_references": ["ledger:repairs"], "source_readiness": "partial",
-              "missing_evidence": ["ключи эпизодов"], "falsification": "Нет различий",
-              "hard_questions": ["Как определён эпизод?"], "analyst_brief": "Проверить данные",
-              "novelty": "unknown", "ranking": {"utility": 3, "feasibility": 3,
-                                                   "interest": 3, "novelty": 0}}
-             for n in range(1, 6)]
-    return context, report, coverage, distinct_directions(cards), text, str(source)
+    assert report['verified']
+    coverage = legacy_inputs.__wrapped__()['coverage']
+    cards = legacy_cards.__wrapped__()
+    for card in cards:
+        if card['meeting_interest']['interest_id'] == 'plan':
+            card['meeting_interest']['interest_id'] = 'labor'
+        card['meeting_interest'] = {k: card['meeting_interest'][k] for k in ('interest_id', 'topic_id')}
+    return context, report, coverage, cards, 'SYNTHETIC_PRIVATE_MEETING_CONTENT', str(source)
+
 
 
 def generate(context, coverage, cards, **trusted):
@@ -139,8 +136,7 @@ def test_resolved_binding_rejects_tampered_metadata(inputs, field, value):
 def test_existing_valid_reference_format_remains_supported_and_forgery_rejected(inputs):
     context, _, coverage, cards, _, _ = inputs
     entry = context["interests"][0]["evidence"][0]
-    for card in cards:
-        card["meeting_interest"].update(reference=entry["reference"], attribution=entry["attribution"])
+    cards[0]["meeting_interest"].update(reference=entry["reference"], attribution=entry["attribution"])
     run = generate(context, coverage, cards)
     pilot.validate_pilot(run, coverage=coverage, interest_context=context)
     cards[0]["meeting_interest"]["reference"] = context["interests"][1]["evidence"][0]["reference"]

@@ -10,6 +10,7 @@ import copy
 import pytest
 
 from pilot_projection_support import TOPIC, project_cards, projection
+from test_hypotheses_pilot import inputs, cards
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
 
 
@@ -86,30 +87,18 @@ def test_ordinary_text_is_not_mistaken_for_numeric_claim():
     check("Выбрать ремонт по состоянию оборудования и повторным отказам.")
 
 
-def test_coverage_and_other_case_cannot_whitelist_written_amount():
-    evidence = {"source_id": "synthetic", "date": "2030-01-01",
-                "locator": "chars:0-4", "attribution": "interpretation",
-                "sha256": "a" * 64, "reference": "synthetic:chars:0-4"}
-    context = {"version": "v1", "corpus_version": "c1", "interests": [{
-        "id": "repeat", "requirement": "Другая встреча: пятнадцать рублей",
-        "attributions": ["interpretation"], "evidence": [evidence]}]}
-    coverage = {"coverage_version": 1, "generation": {"run_id": "gen-1"},
-                "routes": [{"capability_id": "repairs", "availability": "available",
-                            "missing_evidence": [], "source_references": ["ledger:repairs"],
-                            "tables": {"repairs": {"count": 15}}}]}
-    card = {"number": 1, "capability_id": "repairs",
-            "management_question": "Почему повторяются ремонты насосов?",
-            "decision": "Экономия составила пятнадцать рублей.",
-            "scope": "насосы", "metrics_method": "Проверить эпизоды",
-            "meeting_interest": {"interest_id": "repeat"},
-            "source_references": ["ledger:repairs"], "source_readiness": "available",
-            "missing_evidence": [], "falsification": "Повторы не отличаются от базы",
-            "hard_questions": ["Как определён эпизод?"], "analyst_brief": "Проверить данные",
-            "novelty": "unknown", "ranking": {"utility": 3, "feasibility": 3,
-                                                   "interest": 3, "novelty": 0}}
-    cards = [dict(copy.deepcopy(card), number=n) for n in range(1, 6)]
-    with pytest.raises(ValueError, match="(?i)numerical|numeric|числ"):
-        pilot.generate_pilot(scope="Проверить ремонты насосов", knowledge_version="k1",
+def test_coverage_and_other_case_cannot_whitelist_written_amount(inputs, cards):
+    context = copy.deepcopy(inputs['interest_context'])
+    other = copy.deepcopy(context['interests'][0])
+    other['id'] = 'other-case'
+    other['requirement'] = 'Другая встреча: пятнадцать рублей'
+    other['evidence'][0].pop('fragment', None)
+    context['interests'].append(other)
+    coverage = copy.deepcopy(inputs['coverage'])
+    coverage['routes'][0]['tables'] = {'repairs': {'count': 15}}
+    cards[0]['decision'] = 'Экономия составила пятнадцать рублей.'
+    with pytest.raises(ValueError, match='(?i)numerical|numeric|числ'):
+        pilot.generate_pilot(scope='Проверить ремонты насосов', knowledge_version='k1',
                              interest_context=context, coverage_provider=lambda: coverage,
                              generator=lambda _: project_cards(copy.deepcopy(cards)),
                              **projection(context))

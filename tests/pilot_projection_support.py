@@ -7,12 +7,16 @@ def projection(context):
     labels, audit = [], []
     for item in context['interests']:
         evidence = (item['evidence'] or [{'source_id': 'missing', 'locator': 'chars:0-1'}])[0]
-        labels.append({'interest_id': item['id'], 'topic_id': TOPIC, 'description': LABEL})
-        audit.append({'interest_id': item['id'], 'topic_id': TOPIC,
-                      'source_id': evidence['source_id'], 'locator': evidence['locator'],
-                      'verdict': {'supported': True, 'confidence': 'high'}})
+        for topic, label, patterns in _TOPICS:
+            from tof_reliability.vitaly_bot.hypotheses_topic_projection import _matches
+            if _matches(item['requirement'], patterns) and _matches(evidence.get('fragment', item['requirement']), patterns):
+                labels.append({'interest_id': item['id'], 'topic_id': topic, 'description': label})
+                audit.append({'interest_id': item['id'], 'topic_id': topic,
+                              'source_id': evidence['source_id'], 'locator': evidence['locator'],
+                              'verdict': {'supported': True, 'confidence': 'high'}})
     return {'verified_labels': labels, 'verifier_audit': audit,
             'private_verifier': lambda _: {'supported': True, 'confidence': 'high'}}
+
 
 def project_cards(cards):
     for card in cards:

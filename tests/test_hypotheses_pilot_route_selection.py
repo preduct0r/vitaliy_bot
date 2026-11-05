@@ -7,44 +7,19 @@ import pytest
 from pilot_projection_support import LABEL, TOPIC, distinct_directions, project_cards, projection
 
 from tof_reliability.vitaly_bot import hypotheses_pilot as pilot
+from test_hypotheses_pilot import inputs as legacy_inputs, cards as legacy_cards
 
 
 @pytest.fixture
 def inputs():
-    evidence = {
-        "source_id": "meeting-a", "date": "2026-10-01",
-        "locator": "chars:0-4", "attribution": "interpretation",
-        "sha256": "a" * 64, "reference": "meeting-a:chars:0-4",
-    }
-    interests = {"version": "interests-1", "corpus_version": "corpus-1", "interests": [
-        {"id": "repeat", "requirement": "Проверить повторы",
-         "attributions": ["interpretation"], "evidence": [evidence]},
-    ]}
-    coverage = {"coverage_version": 1, "generation": {"run_id": "gen-1"}, "routes": [
-        {"capability_id": "repair-episodes", "availability": "partial",
-         "missing_evidence": ["связь заказов с эпизодами"],
-         "source_references": ["ledger:repairs"]},
-        {"capability_id": "repair-list", "availability": "available",
-         "missing_evidence": [], "source_references": ["ledger:repairs", "ledger:orders"]},
-        {"capability_id": "scenario-effect", "availability": "unavailable",
-         "missing_evidence": ["методика сценария"],
-         "source_references": ["capability:scenario-effect"]},
-    ]}
-    cards = [{
-        "number": n, "capability_id": "repair-episodes",
-        "management_question": f"Как проверить повторы {chr(1040 + n)}?",
-        "decision": "Выбрать проверку", "scope": "насосы",
-        "metrics_method": "Проверить ключи эпизодов",
-        "meeting_interest": {"interest_id": "repeat", "attribution": "interpretation",
-                             "reference": evidence["reference"]},
-        "source_references": ["ledger:repairs"], "source_readiness": "partial",
-        "missing_evidence": ["связь заказов с эпизодами"],
-        "falsification": "Повторы не отличаются от базового уровня",
-        "hard_questions": ["Как определён эпизод?"],
-        "analyst_brief": "Проверить ключи", "novelty": "unknown",
-        "ranking": {"utility": 5, "feasibility": 3, "interest": 4, "novelty": 0},
-    } for n in range(1, 6)]
-    return interests, coverage, distinct_directions(cards)
+    data = legacy_inputs.__wrapped__()
+    coverage = data['coverage']
+    for route in coverage['routes']:
+        route['missing_evidence'] = ['связь заказов с эпизодами']
+    coverage['routes'][1]['source_references'].append('ledger:orders')
+    coverage['routes'].append({'capability_id': 'AN-TECHCARD-LABOR', 'availability': 'unavailable',
+                               'missing_evidence': ['методика'], 'source_references': []})
+    return data['interest_context'], coverage, legacy_cards.__wrapped__()
 
 
 def generate(interests, coverage, cards):
@@ -59,11 +34,12 @@ def generate(interests, coverage, cards):
 def test_shared_table_uses_selected_route_and_preserves_meeting_reference(inputs):
     interests, coverage, cards = inputs
     run = generate(interests, coverage, cards)
-    assert all(card["capability_id"] == "repair-episodes" for card in run["cards"])
+    assert [card["capability_id"] for card in run["cards"]] == [card["capability_id"] for card in cards]
     assert all(card["source_readiness"] == "partial" for card in run["cards"])
     assert all(card["missing_evidence"] == ["связь заказов с эпизодами"] for card in run["cards"])
-    expected = {"interest_id": "repeat", "topic_id": TOPIC, **interests["interests"][0]["evidence"][0]}
-    assert all(card["meeting_interest"] == expected for card in run["cards"])
+    for card in run["cards"]:
+        item = next(i for i in interests["interests"] if i["id"] == card["meeting_interest"]["interest_id"])
+        assert all(card["meeting_interest"][k] == v for k, v in item["evidence"][0].items() if k != "fragment")
     pilot.validate_pilot(run, coverage=coverage, interest_context=interests)
 
 

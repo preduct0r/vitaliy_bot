@@ -33,7 +33,8 @@ def report(inputs):
     evidence = inputs["interest_context"]["interests"][0]["evidence"][0]
     return {"verified": True, "corpus_version": "corpus-1",
             "interest_version": "interests-1",
-            "checks": [{**evidence, "interest_id": "repeat", "verified": True}]}
+            "checks": [{**e, "interest_id": item["id"], "verified": True}
+                       for item in inputs["interest_context"]["interests"] for e in item["evidence"]]}
 
 
 @pytest.mark.parametrize("claim", [
