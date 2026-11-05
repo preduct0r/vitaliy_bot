@@ -369,3 +369,108 @@ def dimensions_for_generator(projection: Mapping[str, Any]) -> dict:
         rows.append({"dimension_id": dim, "topic_id": catalog[dim][0],
                      "description": catalog[dim][1], "interest_ids": list(ids), "source_ids": list(sources)})
     return {"version": version, "dimensions": rows}
+
+
+ADJUDICATED_DIMENSION_VERSION = "repair-analytics-dimensions.v2-adjudicated.v1"
+_CATALOGS[ADJUDICATED_DIMENSION_VERSION] = _DIMENSIONS
+
+
+def adjudicate_conflicts(*, profile: Mapping[str, Any], source_index: Mapping[str, Any],
+                         original_projection: Mapping[str, Any], original_verdicts: list,
+                         original_candidates: list, adjudications: Mapping[str, Any]) -> dict:
+    """Replay a pinned projection and release only separately supported links.
+
+    The caller must obtain the review artifacts from a trusted private archive;
+    hashes establish consistency, not authorship or independence by themselves.
+    """
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()
+
+    def key(row):
+        return tuple(row[k] for k in ("interest_id", "dimension_id", "source_id", "locator"))
+
+    try:
+        if adjudications["version"] != "conflict-adjudication.v1":
+            raise ValueError("unsupported adjudication version")
+        for name, value in (("profile", profile), ("index", source_index),
+                            ("projection", original_projection), ("verdicts", original_verdicts),
+                            ("candidates", original_candidates)):
+            if adjudications[name + "_sha256"] != digest(value):
+                raise ValueError("adjudication generation mismatch")
+        if original_projection["version"] != DIMENSION_VERSION:
+            raise ValueError("unsupported original projection")
+        candidates = {key(c): c for c in original_candidates}
+        verdicts = {key(v): v for v in original_verdicts}
+        if (len(candidates) != len(original_candidates) or len(verdicts) != len(original_verdicts)
+                or candidates.keys() != verdicts.keys()):
+            raise ValueError("candidate and verdict identity mismatch")
+        evidence = {(i["id"], e["source_id"], e["locator"]): e
+                    for i in profile["interests"] for e in i["evidence"]}
+        sources = {s["id"]: s for s in source_index["sources"]}
+
+        def replay(resolved):
+            def classifier(_):
+                return original_candidates
+            def verifier(request):
+                e = request["evidence"]
+                k = (request["interest_id"], request["dimension_id"], e["source_id"], e["locator"])
+                verdict = dict(verdicts[k]["verdict"])
+                if k in resolved:
+                    verdict["conflicting"] = False
+                return verdict
+            return project_semantic_dimensions(profile, source_index, classifier=classifier, verifier=verifier)
+
+        if replay(set()) != original_projection:
+            raise ValueError("original projection does not match candidates and verdicts")
+        resolved = set()
+        for decision in adjudications["decisions"]:
+            k = key(decision)
+            if k in resolved or k not in verdicts or verdicts[k]["verdict"].get("conflicting") is not True:
+                raise ValueError("duplicate or non-conflict decision")
+            item = evidence[(k[0], k[2], k[3])]
+            if (decision["original_verdict_sha256"] != digest(verdicts[k])
+                    or decision["fragment_sha256"] != hashlib.sha256(item["fragment"].encode()).hexdigest()
+                    or decision["source_sha256"] != sources[k[2]]["sha256"]):
+                raise ValueError("decision evidence mismatch")
+            reviews = decision["reviews"]
+            if len(reviews) != 2:
+                raise ValueError("two reviews required")
+            for field in ("run_id", "prompt_id", "trace_sha256"):
+                if any(not isinstance(r[field], str) or not r[field] for r in reviews) or reviews[0][field] == reviews[1][field]:
+                    raise ValueError("reviews must have independent identities")
+            for review in reviews:
+                if review["decision"] != "no":
+                    raise ValueError("conflict not independently resolved")
+                for field in ("prompt", "trace"):
+                    if not isinstance(review[field], str) or not review[field] or hashlib.sha256(review[field].encode()).hexdigest() != review[field + "_sha256"]:
+                        raise ValueError("review artifact hash mismatch")
+                prompt = review["prompt"]
+                prompt_data = json.loads(prompt if prompt.startswith("{") else prompt.rsplit(" Data: ", 1)[1])
+                entries = prompt_data.get("evidence", [prompt_data])
+                if not any(e.get("source_id") == k[2] and e.get("locator") == k[3]
+                           and e.get("fragment") == item["fragment"] for e in entries):
+                    raise ValueError("review prompt does not contain exact evidence")
+                if "review_keys" in prompt_data and sum(
+                    r.get("source_id") == k[2] and r.get("locator") == k[3]
+                    for r in prompt_data["review_keys"]
+                ) != 1:
+                    raise ValueError("review prompt does not request this decision")
+                events = [json.loads(line) for line in review["trace"].splitlines() if line.strip()]
+                threads = [e["thread_id"] for e in events if e.get("type") == "thread.started"]
+                messages = [e["item"]["text"] for e in events if e.get("type") == "item.completed"
+                            and e.get("item", {}).get("type") == "agent_message"]
+                if threads != [review["run_id"]] or len(messages) != 1:
+                    raise ValueError("review trace identity mismatch")
+                rows = json.loads(messages[0])["verdicts"]
+                matching = [v for v in rows if v.get("source_id") == k[2] and v.get("locator") == k[3]]
+                if len(matching) != 1 or matching[0].get("conflict_status") != "no":
+                    raise ValueError("review trace decision mismatch")
+            resolved.add(k)
+        result = replay(resolved)
+        result["version"] = ADJUDICATED_DIMENSION_VERSION
+        result["adjudication_sha256"] = digest(adjudications)
+        result["original_projection_sha256"] = digest(original_projection)
+        return result
+    except (KeyError, IndexError, TypeError, AttributeError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid adjudication or source artifacts") from exc
