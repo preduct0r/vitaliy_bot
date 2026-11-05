@@ -33,7 +33,7 @@ def prepare_fresh_batches(*, index, chunks, source_texts, batch_size):
         source = sources[sid]
         if date.fromisoformat(source['date']) >= CUTOFF:
             continue
-        if source.get('kind', 'transcript') != 'transcript':
+        if source.get('kind', 'transcript') not in ('transcript', 'baseline'):
             continue
         cid = chunk.get('id') or f"{sid}:{chunk['start']}:{chunk['end']}:{chunk['sha256']}"
         if cid in seen:
