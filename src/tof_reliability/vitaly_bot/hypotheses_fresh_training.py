@@ -8,15 +8,29 @@ from pathlib import Path
 
 from .hypotheses_extract_runner import _write
 
-CUTOFF = date(2026, 10, 26)
-VERSION = 'fresh-training-v1'
+CUTOFF = date(2026, 9, 17)
+OCTOBER_CUTOFF = date(2026, 10, 26)
+VERSION = 'fresh-training-v2'
+
+
+def cutoff_contract(cutoff):
+    if type(cutoff) is not date or cutoff not in (CUTOFF, OCTOBER_CUTOFF):
+        raise ValueError('unsupported training cutoff version')
+    return {'version': VERSION, 'cutoff': cutoff.isoformat()}
+
+
+def check_cutoff_contract(state, cutoff):
+    contract = cutoff_contract(cutoff)
+    if any(state.get(key) != value for key, value in contract.items()):
+        raise ValueError('fresh checkpoint or manifest cutoff provenance mismatch')
 
 
 def _hash(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
-def prepare_fresh_batches(*, index, chunks, source_texts, batch_size):
+def prepare_fresh_batches(*, index, chunks, source_texts, batch_size, cutoff=CUTOFF):
+    cutoff_contract(cutoff)
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError('positive batch size required')
     sources = {}
@@ -31,7 +45,7 @@ def prepare_fresh_batches(*, index, chunks, source_texts, batch_size):
         if sid not in sources:
             raise ValueError('unknown source')
         source = sources[sid]
-        if date.fromisoformat(source['date']) >= CUTOFF:
+        if date.fromisoformat(source['date']) >= cutoff:
             continue
         if source.get('kind', 'transcript') not in ('transcript', 'baseline'):
             continue
@@ -93,18 +107,21 @@ def _validated(result, batch, source_texts):
 
 
 def run_fresh_extraction(*, index, chunks, source_texts, checkpoint_path, batch_size, check_queues, invoke,
-                         validate_trace=None):
-    batches = prepare_fresh_batches(index=index, chunks=chunks, source_texts=source_texts, batch_size=batch_size)
+                         validate_trace=None, cutoff=CUTOFF):
+    contract = cutoff_contract(cutoff)
+    batches = prepare_fresh_batches(index=index, chunks=chunks, source_texts=source_texts,
+                                    batch_size=batch_size, cutoff=cutoff)
     if not batches:
         raise ValueError('no verified training chunks')
     path = Path(checkpoint_path)
     if path.exists():
         state = json.loads(path.read_text(encoding='utf-8'))
-        if (state.get('version') != VERSION or state.get('batches') != batches
+        check_cutoff_contract(state, cutoff)
+        if (state.get('batches') != batches
                 or not isinstance(state.get('results'), dict)):
             raise ValueError('fresh checkpoint provenance mismatch')
     else:
-        state = {'version': VERSION, 'batches': batches, 'results': {}}
+        state = {**contract, 'batches': batches, 'results': {}}
         _write(path, state)
     results = state['results']
     if any(not key.isdigit() or int(key) >= len(batches) or str(int(key)) != key for key in results):

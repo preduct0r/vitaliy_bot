@@ -6,18 +6,28 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from datetime import date
 
 from scripts.hypotheses_extract_training import invoke_factory, production_idle
 from tof_reliability.vitaly_bot.hypotheses_extract_runner import _write, parse_trace
-from tof_reliability.vitaly_bot.hypotheses_fresh_training import CUTOFF, prepare_fresh_batches, run_fresh_extraction
-from datetime import date
+from tof_reliability.vitaly_bot.hypotheses_fresh_training import (
+    CUTOFF, OCTOBER_CUTOFF, check_cutoff_contract, cutoff_contract,
+    prepare_fresh_batches, run_fresh_extraction,
+)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--index-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--cutoff', type=date.fromisoformat, choices=(CUTOFF, OCTOBER_CUTOFF),
+                        default=CUTOFF, help='exclusive training cutoff (default: 2026-09-17)')
     args = parser.parse_args()
+    # Reject incompatible or unversioned artifacts before touching any user files.
+    for name in ('coverage-manifest.json', 'fresh-checkpoint.json'):
+        existing = args.output / name
+        if existing.exists():
+            check_cutoff_contract(json.loads(existing.read_text()), args.cutoff)
     args.output.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(args.output, 0o700)
     check = subprocess.run(['git', '-C', str(args.output), 'rev-parse', '--is-inside-work-tree'],
@@ -39,7 +49,7 @@ def main():
             raise ValueError('duplicate source identity in reconciled inventory')
         seen_ids.add(sid)
         if (row.get('status') != 'accepted' or row.get('kind') not in ('baseline', 'transcript')
-                or date.fromisoformat(row['date']) >= CUTOFF):
+                or date.fromisoformat(row['date']) >= args.cutoff):
             continue
         digest = row.get('sha256')
         if not isinstance(digest, str) or len(digest) != 64:
@@ -59,7 +69,7 @@ def main():
         originals[row['id']] = original
     ids = {row['id'] for row in training}
     selected = [chunk for chunk in chunks if chunk['source_id'] in ids]
-    manifest = {'expected': {'sources': len(groups), 'chunks': len(selected)},
+    manifest = {**cutoff_contract(args.cutoff), 'expected': {'sources': len(groups), 'chunks': len(selected)},
                 'found': {'sources': 0, 'chunks': 0},
                 'missing': {'sources': missing_sources + sorted(ids),
                             'chunks': [c.get('id') or f"{c['source_id']}:{c['start']}:{c['end']}:{c['sha256']}"
@@ -110,7 +120,7 @@ def main():
         manifest['missing']['chunks'].extend(gaps)
         save_manifest()
         raise ValueError('source chunk coverage missing or overlapping')
-    prepare_fresh_batches(index={'sources': training}, chunks=selected, source_texts=texts, batch_size=1)
+    prepare_fresh_batches(index={'sources': training}, chunks=selected, source_texts=texts, batch_size=1, cutoff=args.cutoff)
     manifest['missing']['chunks'] = []
     manifest['found'] = {'sources': len(training), 'chunks': len(selected)}
     save_manifest()
@@ -124,7 +134,7 @@ def main():
         return {'trace': trace, 'themes': parse_trace(trace)['themes']}
     result = run_fresh_extraction(index={'sources': training}, chunks=selected, source_texts=texts,
                                   checkpoint_path=args.output / 'fresh-checkpoint.json', batch_size=1,
-                                  check_queues=queues, invoke=invoke, validate_trace=parse_trace)
+                                  check_queues=queues, invoke=invoke, validate_trace=parse_trace, cutoff=args.cutoff)
     manifest['processed_chunks'] = len(result['coverage'])
     save_manifest()
     _write(args.output / 'fresh-extraction.json', result)

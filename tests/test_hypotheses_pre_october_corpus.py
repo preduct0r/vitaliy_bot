@@ -2,6 +2,7 @@
 import hashlib
 import json
 import sys
+from datetime import date
 
 import pytest
 
@@ -23,7 +24,7 @@ def test_cutoff_is_strictly_before_october_26(day, included):
     source = {'id': 's', 'date': day, 'kind': 'baseline', 'sha256': digest(text)}
     chunk = {'id': 'c', 'source_id': 's', 'start': 0, 'end': len(text), 'sha256': digest(text)}
     batches = fresh.prepare_fresh_batches(index={'sources': [source]}, chunks=[chunk],
-                                          source_texts={'s': text}, batch_size=1)
+                                          source_texts={'s': text}, batch_size=1, cutoff=date(2026, 10, 26))
     assert bool(batches) is included
 
 
@@ -67,7 +68,7 @@ def test_cli_includes_all_accepted_sources_and_chunks_without_evaluation_leakage
     monkeypatch.setattr(cli, 'production_idle', lambda: None)
     monkeypatch.setattr(cli, 'invoke_factory', lambda *_: lambda prompt: prompts.append(prompt) or 'trace')
     monkeypatch.setattr(cli, 'parse_trace', lambda _: {'themes': []})
-    monkeypatch.setattr(sys, 'argv', ['fresh', '--index-dir', str(directory), '--output', str(output)])
+    monkeypatch.setattr(sys, 'argv', ['fresh', '--index-dir', str(directory), '--output', str(output), '--cutoff', '2026-10-26'])
     cli.main()
     expected = {s['id'] for s in sources if s['date'] < '2026-10-26'}
     expected_chunks = {c['id'] for c in chunks if c['source_id'] in expected}
@@ -89,6 +90,6 @@ def test_missing_late_chunk_blocks_every_model_call(inventory, tmp_path, monkeyp
     (directory / 'chunk-index-v2.json').write_text(json.dumps(chunks))
     monkeypatch.setattr(cli, 'production_idle', lambda: pytest.fail('must validate coverage before model calls'))
     monkeypatch.setattr(cli, 'invoke_factory', lambda *_: pytest.fail('must not initialize model'))
-    monkeypatch.setattr(sys, 'argv', ['fresh', '--index-dir', str(directory), '--output', str(tmp_path / 'out')])
+    monkeypatch.setattr(sys, 'argv', ['fresh', '--index-dir', str(directory), '--output', str(tmp_path / 'out'), '--cutoff', '2026-10-26'])
     with pytest.raises(ValueError, match='(?i)chunk|coverage|missing'):
         cli.main()
