@@ -373,6 +373,11 @@ _ORDINAL_CLAIM = re.compile(
     r'семнадцат|восемнадцат|девятнадцат|двадцат|тридцат|сороков|сот|тысячн|миллионн)'
     r'(?:ый|ий|ой|ая|яя|ое|ее|ые|ие|ого|его|ому|ему|ым|им|ую|юю|ых|их|ыми|ими|ом|ем|ою|ею)\b', re.I)
 _ROMAN_CLAIM = re.compile(r'(?<![\w])[IVXLCDM]+(?![\w])')
+_INTERROGATIVE_START = re.compile(
+    r'^\s*(?:как|что|чем|почему|зачем|где|когда|можно\s+ли|может\s+ли|'
+    r'является\s+ли|следует\s+ли|стоит\s+ли|верно\s+ли)\b', re.I)
+_SINGULAR_REPAIR_REFERENCE = re.compile(
+    r'(\bпродолжени[а-яё]*\s+)одного(\s+ремонта\b)', re.I)
 
 
 def _case_statement(value):
@@ -386,16 +391,28 @@ def _validate_numeric_claims(card, scope, *, reject_roman=False):
     # No coverage metadata proves a case-scoped numeric ledger fact. Require
     # the entire numeric field to reproduce the current request exactly;
     # matching individual numbers cannot establish their units or context.
-    prose = [card.get(k, '') for k in TEXT_FIELDS] + sum((card.get(k, []) for k in ('hard_questions',) if isinstance(card.get(k), list)), [])
-    prose = [v for v in prose if isinstance(v, str)]
+    fields = [(key, card.get(key, '')) for key in TEXT_FIELDS]
+    hard_questions = card.get('hard_questions')
+    if isinstance(hard_questions, list):
+        fields.extend(('hard_questions', value) for value in hard_questions)
+    fields = [(key, value) for key, value in fields if isinstance(value, str)]
+    prose = [value for _, value in fields]
     if not isinstance(scope, str):
         raise ValueError('scope must be text')
     if reject_roman and any(_ROMAN_CLAIM.search(value) for value in prose):
         raise ValueError('unsupported numerical value')
-    if any((_NUMERIC_CLAIM.search(value) or _ORDINAL_CLAIM.search(value) or _ROMAN_CLAIM.search(value))
-           and _case_statement(value) != _case_statement(scope)
-           for value in prose):
-        raise ValueError('unsupported numerical value')
+    for key, value in fields:
+        numeric_text = value
+        # In this narrow interrogative construction, "одного ремонта" names
+        # the repair being discussed. Other numeric content in the question
+        # remains subject to the ordinary whole-statement scope check.
+        if (key == 'management_question' and value.rstrip().endswith('?')
+                and _INTERROGATIVE_START.search(value)):
+            numeric_text = _SINGULAR_REPAIR_REFERENCE.sub(r'\1\2', value)
+        if ((_NUMERIC_CLAIM.search(numeric_text) or _ORDINAL_CLAIM.search(numeric_text)
+             or _ROMAN_CLAIM.search(numeric_text))
+                and _case_statement(value) != _case_statement(scope)):
+            raise ValueError('unsupported numerical value')
 
 
 def _validate_card_content(card, scope, topic, private_interests, verifier):
