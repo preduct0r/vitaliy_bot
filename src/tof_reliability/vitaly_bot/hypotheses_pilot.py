@@ -892,7 +892,14 @@ def _dimension_bindings(projection, interests, coverage):
             evidence = [e for e in by_id[ident]['evidence'] if all(e.get(k) == entry.get(k) for k in ('source_id', 'locator', 'attribution'))]
             if len(evidence) != 1:
                 raise ValueError('dimension evidence is not bound to current interest')
-            bindings.setdefault((ident, dim), evidence[0])
+            key = (ident, dim)
+            # Stable across projection ordering; the same exact binding is used
+            # for model metadata, the attached citation, and independent review.
+            # Attribution is sorted first, then the source coordinates.
+            order = lambda e: tuple(e.get(k, '') for k in
+                                    ('attribution', 'source_id', 'locator', 'reference', 'sha256'))
+            if key not in bindings or order(evidence[0]) < order(bindings[key]):
+                bindings[key] = evidence[0]
     return bindings
 
 
@@ -1089,6 +1096,8 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
                          'attributions': sorted({e['attribution'] for e in rows[dim]['evidence']}),
                          'attribution_meeting_counts': copy.deepcopy(rows[dim].get('attribution_meeting_counts', {})),
                          'interest_ids': sorted(ident for ident, d in bindings if d == dim),
+                         'interest_attributions': {ident: bindings[(ident, dim)]['attribution']
+                                                   for ident, d in sorted(bindings) if d == dim},
                          'missing_evidence': DIMENSION_MISSING.get(dim, [])} for dim in sorted(eligible)]
     safe_routes = [{k: copy.deepcopy(r[k]) for k in ('capability_id', 'route_id', 'availability', 'missing_evidence') if k in r}
                    | {'source_references': sorted(_references(r))} for r in routes.values()]
@@ -1096,7 +1105,9 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
                'coverage': {'generation_id': coverage['generation']['run_id'], 'routes': safe_routes},
                'eligible_dimension_routes': {dim: sorted(_topic_routes(catalog[dim][0]) & available) for dim in sorted(eligible)},
                'instructions': ('Предложите до 12 разных кандидатов (не менее пяти), чтобы после независимой проверки осталось 5–7. '
-                                'Приоритет: повторяющиеся подтверждённые потребности, полезные различные решения; интерпретация и пересказ третьего лица не прямой запрос. Общий счёт встреч включает все виды атрибуции; только attribution_meeting_counts отдельно считает встречи по каждому виду. '
+                                'Приоритет: повторяющиеся подтверждённые потребности, полезные различные решения; интерпретация и пересказ третьего лица не прямой запрос. '
+                                'Для выбранной пары dimension_id и interest_id описывайте только атрибуцию соответствующей выбранной привязки из interest_attributions; не приписывайте ей другие виды. '
+                                'independent_meeting_count, attributions и attribution_meeting_counts — общие агрегаты по встречам измерения, не атрибуция выбранной привязки. Виды могут пересекаться на одной встрече; не суммируйте их как число встреч. '
                                 'Недоступные источники допускаются только как исследование отсутствующих данных без результата или расчёта. '
                                 'Используйте только указанные измерения, интересы и маршруты. Сохраните область запроса. '
                                 'Не утверждайте факты, значения, прошлые события и эффект сценария; эффект сценария только как планируемое исследование. '
