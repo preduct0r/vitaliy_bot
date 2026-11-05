@@ -816,16 +816,30 @@ def reconcile_dimension_projections(*, profile, source_index, v1_projection, v1_
         raise ValueError('invalid private projection or source corpus') from exc
 
 
-def bind_expanded_projection(*, profile, source_index, projection):
+def bind_expanded_projection(*, profile, source_index, projection, original_projection=None,
+                             original_verdicts=None, original_candidates=None, adjudications=None):
     """Bind an independently audited expanded projection to its exact corpus.
 
     This checks provenance and counts; the caller must retain and verify the
     independent semantic audit that produced the projection.
     """
     from .hypotheses_interests import assess_provenance
-    from .hypotheses_topic_projection import DIMENSION_VERSION
+    from .hypotheses_topic_projection import (DIMENSION_VERSION, ADJUDICATED_DIMENSION_VERSION,
+                                               adjudicate_conflicts)
     try:
-        if (projection['version'] != DIMENSION_VERSION or projection['profile_sha256'] != _digest(profile)
+        if projection['version'] == ADJUDICATED_DIMENSION_VERSION:
+            replayed = adjudicate_conflicts(profile=profile, source_index=source_index,
+                                            original_projection=original_projection,
+                                            original_verdicts=original_verdicts,
+                                            original_candidates=original_candidates,
+                                            adjudications=adjudications)
+            if replayed != projection:
+                raise ValueError('adjudicated projection does not match audit')
+        elif projection['version'] != DIMENSION_VERSION or any(
+                value is not None for value in (original_projection, original_verdicts,
+                                                 original_candidates, adjudications)):
+            raise ValueError('unsupported projection or unexpected audit')
+        if (projection['profile_sha256'] != _digest(profile)
                 or projection['index_sha256'] != _digest(source_index)
                 or projection['profile_version'] != profile['version']
                 or projection['corpus_version'] != source_index['version']
