@@ -17,7 +17,7 @@ from typing import Any, Mapping
 
 from .hypotheses_interests import ATTRIBUTIONS
 from .hypotheses_topic_projection import _TOPICS
-from .models import ModelError
+from .models import InsufficientCandidatesError, ModelError
 
 TEXT_FIELDS = ('management_question', 'decision', 'scope', 'metrics_method',
                'falsification', 'analyst_brief', 'novelty')
@@ -1007,7 +1007,7 @@ def _balanced_dimension_selection(cards, rows):
     return selected
 
 
-def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=None, trusted_store=None, candidate_pool=False):
+def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=None, trusted_store=None, candidate_pool=False, single_candidate=False):
     from .hypotheses_topic_projection import _CATALOGS, DIMENSION_VERSION
     trusted_scope = _trusted_scope(trusted_context, trusted_store, run)
     interests = _interests(interest_context)
@@ -1020,7 +1020,7 @@ def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=
     routes = (_dimension_routes(coverage) if run.get('pilot_version') == EVIDENCE_PILOT_VERSION
               else {r['capability_id']: r for r in coverage['routes']})
     cards = run.get('cards')
-    if not isinstance(cards, list) or not 5 <= len(cards) <= (MAX_CANDIDATES if candidate_pool else 7):
+    if not isinstance(cards, list) or not (1 if single_candidate else 5) <= len(cards) <= (MAX_CANDIDATES if candidate_pool else 7):
         raise ValueError('invalid candidate pool or fewer than five cards')
     seen_dim, seen_decisions, seen_methods = set(), set(), set()
     for n, card in enumerate(cards, 1):
@@ -1082,7 +1082,7 @@ def _validate_dimension_run(run, *, coverage, interest_context, trusted_context=
 
 def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dimension_projection,
                              coverage_provider, generator, private_verifier,
-                             trusted_context=None, trusted_store=None, result_metadata=None):
+                             trusted_context=None, trusted_store=None, result_metadata=None, candidate_check=None):
     from .hypotheses_topic_projection import _CATALOGS, DIMENSION_VERSION
     _text(knowledge_version, 'knowledge version')
     if not isinstance(scope, str):
@@ -1157,47 +1157,68 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
            'cards': copy.deepcopy(cards)}
     if trusted_context is not None:
         run['request_binding'] = trusted_context.token
-    for number, card in enumerate(run['cards'], 1):
-        if not isinstance(card, dict) or not isinstance(card.get('meeting_interest'), dict):
-            raise ValueError('invalid card')
-        if (trusted_context is not None and scope == ''
-                and isinstance(card.get('scope'), str) and not card['scope'].strip()):
-            card['scope'] = 'Периметр не задан; предложить периметр при планировании'
-        meeting = card['meeting_interest']
-        key = (meeting.get('interest_id'), meeting.get('dimension_id'))
-        dim = key[1]
-        if key not in bindings or dim not in eligible or meeting.get('topic_id') != catalog[dim][0]:
-            raise ValueError('invalid dimension selection')
-        route = routes.get(card.get('capability_id'))
-        if route is None or route['capability_id'] not in available or route['capability_id'] not in _topic_routes(meeting['topic_id']):
-            raise ValueError('invalid route')
-        supplied = {k: meeting[k] for k in bindings[key] if k in meeting}
-        if any(bindings[key][k] != v for k, v in supplied.items()):
-            raise ValueError('invalid supplied attribution')
-        card['meeting_interest'] = {'interest_id': key[0], 'topic_id': catalog[dim][0], 'dimension_id': dim, **bindings[key]}
-        card['number'] = number
-        card['source_readiness'] = route['availability']
-        proposed_missing = card.get('missing_evidence')
-        if not isinstance(proposed_missing, list) or any(not isinstance(x, str) or not x.strip() for x in proposed_missing):
-            raise ValueError('invalid proposed missing evidence')
-        missing_check = dict(card, hard_questions=proposed_missing)
-        _validate_numeric_claims(missing_check, scope, reject_roman=True)
-        allowed = set(re.findall(r'[\w-]+', scope.casefold()))
-        private_tokens = {t.casefold() for item in interests['interests'] for value in item.values()
-                          if isinstance(value, str) for t in re.findall(r'[A-ZА-ЯЁ_]{4,}', value)
-                          if t.casefold() not in allowed}
-        if any(token in ' '.join(proposed_missing).casefold() for token in private_tokens):
-            raise ValueError('private source token in missing evidence')
-        card['missing_evidence'] = list(dict.fromkeys([*proposed_missing, *route['missing_evidence'], *DIMENSION_MISSING.get(dim, [])]))
-    _validate_dimension_run(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store, candidate_pool=True)
-    accepted, rejected = [], []
-    for card in run['cards']:
-        prose = ' '.join([card[k] for k in TEXT_FIELDS] + card['hard_questions'])
-        if re.search(r'\b(?:компани\w*|гарантированно|сценари\w*\s+(?:снизит|повысит|сократит))\b', prose, re.I):
-            raise ValueError('unsupported private fact or scenario effect')
+    # Validate each candidate in isolation before allowing it to influence
+    # independent review, duplicate detection, or case-material attribution.
+    prepared, rejected = [], []
+    for index, original in enumerate(run['cards']):
+        card = copy.deepcopy(original)
+        try:
+            if candidate_check is not None:
+                candidate_check(index)
+            if not isinstance(card, dict) or not isinstance(card.get('meeting_interest'), dict):
+                raise ValueError('invalid card')
+            if (trusted_context is not None and scope == ''
+                    and isinstance(card.get('scope'), str) and not card['scope'].strip()):
+                card['scope'] = 'Периметр не задан; предложить периметр при планировании'
+            meeting = card['meeting_interest']
+            key = (meeting.get('interest_id'), meeting.get('dimension_id'))
+            dim = key[1]
+            if key not in bindings or dim not in eligible or meeting.get('topic_id') != catalog[dim][0]:
+                raise ValueError('invalid dimension selection')
+            route = routes.get(card.get('capability_id'))
+            if route is None or route['capability_id'] not in available or route['capability_id'] not in _topic_routes(meeting['topic_id']):
+                raise ValueError('invalid route')
+            supplied = {k: meeting[k] for k in bindings[key] if k in meeting}
+            if any(bindings[key][k] != v for k, v in supplied.items()):
+                raise ValueError('invalid supplied attribution')
+            card['meeting_interest'] = {'interest_id': key[0], 'topic_id': catalog[dim][0], 'dimension_id': dim, **bindings[key]}
+            card['number'] = 1
+            card['source_readiness'] = route['availability']
+            proposed_missing = card.get('missing_evidence')
+            if not isinstance(proposed_missing, list) or any(not isinstance(x, str) or not x.strip() for x in proposed_missing):
+                raise ValueError('invalid proposed missing evidence')
+            missing_check = dict(card, hard_questions=proposed_missing)
+            _validate_numeric_claims(missing_check, scope, reject_roman=True)
+            allowed = set(re.findall(r'[\w-]+', scope.casefold()))
+            private_tokens = {t.casefold() for item in interests['interests'] for value in item.values()
+                              if isinstance(value, str) for t in re.findall(r'[A-ZА-ЯЁ_]{4,}', value)
+                              if t.casefold() not in allowed}
+            if any(token in ' '.join(proposed_missing).casefold() for token in private_tokens):
+                raise ValueError('private source token in missing evidence')
+            card['missing_evidence'] = list(dict.fromkeys([*proposed_missing, *route['missing_evidence'], *DIMENSION_MISSING.get(dim, [])]))
+            one = dict(run, cards=[card])
+            _validate_dimension_run(one, coverage=coverage, interest_context=interests,
+                                    trusted_context=trusted_context, trusted_store=trusted_store,
+                                    candidate_pool=True, single_candidate=True)
+            prose = ' '.join([card[k] for k in TEXT_FIELDS] + card['hard_questions'])
+            if re.search(r'\b(?:компани\w*|гарантированно|сценари\w*\s+(?:снизит|повысит|сократит))\b', prose, re.I):
+                raise ValueError('unsupported private fact or scenario effect')
+            prepared.append((index, card))
+        except (ValueError, TypeError, KeyError) as error:
+            # Never store arbitrary model prose or untrusted exception values.
+            meeting = original.get('meeting_interest', {}) if isinstance(original, dict) else {}
+            dim = meeting.get('dimension_id') if isinstance(meeting, dict) else None
+            safe_dim = dim if isinstance(dim, str) and dim in catalog else None
+            reason = str(error) if isinstance(error, ValueError) else 'invalid candidate structure'
+            rejected.append({'dimension_id': safe_dim, 'reason': reason})
+
+    accepted, accepted_indices = [], {}
+    seen_dim, seen_decisions, seen_methods = set(), set(), set()
+    for index, card in prepared:
         dim = card['meeting_interest']['dimension_id']
         def verify_dimension(request):
             request['dimension_id'] = dim
+            request['candidate_index'] = index
             request['source_evidence'] = copy.deepcopy(bindings[(card['meeting_interest']['interest_id'], dim)])
             request['missing_evidence'] = list(card['missing_evidence'])
             selected_route = routes[card['capability_id']]
@@ -1208,17 +1229,32 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
             request['other_directions'] = [
                 {'dimension_id': other['meeting_interest']['dimension_id'],
                  'decision': other['decision'], 'metrics_method': other['metrics_method']}
-                for other in run['cards'] if other is not card]
+                for _, other in prepared if other is not card]
             request['description'] = catalog[dim][1]
             request['instructions'] += ' Проверьте соответствие точному измерению и различимость решения и метода; не подтверждайте старые факты или эффект сценария.'
             return private_verifier(request)
-        verdict = _validate_card_content(card, scope, card['meeting_interest']['topic_id'], interests, verify_dimension)
-        if verdict is None:
-            accepted.append(card)
-        else:
+        try:
+            verdict = _validate_card_content(card, scope, card['meeting_interest']['topic_id'], interests, verify_dimension)
+        except ValueError as error:
+            if str(error) == 'private verifier failed':
+                raise
+            rejected.append({'dimension_id': dim, 'reason': str(error)})
+            continue
+        if verdict is not None:
             rejected.append({'card': copy.deepcopy(card), 'verdict': verdict})
+            continue
+        decision = ' '.join(card['decision'].casefold().split()).strip(' .!?')
+        method = ' '.join(card['metrics_method'].casefold().split()).strip(' .!?')
+        if dim in seen_dim or decision in seen_decisions or method in seen_methods:
+            rejected.append({'dimension_id': dim, 'reason': 'duplicate dimension, decision or method'})
+            continue
+        seen_dim.add(dim)
+        seen_decisions.add(decision)
+        seen_methods.add(method)
+        accepted.append(card)
+        accepted_indices[id(card)] = index
     if len(accepted) < 5:
-        error = ValueError('fewer than five verified cards remain: ' + '; '.join(r['verdict']['reason'] for r in rejected))
+        error = InsufficientCandidatesError('fewer than five independently verified distinct candidates remain')
         error.rejected_cards = rejected
         raise error
     try:
@@ -1235,7 +1271,7 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
         run['rejected_cards'] = rejected
     _validate_dimension_run(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store)
     if result_metadata is not None:
-        metadata = result_metadata(copy.deepcopy(run))
+        metadata = result_metadata(copy.deepcopy(run), [accepted_indices[id(card)] for card in run['cards']])
         if not isinstance(metadata, dict):
             raise ValueError('invalid private result metadata')
         run['service_metadata'] = copy.deepcopy(metadata)

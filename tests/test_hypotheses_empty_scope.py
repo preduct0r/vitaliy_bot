@@ -101,12 +101,15 @@ def test_explicit_scope_requires_ordinary_scope_validation(setup_case, tmp_path)
     for card in cards:
         card['scope'] = trusted.scope
     cards[0]['scope'] = ''
+    cards[1]['scope'] = ''
     with pytest.raises(ValueError):
         generate(setup_case, cards=cards, scope=trusted.scope, trusted=trusted)
     cards[0]['scope'] = 'всё оборудование'
+    cards[1]['scope'] = 'всё оборудование'
     with pytest.raises(ValueError):
         generate(setup_case, cards=cards, scope=trusted.scope, trusted=trusted)
     cards[0]['scope'] = trusted.scope
+    cards[1]['scope'] = trusted.scope
     run, _, _ = generate(setup_case, cards=cards, scope=trusted.scope, trusted=trusted)
     assert all(c['scope'] == trusted.scope for c in run['cards'])
 
@@ -132,5 +135,7 @@ def test_empty_scope_does_not_hide_missing_coverage_or_invent_facts(setup_case):
         generate(setup_case, provider=unavailable)
     cards = copy.deepcopy(setup_case[3])
     cards[0]['analyst_brief'] = 'Компания СЕКРЕТ потратила 987654321 рублей.'
-    with pytest.raises(ValueError):
-        generate(setup_case, cards=cards)
+    run, _, _ = generate(setup_case, cards=cards)
+    assert len(run['cards']) == 5
+    assert all('987654321' not in card['analyst_brief'] for card in run['cards'])
+    assert run['rejected_cards']

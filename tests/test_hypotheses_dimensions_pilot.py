@@ -181,8 +181,10 @@ def test_generator_only_sees_curated_descriptions_not_private_evidence(dimension
 def test_reworded_or_generic_duplicate_does_not_become_a_distinct_dimension(dimension_case, field):
     cards = copy.deepcopy(dimension_case[3])
     cards[1][field] = cards[0][field]
-    with pytest.raises(ValueError):
-        generate(dimension_case, cards=cards)
+    run = generate(dimension_case, cards=cards)
+    assert cards[1]['meeting_interest']['dimension_id'] not in {c['meeting_interest']['dimension_id'] for c in run['cards']}
+    assert len(run['cards']) == 5
+    assert any('duplicate' in r.get('reason', '') for r in run['rejected_cards'])
 
 
 @pytest.mark.parametrize("damage", ["unavailable", "wrong_route", "unknown_dimension", "stale_generation"])
@@ -197,16 +199,24 @@ def test_dimension_eligibility_and_generation_pin_fail_closed(dimension_case, da
     else:
         coverage["generation"]["run_id"] = "stale"
         projection["generation_id"] = "current"
-    with pytest.raises(ValueError):
-        generate(dimension_case)
+    if damage in ('unavailable', 'stale_generation'):
+        with pytest.raises(ValueError):
+            generate(dimension_case)
+    else:
+        run = generate(dimension_case)
+        assert len(run['cards']) == 5
+        assert all(c['meeting_interest']['dimension_id'] != cards[0]['meeting_interest']['dimension_id'] for c in run['cards'])
+        assert run['rejected_cards']
 
 
 @pytest.mark.parametrize("text", ["Ранее потрачено 987654321 рублей.", "Компания СЕКРЕТ уже завершила ремонт.",
                                   "Сценарий гарантированно снизит затраты."])
 def test_unsupported_old_facts_and_scenario_effect_are_rejected(dimension_case, text):
     dimension_case[3][0]["analyst_brief"] = text
-    with pytest.raises(ValueError):
-        generate(dimension_case)
+    run = generate(dimension_case)
+    assert len(run['cards']) == 5
+    assert all(c['analyst_brief'] != text for c in run['cards'])
+    assert run['rejected_cards']
 
 
 def test_scope_cannot_be_widened_and_verifier_must_be_independent(dimension_case):

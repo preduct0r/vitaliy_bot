@@ -302,6 +302,10 @@ def _meeting_prompt_markup(meeting: Dict[str, Any]) -> Optional[InlineKeyboardMa
 
 
 def user_error(error: Exception) -> str:
+    from .models import InsufficientCandidatesError
+
+    if isinstance(error, InsufficientCandidatesError):
+        return 'Не удалось проверить достаточно разных гипотез. Попробуйте повторить запрос.'
     if isinstance(error, EvidenceError):
         if error.code == "tof_unavailable":
             return "Текущие данные ТОФ недоступны; проверка не выполнена."

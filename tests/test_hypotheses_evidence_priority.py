@@ -5,6 +5,7 @@ independent_meeting_count. These tests exercise its downstream contract without
 reading the private corpus or calling a model, Telegram, or the TOF server.
 """
 import copy
+import re
 import json
 
 import pytest
@@ -161,8 +162,15 @@ def test_exploratory_or_partial_candidate_does_not_relax_safety(dimension_case, 
         card['analyst_brief'] = 'Все необходимые данные доступны и результат рассчитан.'
     else:
         card['analyst_brief'] = 'Компания СЕКРЕТ ранее потратила 987654321 рублей.'
-    with pytest.raises((ValueError, RuntimeError)):
-        _generate(case, verifier=lambda r: {'supported': False, 'confidence': 'high', 'reason': 'analyst_brief: неподтверждённое утверждение'} if damage == 'false_availability' else {'supported': True, 'confidence': 'high'})
+    review = lambda r: {'supported': False, 'confidence': 'high', 'reason': 'analyst_brief: неподтверждённое утверждение'} if damage == 'false_availability' else {'supported': True, 'confidence': 'high'}
+    if damage == 'false_availability':
+        with pytest.raises((ValueError, RuntimeError)):
+            _generate(case, verifier=review)
+    else:
+        result = _generate(case, verifier=review)
+        assert len(result['cards']) == 5
+        assert card['meeting_interest']['dimension_id'] not in {c['meeting_interest']['dimension_id'] for c in result['cards']}
+        assert result['rejected_cards']
 
 
 def test_fewer_than_five_after_independent_review_fails(dimension_case):
@@ -202,8 +210,9 @@ def test_candidate_pool_rejects_duplicates_and_unbounded_input(dimension_case):
     duplicate = copy.deepcopy(case[3])
     duplicate[1]['decision'] = duplicate[0]['decision']
     duplicate[1]['metrics_method'] = duplicate[0]['metrics_method']
-    with pytest.raises((ValueError, RuntimeError)):
-        _generate(case, cards=duplicate)
+    result = _generate(case, cards=duplicate)
+    assert duplicate[1]['meeting_interest']['dimension_id'] not in {c['meeting_interest']['dimension_id'] for c in result['cards']}
+    assert any('duplicate' in r.get('reason', '') for r in result['rejected_cards'])
     with pytest.raises((ValueError, RuntimeError)):
         _generate(case, cards=case[3] * 100)
 
@@ -222,8 +231,10 @@ def test_expanded_projection_is_bound_to_rehashed_profile_index_and_meeting_coun
 def test_available_route_requires_a_real_selected_reference(dimension_case):
     case = copy.deepcopy(dimension_case)
     case[3][0]['source_references'] = []
-    with pytest.raises(ValueError):
-        _generate(case)
+    result = _generate(case)
+    assert len(result['cards']) == 5
+    assert case[3][0]['meeting_interest']['dimension_id'] not in {c['meeting_interest']['dimension_id'] for c in result['cards']}
+    assert result['rejected_cards']
 
 
 def test_unmapped_direction_states_verified_route_gap_without_inventing_dataset(dimension_case):
@@ -259,8 +270,10 @@ def test_generator_is_told_to_avoid_written_numeric_claims(dimension_case):
 def test_candidate_validation_error_identifies_card_and_field(dimension_case):
     case = copy.deepcopy(dimension_case)
     case[3][0]['decision'] = 'Выбрать два направления проверки'
-    with pytest.raises(ValueError, match='(?i)card 1.*decision'):
-        _generate(case)
+    result = _generate(case)
+    assert len(result['cards']) == 5
+    assert case[3][0]['meeting_interest']['dimension_id'] not in {c['meeting_interest']['dimension_id'] for c in result['cards']}
+    assert any(re.search(r'card 1.*decision', r.get('reason', ''), re.I) for r in result['rejected_cards'])
 
 
 def test_expanded_projection_counts_attribution_per_independent_meeting(evidence_case):

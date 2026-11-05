@@ -145,8 +145,10 @@ def test_empty_scope_stays_unset_through_balanced_selection(setup_case):
 def test_explicit_scope_and_server_failure_remain_enforced(dimension_case):
     case = copy.deepcopy(dimension_case)
     case[3][0]['scope'] = 'все оборудование'
-    with pytest.raises(ValueError):
-        _generate(case, scope='насосы')
+    result = _generate(case, scope='насосы')
+    assert len(result['cards']) == 5
+    assert all(c['scope'] != 'все оборудование' for c in result['cards'])
+    assert result['rejected_cards']
 
     def unavailable():
         raise OSError('synthetic server unavailable')

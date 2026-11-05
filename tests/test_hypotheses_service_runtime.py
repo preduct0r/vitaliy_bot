@@ -440,8 +440,10 @@ def test_forged_case_reference_is_rejected(tmp_path, dimension_case):
     case = service.new_case(101)
     job = submit(hypotheses, case)
     _, failures = asyncio.run(drain(store, service, job))
-    assert failures and persisted(hypotheses, job)['status'] == 'failed'
-    assert not persisted(hypotheses, job)['cards']
+    run = persisted(hypotheses, job)
+    assert not failures and run['status'] == 'completed' and len(run['cards']) == 5
+    assert all('чужой-кейс.txt' not in str(c['case_material_references']) for c in run['cards'])
+    assert dimension_case[3][0]['meeting_interest']['dimension_id'] not in {c['meeting_interest']['dimension_id'] for c in run['cards']}
 
 
 @pytest.mark.parametrize('stage', ['generator', 'verifier'])
@@ -459,8 +461,12 @@ def test_invalid_model_schema_fails_closed(tmp_path, dimension_case, stage):
     case = service.new_case(101)
     job = submit(hypotheses, case)
     _, failures = asyncio.run(drain(store, service, job))
-    assert failures and persisted(hypotheses, job)['status'] == 'failed'
-    assert not persisted(hypotheses, job)['cards']
+    run = persisted(hypotheses, job)
+    if stage == 'verifier':
+        assert failures and run['status'] == 'failed' and not run['cards']
+    else:
+        assert not failures and run['status'] == 'completed' and len(run['cards']) == 5
+        assert dimension_case[3][0]['meeting_interest']['dimension_id'] not in {c['meeting_interest']['dimension_id'] for c in run['cards']}
 
 
 def test_sealed_result_recovery_retains_selected_case_citations(tmp_path, dimension_case):

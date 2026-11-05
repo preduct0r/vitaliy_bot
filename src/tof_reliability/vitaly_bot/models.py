@@ -70,6 +70,12 @@ class VitalyBotError(RuntimeError):
     """Base error whose text is safe to show to a bot user."""
 
 
+class InsufficientCandidatesError(ValueError):
+    """Too few independently supported candidate cards remain."""
+
+    code = 'insufficient_candidates'
+
+
 class InputError(VitalyBotError):
     """The uploaded material does not fit the public bot contract."""
 
