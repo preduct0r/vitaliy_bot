@@ -429,7 +429,15 @@ def _validate_card_content(card, scope, topic, private_interests, verifier):
         safe_card = {k: copy.deepcopy(card[k]) for k in TEXT_FIELDS + ('hard_questions',) if k in card}
         verdict = verifier({'card': safe_card, 'scope': scope,
                             'topic_id': topic,
-                            'description': dict((t, d) for t, d, _ in _TOPICS)[topic]})
+                            'description': dict((t, d) for t, d, _ in _TOPICS)[topic],
+                            'ranking_context': {'scores': copy.deepcopy(card['ranking']),
+                                                'scale': {'min': 0, 'max': 5},
+                                                'source_fact': False},
+                            'instructions': ('Проверяйте только поля card по переданным данным. '
+                                             'Ranking — внутренние оценки, не свидетельство и не факт источника; '
+                                             'не придумывайте значения и отклоняйте их изложение в тексте карточки. '
+                                             'Не подтверждайте неподкреплённую уверенность в интересе. '
+                                             'При отказе назовите в reason точное поле card и причину.')})
     except Exception as exc:
         raise ValueError('private verifier failed') from exc
     if (isinstance(verdict, dict) and verdict.get('supported') is False
@@ -513,6 +521,8 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
                                 'Ресурсные ограничения графика рассматривайте с привязкой к обучающим интересам. '
                                 'Не утверждайте непроверенных фактов; укажите interest_id и topic_id выбранной пары. '
                                 'Интерпретация и пересказ третьего лица не являются подтверждённым прямым запросом. '
+                                'Ranking — внутреннее служебное ранжирование по шкале от 0 до 5, а не факт источника. '
+                                'Не включайте оценки, объяснения ранжирования или служебные заметки в текст карточки; не пишите процент интереса или вероятности, что Бусько понравится идея. '
                                 'Неизвестную новизну укажите явно и оцените нулём.')}
     cards = generator(copy.deepcopy(context))
     run = {'generation_id': coverage['generation']['run_id'], 'knowledge_version': knowledge_version,

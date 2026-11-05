@@ -21,7 +21,8 @@ def approve(_):
 def check(claim, *, scope="Проверить повторные ремонты насосов", interests=None,
           field="decision"):
     card = {"management_question": "Почему повторяются ремонты насосов?",
-            "decision": "Определить приоритет проверки", "hard_questions": []}
+            "decision": "Определить приоритет проверки", "hard_questions": [],
+            "ranking": {key: 0 for key in pilot.SCORES}}
     if field == "hard_questions":
         card[field] = [claim]
     else:
@@ -106,7 +107,8 @@ def test_coverage_and_other_case_cannot_whitelist_written_amount(inputs, cards):
 
 def test_structural_card_number_is_not_a_numeric_fact():
     card = {"number": 15, "management_question": "Почему повторяются ремонты насосов?",
-            "decision": "Проверить данные", "hard_questions": []}
+            "decision": "Проверить данные", "hard_questions": [],
+            "ranking": {key: 0 for key in pilot.SCORES}}
     pilot._validate_card_content(card, "Проверить ремонты насосов", TOPIC,
                                  {"interests": []}, approve)
 

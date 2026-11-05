@@ -49,7 +49,8 @@ def report(inputs):
 @pytest.mark.parametrize("field", ["decision", "hard_questions"])
 def test_invented_numeric_variants_are_rejected_with_approving_attacker(pilot, claim, field):
     card = {"management_question": "Почему повторяются ремонты насосов?",
-            "decision": "Выбрать проверку", "hard_questions": ["Как проверить ремонт?"]}
+            "decision": "Выбрать проверку", "hard_questions": ["Как проверить ремонт?"],
+            "ranking": {key: 0 for key in pilot.SCORES}}
     card[field] = [claim] if field == "hard_questions" else claim
     with pytest.raises(ValueError):
         pilot._validate_card_content(card, "Проверить ремонты насосов", TOPIC,
@@ -64,7 +65,7 @@ def test_invented_numeric_variants_are_rejected_with_approving_attacker(pilot, c
 ])
 def test_ordinary_words_are_not_numerical_claims(pilot, text):
     card = {"management_question": "Почему повторяются ремонты насосов?",
-            "decision": text, "hard_questions": []}
+            "decision": text, "hard_questions": [], "ranking": {key: 0 for key in pilot.SCORES}}
     pilot._validate_card_content(card, "Проверить ремонты насосов", TOPIC,
                                  {"interests": []}, attacker_verifier)
 
@@ -76,7 +77,7 @@ def test_ordinary_words_are_not_numerical_claims(pilot, text):
 ])
 def test_exact_request_fact_is_preserved_by_legacy_content_check(pilot, fact):
     card = {"management_question": "Почему повторяются ремонты насосов?",
-            "decision": fact, "hard_questions": []}
+            "decision": fact, "hard_questions": [], "ranking": {key: 0 for key in pilot.SCORES}}
     pilot._validate_card_content(card, fact, TOPIC, {"interests": []}, attacker_verifier)
 
 
