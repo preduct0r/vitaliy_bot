@@ -226,9 +226,31 @@ def _validate_pilot(run: Mapping[str, Any], *, coverage: Mapping[str, Any], inte
         topics = [c.get('meeting_interest', {}).get('topic_id') for c in cards if isinstance(c, dict)]
         if len(topics) != len(set(topics)):
             raise ValueError('duplicate topic: distinct directions required')
-        if (len(eligible) >= 7 and len(cards) != 7) or len(cards) > len(eligible):
+        rejected = run.get('rejected_cards', [])
+        if not isinstance(rejected, list):
+            raise ValueError('invalid private rejection diagnostics')
+        rejected_topics = []
+        for diagnostic in rejected:
+            if not isinstance(diagnostic, dict) or set(diagnostic) != {'card', 'verdict'}:
+                raise ValueError('invalid private rejection diagnostic')
+            card, verdict = diagnostic['card'], diagnostic['verdict']
+            if (not isinstance(card, dict) or not isinstance(card.get('meeting_interest'), dict)
+                    or not isinstance(verdict, dict) or verdict.get('supported') is not False
+                    or verdict.get('confidence') != 'high' or not isinstance(verdict.get('reason'), str)
+                    or not verdict['reason'].strip()):
+                raise ValueError('invalid private rejection verdict')
+            rejected_topics.append(card['meeting_interest'].get('topic_id'))
+        all_topics = topics + rejected_topics
+        if len(all_topics) != len(set(all_topics)) or not set(all_topics) <= eligible:
+            raise ValueError('duplicate or ineligible topic in rejection diagnostics')
+        if (len(eligible) >= 7 and len(all_topics) != 7) or len(all_topics) > len(eligible):
             raise ValueError('breadth requires seven distinct eligible topics when available')
-        if len(eligible) < 7:
+        if rejected:
+            expected = {'eligible_topic_ids': sorted(eligible),
+                        'reason': f'Отклонённые проверяющим идеи исключены: {len(rejected)}; подтверждено карточек: {len(cards)}.'}
+            if run.get('breadth_justification') != expected:
+                raise ValueError('breadth justification does not match rejected ideas')
+        elif len(eligible) < 7:
             expected = {'eligible_topic_ids': sorted(eligible),
                         'reason': f'Доступно только {len(eligible)} подтверждённых тем с применимыми маршрутами; выбрано {len(cards)}.'}
             if run.get('breadth_justification') != expected:
@@ -410,8 +432,13 @@ def _validate_card_content(card, scope, topic, private_interests, verifier):
                             'description': dict((t, d) for t, d, _ in _TOPICS)[topic]})
     except Exception as exc:
         raise ValueError('private verifier failed') from exc
+    if (isinstance(verdict, dict) and verdict.get('supported') is False
+            and verdict.get('confidence') == 'high' and isinstance(verdict.get('reason'), str)
+            and verdict['reason'].strip()):
+        return copy.deepcopy(verdict)
     if not isinstance(verdict, Mapping) or verdict.get('supported') is not True or verdict.get('confidence') != 'high':
         raise ValueError('private verifier rejected or uncertain')
+    return None
 
 def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapping[str, Any], coverage_provider, generator, verified_labels=None, verifier_audit=None, private_verifier=None, trusted_context=None, trusted_store=None) -> dict:
     _text(knowledge_version, 'knowledge version')
@@ -504,7 +531,6 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
                 raise ValueError('unsupported meeting reference or attribution')
             if set(card.get('source_references', [])) - _references(route):
                 raise ValueError('references unsupported by selected route')
-            _validate_card_content(card, scope, topic, interests, private_verifier)
             card['meeting_interest'] = {'interest_id': meeting['interest_id'], 'topic_id': topic, **entry}
 
     _validate_pilot(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store)
@@ -517,9 +543,24 @@ def generate_pilot(*, scope: str, knowledge_version: str, interest_context: Mapp
             if key in values:
                 raise ValueError(f'duplicate {field}: insufficient diversity')
             values.add(key)
+    accepted, rejected = [], []
+    for card in run['cards']:
+        verdict = _validate_card_content(card, scope, card['meeting_interest']['topic_id'], interests, private_verifier)
+        if verdict is None:
+            accepted.append(card)
+        else:
+            rejected.append({'card': copy.deepcopy(card), 'verdict': verdict})
+    if len(accepted) < 5:
+        raise ValueError('fewer than five verified cards remain after semantic rejection')
+    run['cards'] = accepted
+    if rejected:
+        run['rejected_cards'] = rejected
+        run['breadth_justification'] = {'eligible_topic_ids': sorted(eligible),
+                                        'reason': f'Отклонённые проверяющим идеи исключены: {len(rejected)}; подтверждено карточек: {len(accepted)}.'}
     run['cards'].sort(key=lambda c: sum(c['ranking'][k] for k in SCORES), reverse=True)
     for number, card in enumerate(run['cards'], 1):
         card['number'] = number
+    _validate_pilot(run, coverage=coverage, interest_context=interests, trusted_context=trusted_context, trusted_store=trusted_store)
     if trusted_context is not None:
         trusted_store.seal(trusted_context, run)
     return run
