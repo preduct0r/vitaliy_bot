@@ -406,7 +406,7 @@ def _validate_numeric_claims(card, scope, *, reject_roman=False):
         # In this narrow interrogative construction, "одного ремонта" names
         # the repair being discussed. Other numeric content in the question
         # remains subject to the ordinary whole-statement scope check.
-        if (key == 'management_question' and value.rstrip().endswith('?')
+        if (key in ('management_question', 'hard_questions') and value.rstrip().endswith('?')
                 and _INTERROGATIVE_START.search(value)):
             numeric_text = _SINGULAR_REPAIR_REFERENCE.sub(r'\1\2', value)
         if ((_NUMERIC_CLAIM.search(numeric_text) or _ORDINAL_CLAIM.search(numeric_text)
