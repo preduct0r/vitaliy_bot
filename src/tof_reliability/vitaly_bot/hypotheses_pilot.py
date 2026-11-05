@@ -1046,6 +1046,9 @@ def generate_dimension_pilot(*, scope, knowledge_version, interest_context, dime
     for number, card in enumerate(run['cards'], 1):
         if not isinstance(card, dict) or not isinstance(card.get('meeting_interest'), dict):
             raise ValueError('invalid card')
+        if (trusted_context is not None and scope == ''
+                and isinstance(card.get('scope'), str) and not card['scope'].strip()):
+            card['scope'] = 'Периметр не задан; предложить периметр при планировании'
         meeting = card['meeting_interest']
         key = (meeting.get('interest_id'), meeting.get('dimension_id'))
         dim = key[1]
