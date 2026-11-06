@@ -121,7 +121,8 @@ def validate_source_evidence(*, release_store, inventory, candidate, proposal,
         raise ValueError('duplicate dimension')
     for previous in old['dimension_projection']['dimensions']:
         current_dimension = dimensions_by_id.get(previous['dimension_id'], {})
-        if any(current_dimension.get(key) != value for key, value in previous.items() if key != 'evidence'):
+        derived = {'evidence', 'interest_ids', 'source_ids', 'independent_meeting_count', 'attribution_meeting_counts'}
+        if any(current_dimension.get(key) != value for key, value in previous.items() if key not in derived):
             raise ValueError('historical dimension changed')
         if any(entry not in current_dimension.get('evidence', []) for entry in previous.get('evidence', [])):
             raise ValueError('historical dimension evidence removed')
@@ -147,8 +148,21 @@ def validate_source_evidence(*, release_store, inventory, candidate, proposal,
     if any(row.get('supported') is not True or row.get('confidence') != 'high' or row.get('conflicting') is not False for row in verdicts):
         raise ValueError('unconfirmed or conflicting verdict')
     prior_dimensions = {d['dimension_id']: d for d in old['dimension_projection']['dimensions']}
+    linked = set()
     for dimension in dimensions_list:
         prior = prior_dimensions.get(dimension['dimension_id'], {}).get('evidence', [])
+        entries = dimension.get('evidence', [])
+        if (set(dimension.get('interest_ids', [])) != {e.get('interest_id') for e in entries}
+                or set(dimension.get('source_ids', [])) != {e.get('source_id') for e in entries}):
+            raise ValueError('dimension identifiers do not match evidence')
+        previous = prior_dimensions.get(dimension['dimension_id'])
+        new_entries = [e for e in entries if e not in prior]
+        if previous:
+            new_meetings = {by_id[e['source_id']]['meeting_id'] for e in new_entries if e.get('source_id') in by_id}
+            if dimension.get('independent_meeting_count') != previous.get('independent_meeting_count') + len(new_meetings):
+                raise ValueError('dimension meeting count mismatch')
+            if dimension.get('attribution_meeting_counts') != previous.get('attribution_meeting_counts'):
+                raise ValueError('unverified attribution aggregates')
         for item in dimension.get('evidence', []):
             if item not in prior and not any(
                 row.get('dimension_id') == dimension['dimension_id'] and
@@ -156,11 +170,18 @@ def validate_source_evidence(*, release_store, inventory, candidate, proposal,
                 for row in verdicts
             ):
                 raise ValueError('new dimension evidence lacks verified verdict')
+            if item not in prior:
+                linked.add((item.get('interest_id'), item.get('source_id'), dimension['dimension_id'],
+                            item.get('locator'), item.get('attribution')))
+    if {key(row) for row in verdicts} != linked:
+        raise ValueError('verified interest is not actively bound to its dimension')
     return originals
 
 # The authority and SQLite state are owner-controlled installation configuration.
 # They do not protect a host where the bot account itself is compromised.
-from .hypotheses_scenario_comparison import AssessmentAuthority, _digest, _observation, fixed_scenarios
+from .hypotheses_scenario_comparison import (AssessmentAuthority, _digest, _observation, fixed_scenarios,
+    _fixed_request, _script_fingerprint, _target_binding_changed)
+from . import hypotheses_pilot as pilot
 
 
 def _json_bytes(value):
@@ -175,43 +196,83 @@ def _fsync_dir(path):
         os.close(fd)
 
 
-def _verify_assessment(audit, baseline_version, candidate_version):
+def _verify_assessment(audit, baseline, candidate, proposal):
     scenarios = fixed_scenarios()
     records = audit.get('scenarios')
     if not isinstance(records, list) or len(records) != len(scenarios) or not audit.get('generation_id'):
         raise ValueError('assessment scenarios incomplete')
+    coverage = audit.get('coverage')
+    if (not isinstance(coverage, dict) or _digest(coverage) != audit.get('coverage_digest')
+            or audit.get('scripts_sha256') != _script_fingerprint()
+            or set(audit.get('components_sha256', {})) != {'generator', 'verifier'}):
+        raise ValueError('assessment execution context mismatch')
     improved = False
+    common = None
     for scenario, record in zip(scenarios, records):
         if any(record.get(key) != scenario[key] for key in ('id', 'kind', 'input', 'expected', 'checks')):
             raise ValueError('assessment scenario mismatch')
         observations = []
         requests = []
-        for side, version in (('baseline', baseline_version), ('candidate', candidate_version)):
+        for side, payload in (('baseline', baseline), ('candidate', candidate)):
             run = record[side]
             request = run['input']
-            if (request.get('knowledge_version') != version or
+            if any(run.get(field + '_sha256') != _digest(run.get(field))
+                   for field in ('input', 'output', 'verified_cards')):
+                raise ValueError('assessment execution fingerprint mismatch')
+            if ('knowledge_version' in request or
                 request.get('coverage', {}).get('generation_id') != audit['generation_id'] or
                 request.get('scenario') != {k: scenario[k] for k in ('id', 'kind', 'input')} or
                 not run.get('output') or not run.get('verified_cards')):
                 raise ValueError('assessment execution mismatch')
+            fixed = {k: v for k, v in _fixed_request(request).items() if k != 'scenario'}
+            if common is None:
+                common = fixed
+            elif common != fixed:
+                raise ValueError('assessment fixed inputs changed')
+            reviews = iter(run.get('reviews', []))
+            def replay_generator(actual):
+                actual.pop('knowledge_version', None)
+                actual['scenario'] = {k: scenario[k] for k in ('id', 'kind', 'input')}
+                if actual != request:
+                    raise ValueError('assessment prompt does not match knowledge')
+                return copy.deepcopy(run['output'])
+            def replay_verifier(actual):
+                review = next(reviews, None)
+                if not review or review.get('input_sha256') != _digest(actual):
+                    raise ValueError('assessment verifier input mismatch')
+                return copy.deepcopy(review['output'])
+            replay = pilot.generate_dimension_pilot(
+                scope=request['scope'], knowledge_version=payload['knowledge_version'],
+                interest_context=copy.deepcopy(payload['interest_context']),
+                dimension_projection=copy.deepcopy(payload['dimension_projection']),
+                coverage_provider=lambda: copy.deepcopy(coverage), generator=replay_generator,
+                private_verifier=replay_verifier)
+            if next(reviews, None) is not None or replay.get('rejected_cards') or replay['cards'] != run['verified_cards']:
+                raise ValueError('assessment output does not match verified cards')
             actual = {check['kind']: _observation(check['kind'], run['verified_cards'], request['scope'])
                       for check in scenario['checks']}
             if actual != run['observations']:
                 raise ValueError('assessment observations mismatch')
             observations.append(actual)
-            requests.append({k: v for k, v in request.items() if k != 'knowledge_version'})
-        if requests[0] != requests[1]:
+            requests.append(request)
+        if _fixed_request(requests[0]) != _fixed_request(requests[1]):
             raise ValueError('assessment inputs differ')
         old, new = observations
         checks = scenario['checks']
         comparison = {'mandatory_pass': all(new[c['kind']] for c in checks if c['mandatory']),
                       'degraded': any(old[c['kind']] and not new[c['kind']] for c in checks),
                       'new_critical_error': any(c['critical'] and old[c['kind']] and not new[c['kind']] for c in checks),
-                      'improved': any(c['target'] and not old[c['kind']] and new[c['kind']] for c in checks)}
+                      'improved': (any(c['target'] and not old[c['kind']] and new[c['kind']] for c in checks)
+                                   and _target_binding_changed(requests[0], requests[1], record['baseline']['verified_cards'], record['candidate']['verified_cards']))}
         if (comparison != record['comparison'] or not comparison['mandatory_pass'] or
             comparison['degraded'] or comparison['new_critical_error']):
             raise ValueError('assessment comparison mismatch')
-        improved |= comparison['improved']
+        if comparison['improved']:
+            if not any(c.get('meeting_interest', {}).get('interest_id') == proposal['id']
+                       and c['meeting_interest'].get('dimension_id') == 'repair_repeat_interval'
+                       for c in record['candidate']['verified_cards']):
+                raise ValueError('improvement is unrelated to the proposed interest')
+            improved = True
     if not improved:
         raise ValueError('assessment shows no improvement')
 
@@ -389,7 +450,7 @@ class AtomicReleaseManager:
                         'dimension_projection': old['dimension_projection']}
             if audit.get('knowledge_payload_sha256') != {'baseline': _digest(baseline), 'candidate': _digest(candidate)}:
                 raise ValueError('assessment payload mismatch')
-            _verify_assessment(audit, current['version'], version)
+            _verify_assessment(audit, baseline, candidate, proposal)
             # Combine baseline and new audit rows so every retained dimension
             # continues to have a corresponding independently recorded verdict.
             combined_classifier = {'answer': {'candidates': old['classifier']['answer']['candidates'] + classifier['answer']['candidates']}}

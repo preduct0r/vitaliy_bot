@@ -13,7 +13,7 @@ fixed facts/predicates, not model-authored labels. Failed execution may raise or
 return a rejected result, but never authorize activation.
 
 The generator uses the actual dimension-pilot callback signature and produces
-valid cards based on the knowledge version it is given. No network, external
+valid cards based on the source-bound dimension context it is given. No network, external
 models, production sources or personal data are used.
 """
 from __future__ import annotations
@@ -87,8 +87,11 @@ def lab(dimension_case, monkeypatch):
         # The unchanged baseline has a general repair-interval method. The new
         # context actually makes the generator describe a comparison of repeat
         # intervals; the claimed score and verdict below are never evidence.
-        if request['knowledge_version'] == CANDIDATE and mode['value'] != 'tie':
+        interval = next(d for d in request['dimensions'] if d['dimension_id'] == 'repair_repeat_interval')
+        has_new_evidence = 'interval-pattern' in interval['interest_ids']
+        if has_new_evidence and mode['value'] != 'tie':
             row = next(c for c in result if c['meeting_interest']['dimension_id'] == 'repair_repeat_interval')
+            row['meeting_interest']['interest_id'] = 'interval-pattern'
             row['metrics_method'] = 'Сопоставить интервалы между повторными ремонтными эпизодами оборудования по периодам'
             if mode['value'] == 'regression':
                 row['scope'] = 'всё оборудование'
@@ -105,7 +108,7 @@ def lab(dimension_case, monkeypatch):
         }.get(scenario['kind'])
         if brief:
             result[0]['analyst_brief'] = brief
-        if mode['broken_scenario'] == scenario['kind'] and request['knowledge_version'] == CANDIDATE:
+        if mode['broken_scenario'] == scenario['kind'] and has_new_evidence:
             result[0]['analyst_brief'] = 'Данных для проверки пока недостаточно'
         if mode['value'] == 'self_report':
             for card in result:
@@ -128,12 +131,20 @@ def lab(dimension_case, monkeypatch):
 
 def evaluate(lab, **changes):
     module = comparison_module()
+    candidate_context = copy.deepcopy(lab['context'])
+    interest = copy.deepcopy(candidate_context['interests'][0])
+    interest['id'] = 'interval-pattern'
+    candidate_context['interests'].append(interest)
+    candidate_projection = copy.deepcopy(lab['projection'])
+    row = next(d for d in candidate_projection['dimensions'] if d['dimension_id'] == 'repair_repeat_interval')
+    row['interest_ids'].append(interest['id'])
+    row['evidence'].append({'interest_id': interest['id'], **interest['evidence'][0]})
     kwargs = {'baseline': {'knowledge_version': BASE,
                            'interest_context': copy.deepcopy(lab['context']),
                            'dimension_projection': copy.deepcopy(lab['projection'])},
               'candidate': {'knowledge_version': CANDIDATE,
-                            'interest_context': copy.deepcopy(lab['context']),
-                            'dimension_projection': copy.deepcopy(lab['projection'])},
+                            'interest_context': candidate_context,
+                            'dimension_projection': candidate_projection},
               'scope': 'насосы', 'coverage_provider': lab['coverage_provider'],
               'generator': lab['generator'], 'private_verifier': lab['verifier'],
               'scenarios': module.fixed_scenarios(), 'audit_dir': lab['audit_dir']}
@@ -152,10 +163,9 @@ def rejected_or_error(lab, **kwargs):
 def test_audit_binds_exact_baseline_and_candidate_payloads(lab):
     baseline = {'knowledge_version': BASE, 'interest_context': copy.deepcopy(lab['context']),
                 'dimension_projection': copy.deepcopy(lab['projection'])}
-    candidate = copy.deepcopy(baseline)
-    candidate['knowledge_version'] = CANDIDATE
-    candidate['interest_context']['interests'][0]['requirement'] += ' changed'
-    result = evaluate(lab, baseline=baseline, candidate=candidate)
+    result = evaluate(lab)
+    candidate = {'knowledge_version': CANDIDATE, 'interest_context': lab['pilots'][1]['interest_context'],
+                 'dimension_projection': lab['pilots'][1]['dimension_projection']}
     audit = json.loads(Path(result['audit_path']).read_text(encoding='utf-8'))
     def digest(value):
         data = json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -187,14 +197,11 @@ def test_actual_pilot_generation_measures_improvement_on_frozen_inputs_and_audit
     result = evaluate(lab)
     assert result['activation_allowed'] is True
     assert len(lab['pilots']) >= 2 and lab['checks']
-    assert {c['knowledge_version'] for c in lab['calls']} == {BASE, CANDIDATE}
-    # Ignore only the intended knowledge pin: both sides receive the same
-    # scenario, scope, generation, coverage and safe model context.
-    requests = {v: [dict(c, knowledge_version='<pin>') for c in lab['calls']
-                    if c['knowledge_version'] == v] for v in (BASE, CANDIDATE)}
-    assert requests[BASE] == requests[CANDIDATE]
-    assert all(p['scope'] == 'насосы' and p['interest_context'] == lab['context']
-               and p['dimension_projection'] == lab['projection'] for p in lab['pilots'])
+    assert all(BASE not in str(c) and CANDIDATE not in str(c) for c in lab['calls'])
+    for old, new in zip(lab['calls'][::2], lab['calls'][1::2]):
+        assert {k: v for k, v in old.items() if k != 'dimensions'} == {k: v for k, v in new.items() if k != 'dimensions'}
+        assert old['dimensions'] != new['dimensions']
+    assert all(p['scope'] == 'насосы' for p in lab['pilots'])
     records = result['scenarios']
     assert len(records) >= 12
     assert any(r['comparison']['improved'] for r in records)

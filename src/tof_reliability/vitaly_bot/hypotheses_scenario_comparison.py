@@ -18,6 +18,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from . import hypotheses_pilot as pilot
+from . import hypotheses_interests, hypotheses_topic_projection, models
 
 
 class AssessmentAuthority:
@@ -71,6 +72,45 @@ def fixed_scenarios():
 def _digest(value):
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+
+def _script_fingerprint():
+    return {Path(module.__file__).name: hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+            for module in (pilot, hypotheses_interests, hypotheses_topic_projection, models,
+                           __import__(__name__, fromlist=['']))}
+
+
+def _callable_fingerprint(value):
+    code = getattr(value, '__code__', None) or getattr(getattr(value, '__call__', None), '__code__', None)
+    if code is None:
+        raise ValueError('inspectable comparison component required')
+    def describe(item):
+        if hasattr(item, 'co_code'):
+            return {'bytecode': item.co_code.hex(), 'names': item.co_names,
+                    'constants': [describe(constant) for constant in item.co_consts]}
+        if isinstance(item, (str, int, float, bool, type(None))):
+            return item
+        if isinstance(item, tuple):
+            return [describe(element) for element in item]
+        return repr(item)
+    return _digest(describe(code))
+
+
+def _fixed_request(request):
+    return {k: v for k, v in request.items() if k != 'dimensions'}
+
+
+def _target_binding_changed(old, new, old_cards, new_cards):
+    """The target must use a newly exposed, source-bound interest on its own dimension."""
+    dimension = 'repair_repeat_interval'
+    before = next((d for d in old['dimensions'] if d['dimension_id'] == dimension), None)
+    after = next((d for d in new['dimensions'] if d['dimension_id'] == dimension), None)
+    if not before or not after or before == after:
+        return False
+    added = set(after['interest_ids']) - set(before['interest_ids'])
+    return bool(added and any(c.get('meeting_interest', {}).get('dimension_id') == dimension
+                              and c['meeting_interest'].get('interest_id') in added for c in new_cards)
+                and old_cards != new_cards)
 
 
 def _outside_git(path):
@@ -188,10 +228,14 @@ def _evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, genera
     if baseline['knowledge_version'] == candidate['knowledge_version']:
         raise ValueError('distinct knowledge pins required')
     contexts = [baseline['interest_context'], candidate['interest_context']]
+    components = {'generator': _callable_fingerprint(generator),
+                  'verifier': _callable_fingerprint(private_verifier)}
+    scripts = _script_fingerprint()
     try:
         frozen = pilot._coverage(coverage_provider())
     except Exception as exc:
         raise RuntimeError('coverage unavailable') from exc
+    _privacy_check(frozen, contexts)
 
     def checked_coverage():
         try:
@@ -207,16 +251,14 @@ def _evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, genera
         for name, version in (('baseline', baseline), ('candidate', candidate)):
             captured = {}
             def run(request):
+                # Release pins are bookkeeping, never experimental treatment.
+                request.pop('knowledge_version', None)
                 request['scenario'] = {'id': scenario['id'], 'kind': scenario['kind'],
                                        'input': copy.deepcopy(scenario['input'])}
                 captured['input'] = copy.deepcopy(request)
                 _privacy_check(request, contexts)
                 if name == 'candidate':
-                    old_input = dict(sides['baseline']['input'])
-                    new_input = dict(request)
-                    old_input.pop('knowledge_version', None)
-                    new_input.pop('knowledge_version', None)
-                    if old_input != new_input:
+                    if _fixed_request(sides['baseline']['input']) != _fixed_request(request):
                         raise ValueError('baseline and candidate inputs differ')
                 attempt = {'side': name, 'input': copy.deepcopy(request), 'output': None}
                 attempts.append(attempt)
@@ -225,35 +267,49 @@ def _evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, genera
                 captured['output'] = copy.deepcopy(output)
                 attempt['output'] = copy.deepcopy(output)
                 return output
+            reviews = []
+            def verify(request):
+                result = private_verifier(copy.deepcopy(request))
+                _privacy_check(result, contexts)
+                reviews.append({'input_sha256': _digest(request), 'output': copy.deepcopy(result)})
+                return result
             result = pilot.generate_dimension_pilot(
                 scope=scope, knowledge_version=version['knowledge_version'],
                 interest_context=copy.deepcopy(version['interest_context']),
                 dimension_projection=copy.deepcopy(version['dimension_projection']),
                 coverage_provider=checked_coverage, generator=run,
-                private_verifier=private_verifier)
+                private_verifier=verify)
             if result.get('rejected_cards'):
                 raise ValueError('pilot rejected generated cards')
             _privacy_check(result['cards'], contexts)
             observations = {check['kind']: _observation(check['kind'], result['cards'], scope)
                             for check in scenario['checks']}
             sides[name] = {'input': captured['input'], 'output': captured['output'],
-                           'verified_cards': result['cards'], 'observations': observations}
+                           'verified_cards': result['cards'], 'observations': observations,
+                           'reviews': reviews}
+            for field in ('input', 'output', 'verified_cards'):
+                sides[name][field + '_sha256'] = _digest(sides[name][field])
         checks = scenario['checks']
         old, new = sides['baseline']['observations'], sides['candidate']['observations']
         mandatory_pass = all(new[c['kind']] for c in checks if c['mandatory'])
         degraded = any(old[c['kind']] and not new[c['kind']] for c in checks)
         critical = any(c['critical'] and old[c['kind']] and not new[c['kind']] for c in checks)
-        improved = any(c['target'] and not old[c['kind']] and new[c['kind']] for c in checks)
+        improved = (any(c['target'] and not old[c['kind']] and new[c['kind']] for c in checks)
+                    and _target_binding_changed(sides['baseline']['input'], sides['candidate']['input'],
+                                                sides['baseline']['verified_cards'], sides['candidate']['verified_cards']))
         records.append({'id': scenario['id'], 'kind': scenario['kind'], 'input': copy.deepcopy(scenario['input']),
                         'expected': copy.deepcopy(scenario['expected']), 'checks': copy.deepcopy(checks),
                         **sides, 'comparison': {'mandatory_pass': mandatory_pass, 'degraded': degraded,
                                                 'new_critical_error': critical, 'improved': improved}})
     checked_coverage()
+    if components != {'generator': _callable_fingerprint(generator), 'verifier': _callable_fingerprint(private_verifier)} or scripts != _script_fingerprint():
+        raise ValueError('comparison components changed')
     allowed = (all(r['comparison']['mandatory_pass'] and not r['comparison']['degraded']
                    and not r['comparison']['new_critical_error'] for r in records)
                and any(r['comparison']['improved'] for r in records))
     audit = {'activation_allowed': allowed, 'generation_id': frozen['generation']['run_id'],
-             'coverage_digest': _digest(frozen), 'scenarios': records,
+             'coverage_digest': _digest(frozen), 'coverage': frozen, 'scenarios': records,
+             'components_sha256': components, 'scripts_sha256': scripts,
              'knowledge_payload_sha256': {'baseline': _digest(baseline),
                                           'candidate': _digest(candidate)}}
     if authority is not None:

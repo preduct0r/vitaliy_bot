@@ -131,6 +131,13 @@ def package_lab(scenario_lab, tmp_path):
                             'dimension_projection': projection}
         candidate_payload = {'knowledge_version': CANDIDATE, 'interest_context': candidate_context,
                              'dimension_projection': copy.deepcopy(projection)}
+        row = next(d for d in candidate_payload['dimension_projection']['dimensions']
+                   if d['dimension_id'] == 'repair_repeat_interval')
+        row['interest_ids'].append(proposal['id'])
+        row['source_ids'].extend(e['source_id'] for e in evidence)
+        row['evidence'].extend({'interest_id': proposal['id'], **e}
+                               for e in candidate_interest['evidence'])
+        row['independent_meeting_count'] += len(meetings)
         classifier = {'candidates': [{**e, 'interest_id': proposal['id'],
                                       'dimension_id': 'repair_repeat_interval'} for e in evidence]}
         verifier = {'verdicts': [{**r, 'supported': True, 'confidence': 'high', 'conflicting': False}
