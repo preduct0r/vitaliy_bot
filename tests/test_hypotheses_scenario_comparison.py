@@ -19,6 +19,7 @@ models, production sources or personal data are used.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -146,6 +147,22 @@ def rejected_or_error(lab, **kwargs):
     except (ValueError, RuntimeError, OSError):
         return
     assert result['activation_allowed'] is False
+
+
+def test_audit_binds_exact_baseline_and_candidate_payloads(lab):
+    baseline = {'knowledge_version': BASE, 'interest_context': copy.deepcopy(lab['context']),
+                'dimension_projection': copy.deepcopy(lab['projection'])}
+    candidate = copy.deepcopy(baseline)
+    candidate['knowledge_version'] = CANDIDATE
+    candidate['interest_context']['interests'][0]['requirement'] += ' changed'
+    result = evaluate(lab, baseline=baseline, candidate=candidate)
+    audit = json.loads(Path(result['audit_path']).read_text(encoding='utf-8'))
+    def digest(value):
+        data = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return hashlib.sha256(data).hexdigest()
+    assert audit['knowledge_payload_sha256'] == {
+        'baseline': digest(baseline), 'candidate': digest(candidate)}
 
 
 def test_fixed_suite_has_independent_known_cases_and_mandatory_coverage():

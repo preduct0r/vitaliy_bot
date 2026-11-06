@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -17,6 +18,28 @@ from pathlib import Path
 from uuid import uuid4
 
 from . import hypotheses_pilot as pilot
+
+
+class AssessmentAuthority:
+    """Configured owner-controlled authority, separate from the release store."""
+    def __init__(self, key_path, fingerprint):
+        path = Path(key_path)
+        if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+            raise ValueError('private authority key required')
+        if any((p / '.git').exists() for p in (path.resolve().parent, *path.resolve().parents)):
+            raise ValueError('authority must be outside Git')
+        self._key = path.read_bytes()
+        if len(self._key) < 32 or not hmac.compare_digest(hashlib.sha256(self._key).hexdigest(), str(fingerprint)):
+            raise ValueError('authority fingerprint mismatch')
+
+    def _mac(self, value):
+        data = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return hmac.new(self._key, b'hypotheses-assessment-v1\0' + data, hashlib.sha256).hexdigest()
+
+    def verify(self, audit):
+        body = dict(audit)
+        signature = body.pop('authority_hmac_sha256', '')
+        return isinstance(signature, str) and hmac.compare_digest(signature, self._mac(body))
 
 
 def _case(ident, kind, data, expected, check, *, target=False):
@@ -125,16 +148,19 @@ def _write_audit(audit_dir, audit):
 
 
 def evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, generator,
-                       private_verifier, scenarios, audit_dir):
+                       private_verifier, scenarios, audit_dir, authority=None):
     """Run the comparison, retaining a safe partial audit if execution fails."""
     audit_dir = _outside_git(audit_dir)
+    # Keep the inputs stable across the entire run; callbacks are untrusted and
+    # may otherwise mutate caller-owned mappings between individual scenarios.
+    baseline, candidate = copy.deepcopy(baseline), copy.deepcopy(candidate)
     attempts, records = [], []
     try:
         return _evaluate_scenarios(
             baseline=baseline, candidate=candidate, scope=scope,
             coverage_provider=coverage_provider, generator=generator,
             private_verifier=private_verifier, scenarios=scenarios,
-            audit_dir=audit_dir, attempts=attempts, records=records)
+            audit_dir=audit_dir, attempts=attempts, records=records, authority=authority)
     except Exception as exc:
         # Exception text and unvalidated model output may contain private data.
         _write_audit(audit_dir, {'activation_allowed': False, 'failure': type(exc).__name__,
@@ -143,7 +169,7 @@ def evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, generat
 
 
 def _evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, generator,
-                        private_verifier, scenarios, audit_dir, attempts, records):
+                        private_verifier, scenarios, audit_dir, attempts, records, authority):
     """Evaluate fixed cases against actual pilot generation and private review.
 
     Each call to the injected generator receives the usual pilot request plus a
@@ -227,6 +253,12 @@ def _evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, genera
                    and not r['comparison']['new_critical_error'] for r in records)
                and any(r['comparison']['improved'] for r in records))
     audit = {'activation_allowed': allowed, 'generation_id': frozen['generation']['run_id'],
-             'coverage_digest': _digest(frozen), 'scenarios': records}
+             'coverage_digest': _digest(frozen), 'scenarios': records,
+             'knowledge_payload_sha256': {'baseline': _digest(baseline),
+                                          'candidate': _digest(candidate)}}
+    if authority is not None:
+        if not isinstance(authority, AssessmentAuthority):
+            raise ValueError('configured assessment authority required')
+        audit['authority_hmac_sha256'] = authority._mac(audit)
     path = _write_audit(audit_dir, audit)
     return {**audit, 'audit_path': path}
