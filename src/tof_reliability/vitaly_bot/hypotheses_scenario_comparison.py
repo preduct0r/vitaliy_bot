@@ -208,6 +208,123 @@ def evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, generat
         raise
 
 
+class _NextComparisonStep(BaseException):
+    """Unwind the synchronous pilot before invoking another model callback."""
+
+    def __init__(self, kind, request):
+        self.kind, self.request = kind, copy.deepcopy(request)
+
+
+class ScenarioComparisonStepper:
+    """Replay checked responses and execute at most one new callback per step.
+
+    The caller must run each step on the existing model worker and reselect
+    foreground work before starting the next step. The authenticated checkpoint
+    provides integrity within the trusted local account, not against its owner.
+    """
+
+    def __init__(self, *, checkpoint, authority, baseline, candidate, scope,
+                 coverage_provider, generator, private_verifier, audit_dir, before_callback=None):
+        if not isinstance(authority, AssessmentAuthority):
+            raise ValueError('configured assessment authority required')
+        if generator is private_verifier or not callable(generator) or not callable(private_verifier):
+            raise ValueError('separate generator and verifier required')
+        self.path = Path(checkpoint)
+        _outside_git(self.path.parent)
+        if self.path.is_symlink():
+            raise ValueError('checkpoint cannot be a symlink')
+        self.authority = authority
+        self.baseline, self.candidate = copy.deepcopy(baseline), copy.deepcopy(candidate)
+        self.scope, self.coverage_provider = scope, coverage_provider
+        self.generator, self.private_verifier, self.audit_dir = generator, private_verifier, audit_dir
+        self.before_callback = before_callback
+        self.binding = {'baseline': _digest(self.baseline), 'candidate': _digest(self.candidate),
+                        'scope': scope, 'scenarios': _digest(fixed_scenarios()),
+                        'scripts': _script_fingerprint(),
+                        'generator': _callable_fingerprint(generator),
+                        'verifier': _callable_fingerprint(private_verifier)}
+
+    def _load(self):
+        if not self.path.exists():
+            return {'binding': self.binding, 'responses': []}
+        saved = json.loads(self.path.read_text(encoding='utf-8'))
+        if not isinstance(saved, dict):
+            raise ValueError('invalid comparison checkpoint')
+        signature = saved.pop('hmac_sha256', None)
+        if (not isinstance(signature, str) or not hmac.compare_digest(signature, self.authority._mac(saved))
+                or saved.get('binding') != self.binding or not isinstance(saved.get('responses'), list)):
+            raise ValueError('comparison checkpoint authentication failed')
+        return saved
+
+    def _save(self, state):
+        payload = {**state, 'hmac_sha256': self.authority._mac(state)}
+        temp = self.path.with_name('.' + self.path.name + '-' + uuid4().hex)
+        try:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                json.dump(payload, stream, ensure_ascii=False, sort_keys=True, allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, self.path)
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temp.exists():
+                temp.unlink()
+
+    def step(self):
+        state = self._load()
+        try:
+            frozen = pilot._coverage(self.coverage_provider())
+        except Exception as exc:
+            raise RuntimeError('coverage unavailable') from exc
+        coverage_digest = _digest(frozen)
+        if state.get('coverage_sha256', coverage_digest) != coverage_digest:
+            raise ValueError('coverage or generation drift')
+        state['coverage_sha256'] = coverage_digest
+        responses = state['responses']
+        offset = 0
+
+        def replay(kind, request):
+            nonlocal offset
+            digest = _digest(request)
+            if offset == len(responses):
+                raise _NextComparisonStep(kind, request)
+            record = responses[offset]
+            offset += 1
+            if not isinstance(record, dict) or record.get('kind') != kind or record.get('request_sha256') != digest:
+                raise ValueError('comparison replay input changed')
+            return copy.deepcopy(record['output'])
+
+        def generate(request):
+            return replay('generator', request)
+
+        def verify(request):
+            return replay('verifier', request)
+
+        try:
+            result = evaluate_scenarios(baseline=self.baseline, candidate=self.candidate, scope=self.scope,
+                coverage_provider=lambda: copy.deepcopy(frozen), generator=generate, private_verifier=verify,
+                scenarios=fixed_scenarios(), audit_dir=self.audit_dir, authority=self.authority)
+        except _NextComparisonStep as step:
+            if self.before_callback is not None:
+                self.before_callback()
+            component = self.generator if step.kind == 'generator' else self.private_verifier
+            output = component(copy.deepcopy(step.request))
+            # Validate JSON serializability before replacing the durable state.
+            _digest(output)
+            responses.append({'kind': step.kind, 'request_sha256': _digest(step.request),
+                              'output': copy.deepcopy(output)})
+            self._save(state)
+            return {'status': 'pending'}
+        if offset != len(responses):
+            raise ValueError('comparison replay has unused responses')
+        return {'status': 'complete', 'assessment': result}
+
+
 def _evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, generator,
                         private_verifier, scenarios, audit_dir, attempts, records, authority):
     """Evaluate fixed cases against actual pilot generation and private review.
@@ -279,14 +396,13 @@ def _evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, genera
                 dimension_projection=copy.deepcopy(version['dimension_projection']),
                 coverage_provider=checked_coverage, generator=run,
                 private_verifier=verify)
-            if result.get('rejected_cards'):
-                raise ValueError('pilot rejected generated cards')
             _privacy_check(result['cards'], contexts)
+            _privacy_check(result.get('rejected_cards', []), contexts)
             observations = {check['kind']: _observation(check['kind'], result['cards'], scope)
                             for check in scenario['checks']}
             sides[name] = {'input': captured['input'], 'output': captured['output'],
                            'verified_cards': result['cards'], 'observations': observations,
-                           'reviews': reviews}
+                           'reviews': reviews, 'rejected_cards': result.get('rejected_cards', [])}
             for field in ('input', 'output', 'verified_cards'):
                 sides[name][field + '_sha256'] = _digest(sides[name][field])
         checks = scenario['checks']
@@ -304,7 +420,8 @@ def _evaluate_scenarios(*, baseline, candidate, scope, coverage_provider, genera
     checked_coverage()
     if components != {'generator': _callable_fingerprint(generator), 'verifier': _callable_fingerprint(private_verifier)} or scripts != _script_fingerprint():
         raise ValueError('comparison components changed')
-    allowed = (all(r['comparison']['mandatory_pass'] and not r['comparison']['degraded']
+    allowed = (all(not r['baseline']['rejected_cards'] and not r['candidate']['rejected_cards']
+                   and r['comparison']['mandatory_pass'] and not r['comparison']['degraded']
                    and not r['comparison']['new_critical_error'] for r in records)
                and any(r['comparison']['improved'] for r in records))
     audit = {'activation_allowed': allowed, 'generation_id': frozen['generation']['run_id'],

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -483,11 +485,27 @@ class FifoWorker:
         self._wake = asyncio.Event()
         self._task: Optional[asyncio.Task[Any]] = None
         self._stopping = False
+        self.interest_cycle = None
+        self._lock_fd: Optional[int] = None
 
     async def start(self) -> None:
-        self.store.recover_jobs(automatic_run_hour=self.service.config.learning_run_hour)
-        self._task = asyncio.create_task(self._loop(), name="vitaly-bot-model-worker")
-        self._wake.set()
+        if self._lock_fd is not None:
+            raise StateError('Очередь модели уже запущена')
+        fd = os.open(self.store.state_dir / 'model-worker.lock',
+                     os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise StateError('Очередь модели уже работает в другом процессе') from error
+            self.store.recover_jobs(automatic_run_hour=self.service.config.learning_run_hour)
+            self._stopping = False
+            self._task = asyncio.create_task(self._loop(), name="vitaly-bot-model-worker")
+            self._lock_fd = fd
+            self._wake.set()
+        except BaseException:
+            os.close(fd)
+            raise
 
     def notify(self) -> None:
         self._wake.set()
@@ -495,12 +513,49 @@ class FifoWorker:
     async def stop(self) -> None:
         self._stopping = True
         self._wake.set()
-        if self._task:
-            await self._task
+        try:
+            if self._task:
+                await self._task
+        finally:
+            self._task = None
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)
+                self._lock_fd = None
 
     async def _loop(self) -> None:
         while not self._stopping:
             job = self.store.next_queued_work(automatic_run_hour=self.service.config.learning_run_hour)
+            # This is still the same consumer: the durable interest checkpoint
+            # is considered only after case and person-submitted learning work.
+            interest_ready = False
+            if (self.interest_cycle is not None
+                    and (job is None or (job.get('scope') == 'learning' and job.get('kind') in
+                                         {'knowledge_generate', 'knowledge_verify'}))):
+                try:
+                    interest_ready = self.interest_cycle.ready()
+                except Exception:
+                    # Keep foreground work operational even if the private
+                    # learning checkpoint is unreadable or unauthenticated.
+                    try:
+                        self.store.record_learning_event('interest_cycle_unavailable', 'learning_control', '1',
+                            status='failed', error_code='interest_checkpoint_unavailable')
+                    except Exception:
+                        pass
+            if interest_ready:
+                try:
+                    await self.interest_cycle.step()
+                except Exception:
+                    # A failed checkpoint write must not kill the FIFO worker.
+                    # The scheduler will retry admission on its next tick.
+                    self._wake.clear()
+                    # The failed step may have queued a user just before the
+                    # clear. Recheck durable work before going to sleep.
+                    with self.store._connect() as connection:
+                        foreground = (connection.execute("SELECT 1 FROM jobs WHERE status='queued' LIMIT 1").fetchone()
+                                      or connection.execute("SELECT 1 FROM learning_jobs WHERE status='queued' AND kind IN ('feedback_analyze','meeting_analyze') LIMIT 1").fetchone())
+                    if not foreground:
+                        await self._wake.wait()
+                continue
             if job is None:
                 self._wake.clear()
                 await self._wake.wait()

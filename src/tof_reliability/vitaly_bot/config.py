@@ -74,6 +74,20 @@ def load_config(environ: Optional[Dict[str, str]] = None, require_token: bool = 
         if any((parent / '.git').exists() for parent in (release_path, *release_path.parents)):
             raise InputError('Каталог частных выпусков должен находиться вне Git')
         hypotheses_production = {'directory': directory, 'manifest_sha256': digest}
+        auto_fields = {'authority_path': 'VITALY_BOT_HYPOTHESES_AUTHORITY_PATH',
+                       'authority_fingerprint': 'VITALY_BOT_HYPOTHESES_AUTHORITY_SHA256',
+                       'state_path': 'VITALY_BOT_HYPOTHESES_STATE_PATH',
+                       'inventory_path': 'VITALY_BOT_HYPOTHESES_INVENTORY_PATH',
+                       'audit_dir': 'VITALY_BOT_HYPOTHESES_AUDIT_DIR'}
+        auto = {key: values.get(env, '').strip() for key, env in auto_fields.items()}
+        if any(auto.values()):
+            if not all(auto.values()) or not re.fullmatch(r'[0-9a-f]{64}', auto['authority_fingerprint']):
+                raise InputError('Нужна полная конфигурация доверенного автоматического выпуска')
+            for key in ('authority_path', 'state_path', 'inventory_path', 'audit_dir'):
+                path = Path(auto[key])
+                if not path.is_absolute() or any((p / '.git').exists() for p in (path.resolve(), *path.resolve().parents)):
+                    raise InputError('Пути автоматического выпуска должны быть абсолютными и вне Git')
+            hypotheses_production.update(auto)
     if values.get('VITALY_BOT_HYPOTHESES_DEVELOPMENT') == '1':
         fields = {'corpus_dir': 'VITALY_BOT_HYPOTHESES_CORPUS_DIR',
                   'original_dir': 'VITALY_BOT_HYPOTHESES_ORIGINAL_DIR',

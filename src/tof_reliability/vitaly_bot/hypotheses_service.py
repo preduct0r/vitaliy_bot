@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import contextlib
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
@@ -51,6 +52,11 @@ class HypothesesService:
         return knowledge
 
     def submit(self, *, case_id, chat_id, user_id, description=''):
+        acceptance = getattr(self.knowledge_loader, 'acceptance', None)
+        with acceptance() if callable(acceptance) else contextlib.nullcontext():
+            return self._submit(case_id=case_id, chat_id=chat_id, user_id=user_id, description=description)
+
+    def _submit(self, *, case_id, chat_id, user_id, description=''):
         case = self.store.get_case(case_id)
         if user_id != chat_id or case['chat_id'] != chat_id:
             raise StateError('Кейс принадлежит другому пользователю')

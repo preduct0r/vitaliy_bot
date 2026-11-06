@@ -62,7 +62,7 @@ def validate_source_evidence(*, release_store, inventory, candidate, proposal,
         raise ValueError('historical source missing')
     for row in historical:
         old_row = old_sources[row['id']]
-        if any(row.get(key) != old_row.get(key) for key in ('id', 'sha256', 'date')):
+        if any(row.get(key) != old_row.get(key) for key in ('id', 'sha256', 'date', 'meeting_id')):
             raise ValueError('historical source changed')
     originals, texts, hashes = {}, {}, set()
     for row in rows:
@@ -79,6 +79,9 @@ def validate_source_evidence(*, release_store, inventory, candidate, proposal,
     meeting_ids = [row['meeting_id'] for row in meetings]
     if len(set(meeting_ids)) != len(meeting_ids):
         raise ValueError('meetings are not distinct')
+    historical_meetings = {row.get('meeting_id') for row in historical if row.get('meeting_id')}
+    if historical_meetings.intersection(meeting_ids):
+        raise ValueError('meeting already present in historical inventory')
     by_id = {row['id']: row for row in meetings}
     evidence = proposal.get('evidence')
     if not isinstance(evidence, list) or not evidence:
@@ -93,6 +96,8 @@ def validate_source_evidence(*, release_store, inventory, candidate, proposal,
         if (ident not in by_id or entry.get('attribution') not in ATTRIBUTIONS or not match
                 or int(match[1]) >= int(match[2]) or int(match[2]) > len(texts[ident])):
             raise ValueError('invalid source evidence')
+        if any(not old.get('meeting_id') and old.get('date') == by_id[ident].get('date') for old in historical):
+            raise ValueError('historical meeting identity is ambiguous')
     version = candidate.get('knowledge_version')
     context = candidate.get('interest_context', {})
     if not version or version == current['version'] or context.get('version') != version:
@@ -126,9 +131,26 @@ def validate_source_evidence(*, release_store, inventory, candidate, proposal,
             raise ValueError('historical dimension changed')
         if any(entry not in current_dimension.get('evidence', []) for entry in previous.get('evidence', [])):
             raise ValueError('historical dimension evidence removed')
-    for trace, answer in ((classifier_trace, classifier), (verifier_trace, verifier)):
-        if not trace.get('thread_id') or trace.get('answer') != answer.get('answer'):
-            raise ValueError('trace mismatch')
+    # Runtime classifiers emit one proposal, whereas the release format stores
+    # one row per cited source. Preserve the actual trace and verify the exact
+    # deterministic normalization rather than inventing a model response.
+    raw_classifier = classifier_trace.get('answer')
+    if raw_classifier != classifier.get('answer'):
+        if (not isinstance(raw_classifier, dict)
+                or set(raw_classifier) != {'decision', 'interest_id', 'dimension_id', 'requirement', 'scope', 'evidence'}
+                or raw_classifier['decision'] != 'candidate'
+                or raw_classifier['interest_id'] != proposal.get('id')
+                or raw_classifier['requirement'] != proposal.get('requirement')
+                or raw_classifier['scope'] != proposal.get('scope')
+                or raw_classifier['evidence'] != evidence):
+            raise ValueError('classifier trace mismatch')
+        expected_rows = [{**entry, 'interest_id': raw_classifier['interest_id'],
+                          'dimension_id': raw_classifier['dimension_id']} for entry in evidence]
+        if classifier.get('answer') != {'candidates': expected_rows}:
+            raise ValueError('classifier trace normalization mismatch')
+    if (not classifier_trace.get('thread_id') or not verifier_trace.get('thread_id')
+            or verifier_trace.get('answer') != verifier.get('answer')):
+        raise ValueError('trace mismatch')
     if classifier_trace['thread_id'] == verifier_trace['thread_id']:
         raise ValueError('same trace thread')
     candidates = classifier.get('answer', {}).get('candidates')
@@ -161,7 +183,18 @@ def validate_source_evidence(*, release_store, inventory, candidate, proposal,
             new_meetings = {by_id[e['source_id']]['meeting_id'] for e in new_entries if e.get('source_id') in by_id}
             if dimension.get('independent_meeting_count') != previous.get('independent_meeting_count') + len(new_meetings):
                 raise ValueError('dimension meeting count mismatch')
-            if dimension.get('attribution_meeting_counts') != previous.get('attribution_meeting_counts'):
+            prior_counts = previous.get('attribution_meeting_counts')
+            if prior_counts is None:
+                expected_counts = None
+            elif isinstance(prior_counts, dict):
+                expected_counts = dict(prior_counts)
+                additions = {(by_id[e['source_id']]['meeting_id'], e['attribution'])
+                             for e in new_entries if e.get('source_id') in by_id}
+                for _, attribution in additions:
+                    expected_counts[attribution] = expected_counts.get(attribution, 0) + 1
+            else:
+                raise ValueError('invalid prior attribution aggregates')
+            if dimension.get('attribution_meeting_counts') != expected_counts:
                 raise ValueError('unverified attribution aggregates')
         for item in dimension.get('evidence', []):
             if item not in prior and not any(
@@ -397,6 +430,19 @@ class AtomicReleaseManager:
             if releases.get(binding.get('knowledge_version')) != binding.get('manifest_sha256'):
                 raise ValueError('binding is not in the trusted chain')
             return self.release_store.load_bound(binding)
+
+    def load_version(self, version):
+        """Load a historical or active release only from the authenticated chain."""
+        with self._locked() as db:
+            self._recover(db)
+            releases, _ = self._chain(db)
+            digest = releases.get(version)
+            if not digest:
+                raise ValueError('release version is not trusted')
+            record = json.loads((self.release_store.root / 'records' / (version + '.json')).read_text(encoding='utf-8'))
+            if record.get('manifest_sha256') != digest:
+                raise ValueError('release record does not match trusted chain')
+            return self.release_store.load(version)
 
     def _advance(self, db, version, digest):
         db.execute('UPDATE state SET pending_version=?,pending_hash=? WHERE id=1', (version, digest))
