@@ -30,6 +30,95 @@ class _ForegroundWaiting(Exception):
     pass
 
 
+def _baseline_original_matches(row, item):
+    expected = item.get('original_sha256')
+    if expected is None and item['id'].startswith('submission-'):
+        # The minimal audited index pins the archived original as the same
+        # bytes as the indexed source; any other relation needs a new audit.
+        expected = item['sha256']
+    return expected is None or row.get('original_sha256') == expected
+
+
+def _new_accepted_records(records, baseline, inventory):
+    """Classify using pinned identity; legacy indexes may use exact content.
+
+    The inventory is operator-controlled input. Lineage must be captured from
+    an independent snapshot, never derived from the live record being checked.
+    """
+    lineage = inventory.get('historical_submission_lineage', {})
+    origin = inventory.get('historical_lineage_version', inventory.get('baseline_version'))
+    by_id, by_hash = {}, {}
+    for source in baseline:
+        source_id = source['id']
+        meeting_id = source.get('meeting_id')
+        if source_id.startswith('submission-'):
+            inferred = source_id[len('submission-'):]
+            if not inferred or (meeting_id and meeting_id != inferred):
+                raise ValueError('conflicting historical identity')
+            meeting_id = inferred
+        if meeting_id:
+            if meeting_id in by_id:
+                raise ValueError('duplicate historical identity')
+            by_id[meeting_id] = source
+        if source['sha256'] in by_hash:
+            raise ValueError('duplicate baseline source')
+        by_hash[source['sha256']] = source
+    snapshot_hashes = {pin.get(key) for source in baseline
+                       if source['id'].startswith('submission-')
+                       for pin in [lineage.get(source['id'], {})] if isinstance(pin, dict)
+                       for key in ('normalized_sha256', 'normalized_file_sha256')}
+    seen, new, new_hashes = set(), [], set()
+    for record in records:
+        meeting_id = record['id']
+        source = by_id.get(meeting_id)
+        if source:
+            seen.add(meeting_id)
+            if source['id'].startswith('submission-'):
+                pin = lineage.get(source['id'])
+                if not isinstance(pin, dict) or any(pin.get(k) != v for k, v in {
+                    'baseline_version': origin, 'indexed_sha256': source['sha256'],
+                    'meeting_id': meeting_id, 'meeting_date': record['meeting_date'],
+                    'source_sha256': record['source_sha256'],
+                    'normalized_sha256': record['normalized_sha256'],
+                }.items()):
+                    raise ValueError('historical submission lineage mismatch')
+                _bytes(record['source_path'], pin['source_sha256'])
+                _bytes(record['normalized_path'], pin.get('normalized_file_sha256'))
+            else:
+                if (record['meeting_date'] != source['date'] or
+                        record['normalized_sha256'] != source['sha256'] or
+                        record['source_sha256'] != source['original_sha256']):
+                    raise ValueError('historical meeting changed')
+                _bytes(record['normalized_path'], record['normalized_sha256'])
+                _bytes(record['source_path'], record['source_sha256'])
+            continue
+        collision = by_hash.get(record['normalized_sha256'])
+        if collision:
+            # Only an identity-free legacy source can be reconciled by exact
+            # content, and a matching date is required to avoid hiding meetings.
+            if (collision.get('meeting_id') or collision['id'].startswith('submission-')
+                    or collision.get('date') != record['meeting_date']):
+                raise ValueError('historical content collision')
+            _bytes(record['normalized_path'], record['normalized_sha256'])
+            _bytes(record['source_path'], record['source_sha256'])
+            if collision['id'] in seen:
+                raise ValueError('ambiguous legacy content')
+            seen.add(collision['id'])
+            continue
+        date.fromisoformat(record['meeting_date'])
+        _bytes(record['normalized_path'], record['normalized_sha256'])
+        _bytes(record['source_path'], record['source_sha256'])
+        if record['normalized_sha256'] in snapshot_hashes:
+            raise ValueError('historical snapshot content collision')
+        if record['normalized_sha256'] in new_hashes:
+            raise ValueError('duplicate meeting content')
+        new_hashes.add(record['normalized_sha256'])
+        new.append(record)
+    if not set(by_id).issubset(seen):
+        raise ValueError('historical meeting unavailable')
+    return new
+
+
 class AutomaticInterestCycle:
     """One durable, low-priority model step at a time; owns no worker or timer."""
 
@@ -68,7 +157,9 @@ class AutomaticInterestCycle:
         historical, hashes = [], set()
         for item in baseline:
             row = known.get(item['id'], item)
-            if any(row.get(key) != item.get(key) for key in ('id', 'date', 'sha256', 'meeting_id')) or row.get('status') != 'accepted':
+            if (any(row.get(key) != item.get(key) for key in ('id', 'date', 'sha256', 'meeting_id'))
+                    or not _baseline_original_matches(row, item)
+                    or row.get('status') != 'accepted'):
                 raise ValueError('baseline inventory differs')
             _bytes(row['path'], row['sha256'])
             _bytes(row['original_path'], row['original_sha256'])
@@ -79,13 +170,7 @@ class AutomaticInterestCycle:
         with self.store._connect() as db:
             rows = db.execute("SELECT * FROM meeting_submissions WHERE status='accepted' ORDER BY id").fetchall()
         meetings = []
-        for record in rows:
-            if record['normalized_sha256'] in hashes:
-                continue
-            date.fromisoformat(record['meeting_date'])
-            _bytes(record['normalized_path'], record['normalized_sha256'])
-            _bytes(record['source_path'], record['source_sha256'])
-            hashes.add(record['normalized_sha256'])
+        for record in _new_accepted_records(rows, baseline, seed):
             meetings.append({'id': record['id'], 'meeting_id': record['id'], 'date': record['meeting_date'],
                 'kind': 'meeting', 'status': 'accepted', 'path': record['normalized_path'],
                 'original_path': record['source_path'], 'sha256': record['normalized_sha256'],
@@ -93,6 +178,9 @@ class AutomaticInterestCycle:
         result = {'complete': True, 'baseline_version': active['version'],
                   'historical_source_ids': [row['id'] for row in historical],
                   'historical_sources': historical, 'meetings': meetings}
+        if 'historical_submission_lineage' in seed:
+            result['historical_submission_lineage'] = copy.deepcopy(seed['historical_submission_lineage'])
+            result['historical_lineage_version'] = seed.get('historical_lineage_version', seed.get('baseline_version'))
         self.releases._atomic_json(self.inventory_path, result)
         _fsync_dir(self.inventory_path.parent)
         return result
@@ -149,9 +237,8 @@ class AutomaticInterestCycle:
                 or len(historical) != len(old_sources) or {r['id'] for r in historical} != set(old_sources)):
             raise ValueError('incomplete historical inventory')
         with self.store._connect() as db:
-            accepted = db.execute("SELECT id, normalized_sha256 FROM meeting_submissions WHERE status='accepted'").fetchall()
-        historical_hashes = {row.get('sha256') for row in old_sources.values()}
-        expected_meetings = {row['id'] for row in accepted if row['normalized_sha256'] not in historical_hashes}
+            accepted = db.execute("SELECT * FROM meeting_submissions WHERE status='accepted'").fetchall()
+        expected_meetings = {row['id'] for row in _new_accepted_records(accepted, old_sources.values(), inventory)}
         supplied_meetings = [row.get('meeting_id') for row in inventory.get('meetings', [])]
         if len(supplied_meetings) != len(set(supplied_meetings)) or set(supplied_meetings) != expected_meetings:
             raise ValueError('accepted meeting inventory incomplete')
@@ -166,7 +253,9 @@ class AutomaticInterestCycle:
                 raise ValueError('duplicate source content')
             hashes.add(row['sha256'])
             if row in historical:
-                if any(row.get(k) != old_sources[row['id']].get(k) for k in ('id', 'sha256', 'date', 'meeting_id')):
+                item = old_sources[row['id']]
+                if (any(row.get(k) != item.get(k) for k in ('id', 'sha256', 'date', 'meeting_id'))
+                        or not _baseline_original_matches(row, item)):
                     raise ValueError('historical source changed')
             else:
                 meeting = self.store.get_meeting(row['meeting_id'])
