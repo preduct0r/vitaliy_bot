@@ -393,6 +393,25 @@ class TelegramRuntime:
                         raise StateError('Выпуск гипотез изменился без согласованной конфигурации')
                     return inner.load_version(active['version'], profile_version, knowledge_package_id)
 
+                def bind(inner, **fields):
+                    # Admission already holds the manager lock where configured.
+                    return releases.bind(**fields)
+
+                def requires_binding(inner, run_id):
+                    return releases.requires_binding(run_id)
+
+                def load_bound(inner, binding):
+                    package = self.store.get_knowledge_package(binding['knowledge_package_id'])
+                    if str(package['package']['profile']['version']) != binding['profile_version']:
+                        raise StateError('Профиль не соответствует пакету кейса')
+                    result = production_manager.load_bound(binding) if production_manager else releases.load_bound(binding)
+                    interests = _interests(result['interest_context'])
+                    projection = result['dimension_projection']
+                    generation = projection.get('generation_id', 'not-yet-checked')
+                    if not _dimension_bindings(projection, interests, {'generation': {'run_id': generation}}):
+                        raise StateError('В выпуске нет проверенных связей интересов')
+                    return result
+
                 def load_version(inner, version, profile_version, knowledge_package_id):
                     package = self.store.get_knowledge_package(knowledge_package_id)
                     if str(package['package']['profile']['version']) != profile_version:

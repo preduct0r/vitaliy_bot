@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -30,6 +31,107 @@ def _read(path):
 def _digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                      separators=(',', ':')).encode()).hexdigest()
+
+
+def build_s1_release(source_dir, destination, *, manifest_sha256):
+    """Replay the trusted s1 snapshot and stage a portable private release."""
+    from .hypotheses_topic_projection import project_semantic_dimensions
+
+    source = Path(source_dir).resolve()
+    target = Path(destination).resolve()
+    if any((parent / '.git').exists() for parent in (target, *target.parents)):
+        raise ValueError('private release must be outside Git')
+    if target.exists():
+        raise ValueError('release destination already exists')
+    manifest_path = source / 'final-manifest.json'
+    if not re.fullmatch(r'[0-9a-f]{64}', str(manifest_sha256)) or _sha(manifest_path) != manifest_sha256:
+        raise ValueError('s1 manifest hash mismatch')
+    audit = _read(manifest_path)
+    if (audit.get('status') != 'private_corpus_replayed_server_passed_release_not_verified' or
+            audit.get('cutoff_exclusive') != '2026-11-07' or not isinstance(audit.get('sha256'), dict)):
+        raise ValueError('unsupported s1 audit')
+    inventory = audit['sha256']
+    for name, digest in inventory.items():
+        path = source / name
+        if (not isinstance(name, str) or Path(name).is_absolute() or '..' in Path(name).parts or
+                not path.resolve().is_relative_to(source) or path.is_symlink() or _sha(path) != digest):
+            raise ValueError('s1 audited file changed')
+    required = ('full-corpus/training-interest-map.json', 'full-corpus/training-index.json',
+                'dimension-projection/repair-dimensions-private.json')
+    if not set(required) <= set(inventory):
+        raise ValueError('s1 inventory incomplete')
+    profile, index, projection = (_read(source / name) for name in required)
+    if index.get('snapshot_cutoff') != audit['cutoff_exclusive']:
+        raise ValueError('s1 cutoff mismatch')
+    for entry in index['sources']:
+        path = Path(entry['path'])
+        if not path.is_absolute() or not path.resolve().is_relative_to(source):
+            raise ValueError('s1 source outside audited snapshot')
+        name = str(path.resolve().relative_to(source))
+        if inventory.get(name) != entry['sha256']:
+            raise ValueError('s1 source not in trusted inventory')
+    traces, answers = {}, {}
+    available_traces = Counter(inventory[name] for name in inventory
+                               if name.startswith('dimension-projection/trace-') and name.endswith('.jsonl'))
+    all_threads = set()
+    for role, key in (('classifier', 'candidates'), ('verifier', 'verdicts')):
+        names = sorted(name for name in inventory if re.fullmatch(r'dimension-projection/' + role + r'-bounded-\d+\.json', name))
+        if not names:
+            raise ValueError('s1 semantic batches missing')
+        traces[role], answers[role] = [], []
+        for name in names:
+            item = _read(source / name)
+            trace, answer = item['trace'], item['answer']
+            ids = [event.get('thread_id') for event in (json.loads(line) for line in trace.splitlines() if line.strip())
+                   if event.get('type') == 'thread.started']
+            trace_hash = hashlib.sha256(trace.encode('utf-8')).hexdigest()
+            if (len(ids) != 1 or not ids[0] or ids[0] in all_threads or parse_trace(trace) != answer or
+                    available_traces[trace_hash] < 1 or not isinstance(answer.get(key), list)):
+                raise ValueError('s1 trace or independent thread mismatch')
+            all_threads.add(ids[0])
+            available_traces[trace_hash] -= 1
+            traces[role].append(trace)
+            answers[role].extend(answer[key])
+    def key(row):
+        return tuple(row[name] for name in ('interest_id', 'dimension_id', 'source_id', 'locator'))
+    verdicts = {key(row): row for row in answers['verifier']}
+    if len(verdicts) != len(answers['verifier']) or set(verdicts) != {key(row) for row in answers['classifier']}:
+        raise ValueError('s1 semantic verdict inventory mismatch')
+    replayed = project_semantic_dimensions(profile, index, classifier=lambda _: answers['classifier'],
+        verifier=lambda request: verdicts[key({**request, **request['evidence']})], final_cutoff=audit['cutoff_exclusive'])
+    if replayed != projection:
+        raise ValueError('s1 projection replay mismatch')
+    bound = bind_expanded_projection(profile=profile, source_index=index, projection=projection)
+    bound['dimensions'] = [row for row in bound['dimensions'] if row['independent_meeting_count'] >= 2]
+    portable_index = {**index, 'sources': [{k: v for k, v in entry.items() if k not in ('path', 'original_path')}
+                                          for entry in index['sources']]}
+    payloads = {'interest-map.json': profile, 'source-index.json': portable_index, 'dimension-projection.json': bound,
+                'classifier.json': {'answer': {'candidates': answers['classifier']}},
+                'verifier.json': {'answer': {'verdicts': answers['verifier']}},
+                'classifier-trace.json': {'traces': traces['classifier']},
+                'verifier-trace.json': {'traces': traces['verifier']}}
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix='.s1-release-', dir=target.parent))
+    try:
+        for name, value in payloads.items():
+            (stage / name).write_text(json.dumps(value, ensure_ascii=False, sort_keys=True), encoding='utf-8')
+            os.chmod(stage / name, 0o600)
+        manifest = {'format': 'hypotheses-knowledge-release.v1', 'version': profile['version'],
+                    'purpose': 'production', 'developmental_only': False, 'source_ids': [x['id'] for x in index['sources']],
+                    's1_manifest_sha256': manifest_sha256,
+                    'interest_map': 'interest-map.json', 'source_index': 'source-index.json',
+                    'dimension_projection': 'dimension-projection.json', 'classifier': 'classifier.json',
+                    'verifier': 'verifier.json', 'classifier_trace': 'classifier-trace.json', 'verifier_trace': 'verifier-trace.json',
+                    'files': {name: _sha(stage / name) for name in payloads}}
+        (stage / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True), encoding='utf-8')
+        os.chmod(stage / 'manifest.json', 0o600)
+        digest = _sha(stage / 'manifest.json')
+        VerifiedReleaseStore._validate(stage, digest)
+        os.rename(stage, target)
+        return digest
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
 
 
 class VerifiedReleaseStore:
@@ -73,12 +175,16 @@ class VerifiedReleaseStore:
             raise ValueError('release roles missing or overlapping')
         values = {k: _read(directory / m[k]) for k in roles}
         index, interests = values['source_index'], values['interest_map']
-        if index.get('version') != version or interests.get('version') != version:
+        if (interests.get('version') != version or not index.get('version') or
+                (index['version'] != version and interests.get('corpus_version') != index['version'])):
             raise ValueError('release version mismatch')
         sources = index.get('sources')
         items = interests.get('interests')
         if not isinstance(sources, list) or not sources or not isinstance(items, list) or not items:
             raise ValueError('source inventory or interest map missing')
+        interest_ids = [item['id'] for item in items]
+        if any(not isinstance(value, str) or not value for value in interest_ids) or len(set(interest_ids)) != len(interest_ids):
+            raise ValueError('invalid or duplicate interest identifier')
         source_ids = [row['id'] for row in sources]
         if len(set(source_ids)) != len(source_ids) or set(m.get('source_ids', [])) != set(source_ids) or len(m.get('source_ids', [])) != len(source_ids):
             raise ValueError('source inventory mismatch')
@@ -87,7 +193,29 @@ class VerifiedReleaseStore:
             if not references or not set(references) <= set(source_ids):
                 raise ValueError('interest source mismatch')
         a, b = values['classifier_trace'], values['verifier_trace']
-        if not a.get('thread_id') or not b.get('thread_id') or a['thread_id'] == b['thread_id'] or a.get('answer') != values['classifier'].get('answer') or b.get('answer') != values['verifier'].get('answer'):
+        if 'traces' in a or 'traces' in b:
+            threads = set()
+            for trace_set, role, key in ((a, 'classifier', 'candidates'), (b, 'verifier', 'verdicts')):
+                traces = trace_set.get('traces')
+                if not isinstance(traces, list) or not traces:
+                    raise ValueError('missing raw semantic traces')
+                rows = []
+                for trace in traces:
+                    if not isinstance(trace, str):
+                        raise ValueError('invalid raw semantic trace')
+                    events = [json.loads(line) for line in trace.splitlines() if line.strip()]
+                    ids = [event.get('thread_id') for event in events if event.get('type') == 'thread.started']
+                    if len(ids) != 1 or not isinstance(ids[0], str) or not ids[0] or ids[0] in threads:
+                        raise ValueError('semantic trace threads are not independent')
+                    threads.add(ids[0])
+                    answer = parse_trace(trace)
+                    if not isinstance(answer, dict) or not isinstance(answer.get(key), list):
+                        raise ValueError('invalid semantic trace answer')
+                    rows.extend(answer[key])
+                expected_rows = values[role].get('answer', {}).get(key)
+                if not isinstance(expected_rows, list) or Counter(map(_digest, rows)) != Counter(map(_digest, expected_rows)):
+                    raise ValueError('semantic trace answer mismatch')
+        elif not a.get('thread_id') or not b.get('thread_id') or a['thread_id'] == b['thread_id'] or a.get('answer') != values['classifier'].get('answer') or b.get('answer') != values['verifier'].get('answer'):
             raise ValueError('independent trace mismatch')
         candidates = values['classifier'].get('answer', {}).get('candidates')
         verdicts = values['verifier'].get('answer', {}).get('verdicts')
@@ -141,6 +269,19 @@ class VerifiedReleaseStore:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         releases = self.root / 'releases'
         releases.mkdir(mode=0o700, exist_ok=True)
+        key_path = self.root / 'binding.key'
+        if not key_path.exists():
+            if any(releases.iterdir()):
+                raise ValueError('binding key is missing for existing release store')
+            try:
+                fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(os.urandom(32))
+                    stream.flush()
+                    os.fsync(stream.fileno())
         destination = releases / version
         if destination.exists():
             existing = _read(self.root / 'records' / (version + '.json'))
@@ -202,7 +343,43 @@ class VerifiedReleaseStore:
                 projected.append({'id': item['id'], 'requirement': item['requirement'],
                                   'attributions': sorted({e['attribution'] for e in evidence}), 'evidence': evidence})
             context = {'version': context['version'], 'corpus_version': index['version'], 'interests': projected}
-        return {'knowledge_version': version, 'interest_context': context, 'dimension_projection': values['dimension_projection']}
+        else:
+            context = {'version': context['version'], 'corpus_version': index['version'], 'interests': [
+                {key: item[key] for key in ('id', 'source_id', 'label') if key in item}
+                for item in context['interests']]}
+        source_projection = values['dimension_projection']
+        projection = {key: source_projection[key] for key in
+                      ('version', 'profile_version', 'corpus_version', 'generation_id') if key in source_projection}
+        projection['dimensions'] = []
+        for row in source_projection['dimensions']:
+            safe_row = {key: row[key] for key in ('dimension_id', 'topic_id', 'description', 'interest_ids',
+                        'source_ids', 'independent_meeting_count', 'attribution_meeting_counts') if key in row}
+            if 'evidence' in row:
+                safe_row['evidence'] = [{key: entry[key] for key in ('interest_id', 'source_id', 'locator', 'attribution')
+                                         if key in entry} for entry in row['evidence']]
+            projection['dimensions'].append(safe_row)
+        return {'knowledge_version': version, 'interest_context': context, 'dimension_projection': projection}
+
+    def _binding_mac(self, binding):
+        path = self.root / 'binding.key'
+        if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+            raise ValueError('private binding key unavailable or insecure')
+        key = path.read_bytes()
+        if len(key) != 32:
+            raise ValueError('invalid private binding key')
+        message = json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+        return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+    def _binding_path(self, run_id):
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError('run identifier required')
+        return self.root / 'bindings' / (hashlib.sha256(run_id.encode()).hexdigest() + '.json')
+
+    def requires_binding(self, run_id):
+        path = self._binding_path(run_id)
+        if path.is_symlink():
+            raise ValueError('invalid binding record')
+        return path.exists()
 
     def bind(self, *, profile_version, knowledge_package_id, case_id, run_id):
         current = self.current()
@@ -211,12 +388,26 @@ class VerifiedReleaseStore:
         binding = {'profile_version': profile_version, 'knowledge_package_id': knowledge_package_id,
                    'case_id': case_id, 'run_id': run_id, 'knowledge_version': current['version'],
                    'manifest_sha256': current['manifest_sha256']}
-        return {**binding, 'knowledge_hash': _digest(binding)}
+        result = {**binding, 'knowledge_hash': self._binding_mac(binding)}
+        path = self._binding_path(run_id)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as error:
+            raise ValueError('run binding already exists') from error
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(result, stream, ensure_ascii=False, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return result
 
     def load_bound(self, binding):
         binding = dict(binding)
+        path = self._binding_path(binding.get('run_id'))
+        if not self.requires_binding(binding['run_id']) or _read(path) != binding:
+            raise ValueError('binding record missing or changed')
         digest = binding.pop('knowledge_hash', None)
-        if digest != _digest(binding):
+        if not isinstance(digest, str) or not hmac.compare_digest(digest, self._binding_mac(binding)):
             raise ValueError('binding changed')
         version = self._version(binding['knowledge_version'])
         record = _read(self.root / 'records' / (version + '.json'))

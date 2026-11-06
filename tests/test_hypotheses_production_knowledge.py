@@ -21,6 +21,7 @@ import pytest
 from test_hypotheses_telegram_integration import Harness, cards, isolated_dir
 from test_hypotheses_dimensions_pilot import dimension_case, topic_case
 from test_hypotheses_adjudicated_pilot import adjudication_case, source_case
+from test_hypotheses_semantic_projection import case as semantic_case
 
 from tof_reliability.vitaly_bot import hypotheses_knowledge, hypotheses_ui
 from tof_reliability.vitaly_bot.config import load_config
@@ -372,6 +373,10 @@ def test_synthetic_release_runs_through_configured_telegram_service(tmp_path, di
         hypotheses.coverage_provider = FakeCoverage(coverage)
         case = runtime.service.new_case(101)
         job = hypotheses.submit(case_id=case['id'], chat_id=101, user_id=101)
+        admitted = hypotheses.get_run(user_id=101, job_id=job['id'])
+        binding = json.loads(admitted['knowledge_binding_json'])
+        assert binding['run_id'] == admitted['id'] and binding['case_id'] == case['id']
+        assert releases.load_bound(binding)['knowledge_version'] == version
         _, failures = asyncio.run(drain(runtime.store, runtime.service, job))
         assert not failures
         assert hypotheses.get_run(user_id=101, job_id=job['id'])['knowledge_version'] == version
@@ -407,3 +412,194 @@ def test_installer_rejects_destination_inside_git(tmp_path):
     package = _package(tmp_path / 'source')
     with pytest.raises(ValueError):
         _install(_store(repo / 'private'), package)
+
+
+def test_release_never_exposes_private_fields_in_generator_context(tmp_path):
+    package = _package(tmp_path / 'source')
+    path = package / 'interest-map.json'
+    interest_map = json.loads(path.read_text(encoding='utf-8'))
+    secret = 'SYNTHETIC_PRIVATE_TRANSCRIPT_DO_NOT_EXPOSE'
+    interest_map['interests'][0]['private_transcript'] = secret
+    _write(path, interest_map)
+    digest = _rehash_manifest(package)
+    store = _store(tmp_path / 'private-releases')
+    try:
+        store.install(package, manifest_sha256=digest)
+        context = store.load('synthetic-release-1')['interest_context']
+    except ValueError:
+        # Rejecting an unsupported private field is also a safe outcome.
+        return
+    assert secret not in json.dumps(context, ensure_ascii=False)
+    assert 'private_transcript' not in json.dumps(context, ensure_ascii=False)
+
+
+@pytest.mark.parametrize('field,replacement', [
+    ('case_id', 'different-case'),
+    ('run_id', 'different-run'),
+    ('profile_version', 'different-profile'),
+    ('knowledge_package_id', 'different-general-package'),
+])
+def test_rehashed_binding_cannot_be_reassigned_to_another_run(tmp_path, field, replacement):
+    store = _store(tmp_path / 'private-releases')
+    _install(store, _package(tmp_path / 'source'))
+    binding = store.bind(profile_version='profile', knowledge_package_id='general',
+                         case_id='case', run_id='run')
+    forged = {**binding, field: replacement}
+    forged.pop('knowledge_hash')
+    forged['knowledge_hash'] = hashlib.sha256(_bytes(forged)).hexdigest()
+    with pytest.raises(ValueError):
+        store.load_bound(forged)
+    assert store.load_bound(binding)['knowledge_version'] == 'synthetic-release-1'
+
+
+def test_release_rejects_ambiguous_duplicate_interest_ids(tmp_path):
+    package = _package(tmp_path / 'source')
+    path = package / 'interest-map.json'
+    interest_map = json.loads(path.read_text(encoding='utf-8'))
+    duplicate = copy.deepcopy(interest_map['interests'][0])
+    duplicate['source_id'] = 'meeting-late'
+    interest_map['interests'].append(duplicate)
+    _write(path, interest_map)
+    digest = _rehash_manifest(package)
+    store = _store(tmp_path / 'private-releases')
+    with pytest.raises(ValueError):
+        store.install(package, manifest_sha256=digest)
+    assert store.current() is None
+
+
+def test_release_projection_does_not_expose_private_fields(tmp_path):
+    package = _package(tmp_path / 'source')
+    path = package / 'dimension-projection.json'
+    projection = json.loads(path.read_text(encoding='utf-8'))
+    projection['private_transcript'] = 'SYNTHETIC_PROJECTION_SECRET'
+    _write(path, projection)
+    store = _store(tmp_path / 'releases')
+    try:
+        store.install(package, manifest_sha256=_rehash_manifest(package))
+        loaded = store.load('synthetic-release-1')
+    except ValueError:
+        return
+    assert 'SYNTHETIC_PROJECTION_SECRET' not in json.dumps(loaded, ensure_ascii=False)
+
+
+def test_missing_binding_key_never_silently_rekeys_existing_store(tmp_path):
+    store = _store(tmp_path / 'releases')
+    _install(store, _package(tmp_path / 'first'))
+    binding = store.bind(profile_version='p', knowledge_package_id='g', case_id='c', run_id='r')
+    (store.root / 'binding.key').unlink()
+    with pytest.raises((ValueError, OSError)):
+        store.load_bound(binding)
+    with pytest.raises((ValueError, OSError)):
+        _install(store, _package(tmp_path / 'second', 'synthetic-release-2'))
+
+
+def test_issued_binding_is_durably_registered_and_cannot_be_reassigned(tmp_path):
+    store = _store(tmp_path / 'releases')
+    _install(store, _package(tmp_path / 'first'))
+    old = store.bind(profile_version='p', knowledge_package_id='g', case_id='c', run_id='run')
+    _install(store, _package(tmp_path / 'second', 'synthetic-release-2'))
+    assert _store(store.root).requires_binding('run')
+    with pytest.raises(ValueError):
+        store.bind(profile_version='p', knowledge_package_id='g', case_id='c', run_id='run')
+    assert store.load_bound(old)['knowledge_version'] == 'synthetic-release-1'
+
+
+@pytest.mark.parametrize('damage', ['changed', 'removed'])
+def test_service_persists_and_checks_run_binding_before_generation(tmp_path, dimension_case, damage):
+    from test_hypotheses_service_runtime import make_runtime, submit, drain
+    store, service, hypotheses, runner, _, loader, _ = make_runtime(tmp_path, dimension_case)
+    issued = {}
+    def bind(**fields):
+        binding = {**fields, 'knowledge_version': loader.version, 'signature': 'synthetic-signature'}
+        issued[fields['run_id']] = binding.copy()
+        return binding
+    def load_bound(binding):
+        if issued.get(binding.get('run_id')) != binding:
+            raise ValueError('binding changed')
+        return loader.load(binding['profile_version'], binding['knowledge_package_id'])
+    loader.bind = bind
+    loader.load_bound = load_bound
+    loader.requires_binding = lambda run_id: run_id in issued
+    case = service.new_case(101)
+    job = submit(hypotheses, case)
+    run = hypotheses.get_run(user_id=101, job_id=job['id'])
+    binding = json.loads(run['knowledge_binding_json'])
+    assert binding['run_id'] == run['id'] and binding['case_id'] == case['id']
+    binding['case_id'] = 'another-case'
+    with store._connect() as db:
+        db.execute('UPDATE hypotheses_runs SET knowledge_binding_json=? WHERE id=?',
+                   (json.dumps(binding) if damage == 'changed' else None, run['id']))
+    _, failures = asyncio.run(drain(store, service, job))
+    assert failures and not runner.calls
+
+
+def test_release_accepts_distinct_corpus_version_and_independent_raw_batch_traces(tmp_path):
+    package = _package(tmp_path / 'source')
+    index_path, map_path = package / 'source-index.json', package / 'interest-map.json'
+    index, interest_map = json.loads(index_path.read_text()), json.loads(map_path.read_text())
+    index['version'] = 'source-corpus-version'
+    interest_map['corpus_version'] = index['version']
+    _write(index_path, index)
+    _write(map_path, interest_map)
+    for role, key in [('classifier', 'candidates'), ('verifier', 'verdicts')]:
+        answer = json.loads((package / (role + '.json')).read_text())['answer']
+        batches = []
+        for number, row in enumerate(answer[key]):
+            thread = f'{role}-{number}'
+            events = [{'type': 'thread.started', 'thread_id': thread},
+                      {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps({key: [row]})}},
+                      {'type': 'turn.completed'}]
+            batches.append('\n'.join(json.dumps(event) for event in events))
+        _write(package / (role + '-trace.json'), {'traces': batches})
+    store = _store(tmp_path / 'releases')
+    store.install(package, manifest_sha256=_rehash_manifest(package))
+    loaded = store.load('synthetic-release-1')
+    assert loaded['interest_context']['version'] == 'synthetic-release-1'
+    assert loaded['interest_context']['corpus_version'] == 'source-corpus-version'
+    trace = json.loads((package / 'verifier-trace.json').read_text())
+    trace['traces'][0] = trace['traces'][1]
+    _write(package / 'verifier-trace.json', trace)
+    with pytest.raises(ValueError):
+        _store(tmp_path / 'other').install(package, manifest_sha256=_rehash_manifest(package))
+
+
+def test_build_release_replays_s1_evidence_and_original_traces(tmp_path, semantic_case):
+    from tof_reliability.vitaly_bot.hypotheses_topic_projection import project_semantic_dimensions
+    profile, index, candidate = copy.deepcopy(semantic_case)
+    root = tmp_path / 's1'
+    source = root / 'source.txt'
+    source.parent.mkdir()
+    shutil.copyfile(index['sources'][0]['path'], source)
+    index['sources'][0].update(path=str(source), date='2026-10-30')
+    index['snapshot_cutoff'] = '2026-11-07'
+    candidate.update(dimension_id='repair_repeat_interval', confidence='high')
+    verdict = {k: candidate[k] for k in ('interest_id', 'dimension_id', 'source_id', 'locator')}
+    verdict.update(supported=True, confidence='high', conflicting=False)
+    projection = project_semantic_dimensions(profile, index, classifier=lambda _: [candidate],
+                                             verifier=lambda _: verdict, final_cutoff=index['snapshot_cutoff'])
+    _write(root / 'full-corpus/training-interest-map.json', profile)
+    _write(root / 'full-corpus/training-index.json', index)
+    _write(root / 'dimension-projection/repair-dimensions-private.json', projection)
+    for role, key, row in [('classifier', 'candidates', candidate), ('verifier', 'verdicts', verdict)]:
+        answer = {key: [row]}
+        events = [{'type': 'thread.started', 'thread_id': 'synthetic-' + role},
+                  {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(answer)}},
+                  {'type': 'turn.completed'}]
+        trace = '\n'.join(json.dumps(event) for event in events)
+        _write(root / f'dimension-projection/{role}-bounded-000.json', {'trace': trace, 'answer': answer})
+        (root / f'dimension-projection/trace-{role}.jsonl').write_text(trace)
+    files = {str(path.relative_to(root)): _sha(path) for path in root.rglob('*') if path.is_file()}
+    _write(root / 'final-manifest.json', {'status': 'private_corpus_replayed_server_passed_release_not_verified',
+           'cutoff_exclusive': '2026-11-07', 'sha256': files})
+    builder = getattr(hypotheses_knowledge, 'build_s1_release', None)
+    assert builder is not None, 'the verified s1 corpus needs a portable release adapter'
+    package = tmp_path / 'package'
+    digest = builder(root, package, manifest_sha256=_sha(root / 'final-manifest.json'))
+    store = _store(tmp_path / 'installed')
+    store.install(package, manifest_sha256=digest)
+    loaded = store.load(profile['version'])
+    assert loaded['interest_context']['corpus_version'] == index['version']
+    assert loaded['dimension_projection']['dimensions'] == []  # one meeting is not recurring support
+    (root / 'source.txt').write_text('tampered')
+    with pytest.raises(ValueError):
+        builder(root, tmp_path / 'bad-package', manifest_sha256=_sha(root / 'final-manifest.json'))

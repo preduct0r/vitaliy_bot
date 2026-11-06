@@ -34,10 +34,15 @@ class HypothesesService:
         self.store, self.config, self.runner = store, config, runner
         self.coverage_provider, self.knowledge_loader, self.trusted_store = coverage_provider, knowledge_loader, trusted_store
 
-    def _knowledge(self, case, version=None, approved_rules=None):
+    def _knowledge(self, case, version=None, approved_rules=None, binding=None):
         from .learning import TRANSFERABLE_ANALYSIS_RULES
         load_version = getattr(self.knowledge_loader, 'load_version', None)
-        if version is not None and callable(load_version):
+        if binding is not None:
+            load_bound = getattr(self.knowledge_loader, 'load_bound', None)
+            if not callable(load_bound):
+                raise StateError('Проверка закреплённого выпуска недоступна')
+            knowledge = copy.deepcopy(load_bound(binding))
+        elif version is not None and callable(load_version):
             knowledge = copy.deepcopy(load_version(version, case['profile_version'], case['knowledge_package_id']))
         else:
             knowledge = copy.deepcopy(self.knowledge_loader.load(case['profile_version'], case['knowledge_package_id']))
@@ -70,7 +75,7 @@ class HypothesesService:
             case_id, chat_id, user_id, description, ttl_days=self.config.context_ttl_days,
             knowledge_version=knowledge['knowledge_version'], interest_version=knowledge['interest_context']['version'],
             knowledge_hash=_digest(knowledge), expected_profile=(case['profile_version'], case['knowledge_package_id']),
-            approved_rules=keys)
+            approved_rules=keys, knowledge_binder=getattr(self.knowledge_loader, 'bind', None))
 
     def get_run(self, *, user_id, job_id=None, run_id=None):
         return self.store.hypotheses_run(user_id=user_id, job_id=job_id, run_id=run_id)
@@ -124,7 +129,15 @@ class HypothesesService:
     async def execute(self, job):
         run = self.get_run(job_id=job['id'], user_id=job['chat_id'])
         rules = json.loads(run['approved_rules_json']) if run.get('approved_rules_json') is not None else None
-        knowledge = self._knowledge(self.store.get_case(run['case_id']), run['knowledge_version'], rules)
+        binding = json.loads(run['knowledge_binding_json']) if run.get('knowledge_binding_json') else None
+        requires_binding = getattr(self.knowledge_loader, 'requires_binding', None)
+        if binding is None and callable(requires_binding) and requires_binding(run['id']):
+            raise StateError('Привязка задания к знаниям отсутствует')
+        if binding is not None and any(binding.get(k) != v for k, v in {
+                'run_id': run['id'], 'case_id': run['case_id'], 'profile_version': run['profile_version'],
+                'knowledge_package_id': run['knowledge_package_id'], 'knowledge_version': run['knowledge_version']}.items()):
+            raise StateError('Привязка задания к знаниям изменилась')
+        knowledge = self._knowledge(self.store.get_case(run['case_id']), run['knowledge_version'], rules, binding)
         if _digest(knowledge) != run['knowledge_hash']:
             # S4a queued jobs predate the extra rule snapshot. Preserve their
             # original binding and do not attach rules retroactively.
