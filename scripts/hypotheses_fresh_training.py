@@ -11,7 +11,7 @@ from datetime import date
 from scripts.hypotheses_extract_training import invoke_factory, production_idle
 from tof_reliability.vitaly_bot.hypotheses_extract_runner import _write, parse_trace
 from tof_reliability.vitaly_bot.hypotheses_fresh_training import (
-    CUTOFF, OCTOBER_CUTOFF, check_cutoff_contract, cutoff_contract,
+    CUTOFF, OCTOBER_CUTOFF, FINAL_CUTOFF, check_cutoff_contract, cutoff_contract,
     prepare_fresh_batches, run_fresh_extraction,
 )
 
@@ -20,7 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--index-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--cutoff', type=date.fromisoformat, choices=(CUTOFF, OCTOBER_CUTOFF),
+    parser.add_argument('--cutoff', type=date.fromisoformat, choices=(CUTOFF, OCTOBER_CUTOFF, FINAL_CUTOFF),
                         default=CUTOFF, help='exclusive training cutoff (default: 2026-09-17)')
     args = parser.parse_args()
     # Reject incompatible or unversioned artifacts before touching any user files.
@@ -42,7 +42,7 @@ def main():
         if row['id'] in indexed:
             raise ValueError('duplicate source identity in index')
         indexed[row['id']] = row
-    groups, seen_ids = {}, set()
+    groups, seen_ids, duplicates, historical = {}, set(), [], {}
     for row in reconciled:
         sid = row['id']
         if sid in seen_ids:
@@ -54,14 +54,42 @@ def main():
         digest = row.get('sha256')
         if not isinstance(digest, str) or len(digest) != 64:
             raise ValueError('missing source hash: ' + sid)
-        groups.setdefault(digest, []).append(row)
-    training, originals, missing_sources = [], {}, []
-    for digest, group in groups.items():
+        if args.cutoff != FINAL_CUTOFF:
+            historical.setdefault(digest, []).append(row)
+            continue
+        if row.get('duplicate_of'):
+            duplicates.append(row)
+        else:
+            groups[sid] = row
+    historical_missing = []
+    for group in historical.values():
         matches = [row for row in group if row['id'] in indexed and not row.get('duplicate_of')]
         if len(matches) != 1:
-            missing_sources.append([row['id'] for row in group])
+            historical_missing.append([row['id'] for row in group])
+        else:
+            groups[matches[0]['id']] = matches[0]
+    for row in duplicates:
+        target = groups.get(row['duplicate_of'])
+        if (target is None or target['sha256'] != row['sha256']
+                or target['date'] != row['date']
+                or (row.get('meeting_id') and target.get('meeting_id')
+                    and row['meeting_id'] != target['meeting_id'])):
+            raise ValueError('unverified duplicate identity: ' + row['id'])
+        data = Path(row['path']).read_bytes()
+        if hashlib.sha256(data).hexdigest() != row['sha256']:
+            raise ValueError('duplicate source hash mismatch: ' + row['id'])
+        if row.get('original_path'):
+            original_data = Path(row['original_path']).read_bytes()
+            if hashlib.sha256(original_data).hexdigest() != row.get('original_sha256', row['sha256']):
+                raise ValueError('duplicate original hash mismatch: ' + row['id'])
+            encoding = row.get('original_encoding', 'utf-16' if original_data.startswith((b'\xff\xfe', b'\xfe\xff')) else 'utf-8')
+            if original_data.decode(encoding) != data.decode('utf-8'):
+                raise ValueError('duplicate original content mismatch: ' + row['id'])
+    training, originals, missing_sources = [], {}, historical_missing
+    for sid, original in groups.items():
+        if sid not in indexed:
+            missing_sources.append([sid])
             continue
-        original = matches[0]
         row = indexed[original['id']]
         if any(row.get(key) != original.get(key) for key in ('sha256', 'date', 'kind')):
             raise ValueError('verified source index mismatch: ' + row['id'])
@@ -69,7 +97,7 @@ def main():
         originals[row['id']] = original
     ids = {row['id'] for row in training}
     selected = [chunk for chunk in chunks if chunk['source_id'] in ids]
-    manifest = {**cutoff_contract(args.cutoff), 'expected': {'sources': len(groups), 'chunks': len(selected)},
+    manifest = {**cutoff_contract(args.cutoff), 'expected': {'sources': len(groups) + len(historical_missing), 'chunks': len(selected)},
                 'found': {'sources': 0, 'chunks': 0},
                 'missing': {'sources': missing_sources + sorted(ids),
                             'chunks': [c.get('id') or f"{c['source_id']}:{c['start']}:{c['end']}:{c['sha256']}"

@@ -10,11 +10,12 @@ from .hypotheses_extract_runner import _write
 
 CUTOFF = date(2026, 9, 17)
 OCTOBER_CUTOFF = date(2026, 10, 26)
+FINAL_CUTOFF = date(2026, 11, 7)
 VERSION = 'fresh-training-v2'
 
 
 def cutoff_contract(cutoff):
-    if type(cutoff) is not date or cutoff not in (CUTOFF, OCTOBER_CUTOFF):
+    if type(cutoff) is not date or cutoff not in (CUTOFF, OCTOBER_CUTOFF, FINAL_CUTOFF):
         raise ValueError('unsupported training cutoff version')
     return {'version': VERSION, 'cutoff': cutoff.isoformat()}
 

@@ -12,7 +12,8 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .hypotheses_interests import assess_provenance
+from .hypotheses_interests import _date, assess_provenance
+from .hypotheses_fresh_training import FINAL_CUTOFF, OCTOBER_CUTOFF
 
 # Each topic requires every expression in its tuple in one sentence, in both
 # the requirement and an independently verified evidence fragment. This is
@@ -227,7 +228,9 @@ _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 
 def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, Any], *,
-                                classifier: Callable[[dict], Any], verifier: Callable[[dict], Any]) -> dict:
+                                classifier: Callable[[dict], Any], verifier: Callable[[dict], Any],
+                                final_cutoff: str | None = None,
+                                development_cutoff: str | None = None) -> dict:
     """Project verified private evidence; caller must isolate independent model processes.
 
     The supplied source index defines the boundary, including holdout exclusions.
@@ -236,6 +239,12 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
     """
     if not callable(classifier) or not callable(verifier) or classifier is verifier:
         raise ValueError("independent classifier and verifier required")
+    if final_cutoff is not None and (final_cutoff != FINAL_CUTOFF.isoformat()
+                                     or index.get("snapshot_cutoff") != final_cutoff):
+        raise ValueError("final snapshot cutoff mismatch")
+    if development_cutoff is not None and (development_cutoff != OCTOBER_CUTOFF.isoformat()
+                                           or final_cutoff is not None):
+        raise ValueError("development cutoff mismatch")
     try:
         if not index.get("version") or profile.get("corpus_version") != index["version"]:
             raise ValueError("corpus version mismatch")
@@ -248,7 +257,12 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
                     or not re.fullmatch(r"[0-9a-f]{64}", digest)
                     or hashlib.sha256(path.read_bytes()).hexdigest() != digest):
                 raise ValueError("invalid source or hash")
-            if source.get("date") in {"2026-10-26", "2026-10-28", "2026-10-30"}:
+            day = _date(source.get("date"))
+            if final_cutoff is not None and day >= final_cutoff:
+                raise ValueError("source outside final snapshot cutoff")
+            if development_cutoff is not None and day >= development_cutoff:
+                raise ValueError("source outside development cutoff")
+            if final_cutoff is None and day in {"2026-10-26", "2026-10-28", "2026-10-30"}:
                 raise ValueError("heldout source in training index")
             sources[sid] = source
             texts[sid] = path.read_text(encoding="utf-8")
@@ -352,11 +366,15 @@ def project_semantic_dimensions(profile: Mapping[str, Any], index: Mapping[str, 
             "index_sha256": digest(index), "dimensions": rows, "unconfirmed": unconfirmed}
 
 
-def dimensions_for_generator(projection: Mapping[str, Any]) -> dict:
+def dimensions_for_generator(projection: Mapping[str, Any], *,
+                             min_independent_meetings: int | None = None) -> dict:
     """Rebuild a minimal payload from the fixed catalog, never copy private text."""
     version = projection.get("version")
     if version not in _CATALOGS:
         raise ValueError("unsupported dimension version")
+    if min_independent_meetings is not None and (type(min_independent_meetings) is not int
+                                                  or min_independent_meetings < 1):
+        raise ValueError("invalid independent meeting threshold")
     catalog = _CATALOGS[version]
     rows = []
     for row in projection["dimensions"]:
@@ -366,6 +384,12 @@ def dimensions_for_generator(projection: Mapping[str, Any]) -> dict:
         ids, sources = row["interest_ids"], row["source_ids"]
         if not all(isinstance(i, str) and _SAFE_ID.fullmatch(i) for i in [*ids, *sources]):
             raise ValueError("unsafe identifier")
+        if min_independent_meetings is not None:
+            count = row.get("independent_meeting_count")
+            if type(count) is not int or count < 1:
+                raise ValueError("independent meeting count required")
+            if count < min_independent_meetings:
+                continue
         rows.append({"dimension_id": dim, "topic_id": catalog[dim][0],
                      "description": catalog[dim][1], "interest_ids": list(ids), "source_ids": list(sources)})
     return {"version": version, "dimensions": rows}
