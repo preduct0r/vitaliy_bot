@@ -940,3 +940,6 @@ class LearningManager:
         if kind == "knowledge_verify":
             return await self._verify_knowledge(job)
         raise StateError("Неизвестный тип фоновой задачи обучения")
+
+# Experimental, injectable candidate preparation; not a production scheduler.
+from .hypotheses_auto_learning import HypothesesInterestLearning  # noqa: E402,F401
