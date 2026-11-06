@@ -37,7 +37,12 @@ def event(identifier, order="o1", equipment="eq1", day="2026-01-10"):
 
 
 @pytest.fixture
-def case(tmp_path):
+def case(tmp_path, monkeypatch):
+    def semantic(generation, ids):
+        return {"generation": generation["run_id"], "columns": ["source_document_id"],
+                "rows": [["ok"]], "truncated": False}
+    monkeypatch.setattr(server, "_criticality_query", semantic)
+    monkeypatch.setattr(server, "_techcard_query", semantic)
     ledger = tmp_path / "ledger" / "g1"
     ledger.mkdir(parents=True)
     cat = tmp_path / "inventory" / "g1" / "data_catalog.csv"
@@ -80,11 +85,11 @@ def test_supported_with_published_catalog_and_actual_fact_is_partial(case, statu
     set_sources(case, [source("ok")], [catalog("ok", status)])
     set_table(case, "work_order_events", [event("ok")])
     result = build(case)
-    item = route(result)
+    item = route(result, "AN-EQUIPMENT-CRITICALITY")
     assert result["generation"]["run_id"] == "g1"
     assert item["availability"] == "partial"
-    assert item["tables"]["work_order_events"]["count"] == 1
-    assert item["tables"]["work_order_events"]["months"] == ["2026-01"]
+    assert item["tables"]["equipment"]["source_document_ids"] == ["ok"]
+    assert route(result)["availability"] == "unavailable"
     assert item["missing_evidence"]  # presence is not completeness
 
 
@@ -99,9 +104,9 @@ def test_supported_with_published_catalog_and_actual_fact_is_partial(case, statu
 def test_unresolved_conflicting_or_review_provenance_never_counts(case, catalog_rows, source_rows):
     set_sources(case, source_rows, catalog_rows)
     set_table(case, "work_order_events", [event("ok")])
-    item = route(build(case))
+    item = route(build(case), "AN-EQUIPMENT-CRITICALITY")
     assert item["availability"] == "unavailable"
-    assert "work_order_events" not in item["tables"]
+    assert item["tables"] == {}
 
 
 @pytest.mark.parametrize("parser,status", [
@@ -111,7 +116,7 @@ def test_unresolved_conflicting_or_review_provenance_never_counts(case, catalog_
 def test_catalog_inventory_and_queue_are_not_published_facts(case, parser, status):
     set_sources(case, [source("ok", parser)], [catalog("ok", status, parser)])
     set_table(case, "work_order_events", [event("ok")])
-    assert route(build(case))["availability"] == "unavailable"
+    assert route(build(case), "AN-EQUIPMENT-CRITICALITY")["availability"] == "unavailable"
 
 
 def test_scope_period_and_join_use_only_admissible_rows(case):
@@ -121,14 +126,11 @@ def test_scope_period_and_join_use_only_admissible_rows(case):
     set_table(case, "maintenance_fact_events", [event("review", "match"),
               event("ok", "outside", day="2025-12-31"), event("ok", "other", "eq2")])
     item = route(build(case), "AN-PLAN-FACT")
-    assert item["tables"]["maintenance_plan_events"]["count"] == 1
-    assert "maintenance_fact_events" not in item["tables"]
+    assert item["tables"] == {}
+    assert item["availability"] == "unavailable"
     assert any("ключ" in text.lower() for text in item["missing_evidence"])
     set_table(case, "maintenance_fact_events", [event("ok", "match", day="2026-02-01")])
-    item = route(build(case), "AN-PLAN-FACT")
-    assert item["tables"]["maintenance_fact_events"]["months"] == ["2026-02"]
-    assert not any("совпадения ключей" in text.lower() for text in item["missing_evidence"])
-    assert item["availability"] == "partial"
+    assert route(build(case), "AN-PLAN-FACT") == item
 
 
 def test_catalog_is_part_of_pinned_generation_and_drift_retries(case, monkeypatch, tmp_path):
@@ -166,7 +168,8 @@ def test_response_is_bounded_for_many_distinct_keys_and_sources(case):
     set_table(case, "work_order_events", [event(f"s{i}", f"order{i}") for i in range(n)])
     result = build(case)
     item = route(result)
-    assert item["tables"]["work_order_events"]["count"] == n
+    assert item["tables"] == {}
+    assert item["availability"] == "unavailable"
     assert len(json.dumps(result, ensure_ascii=False).encode()) < 50000
     assert "order5999" not in json.dumps(result)
 
@@ -175,7 +178,7 @@ def test_response_is_bounded_for_many_distinct_keys_and_sources(case):
 def test_auto_parsed_catalog_can_publish_facts_for_original_classification(case, parser):
     set_sources(case, [source("ok", parser)], [catalog("ok", "auto_parsed", parser)])
     set_table(case, "work_order_events", [event("ok")])
-    assert route(build(case))["tables"]["work_order_events"]["count"] == 1
+    assert route(build(case), "AN-EQUIPMENT-CRITICALITY")["tables"]["equipment"]["source_document_ids"] == ["ok"]
 
 
 def test_generation_fingerprint_change_retries_even_when_paths_are_unchanged(case, monkeypatch):
@@ -194,4 +197,5 @@ def test_generation_fingerprint_change_retries_even_when_paths_are_unchanged(cas
 def test_undated_rows_do_not_emit_null_months(case):
     set_table(case, "work_order_events", [event("ok", day="")])
     result = server.build_coverage({"version": 1}, generation_state_path=case["state"], root=case["root"])
-    assert route(result)["tables"]["work_order_events"]["months"] == []
+    assert route(result)["tables"] == {}
+    assert route(result)["availability"] == "unavailable"

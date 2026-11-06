@@ -54,7 +54,11 @@ def write_csv(path, columns, rows):
 
 
 @pytest.fixture
-def snapshot(tmp_path):
+def snapshot(tmp_path, monkeypatch):
+    from tof_reliability.vitaly_bot import server_coverage
+    empty = lambda generation, ids: {"generation": generation["run_id"], "columns": ["source_document_id"], "rows": [], "truncated": False}
+    monkeypatch.setattr(server_coverage, "_criticality_query", empty)
+    monkeypatch.setattr(server_coverage, "_techcard_query", empty)
     ledger = tmp_path / "generations" / "g1" / "ledger"
     ledger.mkdir(parents=True)
     state = tmp_path / "current_generation.json"

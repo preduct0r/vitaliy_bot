@@ -6,24 +6,24 @@ This file is self-contained so it can be sent to the server over SSH.
 """
 from __future__ import annotations
 
+import csv
 import json
+import subprocess
 from datetime import date
 from pathlib import Path
 from typing import Any
 
-import duckdb
 
 GENERATION_STATE = Path('/srv/tof/state/current_generation.json')
 TOF_ROOT = Path('/srv/tof/repos/tof_v1')
 ROUTES = {
-    'AN-REPAIR-EPISODES': ('work_order_events', 'maintenance_fact_events', 'work_order_operation_events'),
-    'AN-PLAN-FACT': ('maintenance_plan_events', 'maintenance_fact_events', 'work_order_events'),
-    'AN-MTR-COST': ('mtr_writeoff_events', 'work_order_events', 'material_requirements'),
-    'AN-DOWNTIME': ('downtime_events', 'sap_message_events', 'work_order_events'),
-    'AN-TECHCARD-LABOR': ('tech_card_operations', 'work_order_operation_events', 'material_requirements'),
-    'AN-EQUIPMENT-CRITICALITY': ('equipment_criticality_records', 'equipment_registry', 'fixed_asset_records'),
+    'AN-REPAIR-EPISODES': 'Производные эпизоды не раскрывают полный состав источников и их статусы needs_review.',
+    'AN-PLAN-FACT': 'Методика сопоставления плановых позиций и ремонтных эпизодов с проверяемыми ключами и происхождением не опубликована.',
+    'AN-MTR-COST': 'Полная цепочка источников производных затрат и методика связи со списаниями МТР не подтверждены.',
+    'AN-DOWNTIME': 'Методика связи простоя с заказом и полное происхождение для периметра не подтверждены.',
+    'AN-TECHCARD-LABOR': 'Источники техкарт не подтверждают полноту норм времени или соответствие фактическим ремонтам за период.',
+    'AN-EQUIPMENT-CRITICALITY': 'Источники критичности не подтверждают полноту или актуальность оценок для всего периметра и периода.',
 }
-DATE_COLUMNS = ('event_date', 'actual_start', 'planned_start')
 
 
 def _generation(path: Path) -> dict[str, Any]:
@@ -61,110 +61,85 @@ def _literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _semantic_query(generation: dict[str, Any], ids: set[str], table: str, role: str = '') -> dict[str, Any]:
+    # Only fixed tables and fixed projection; values are escaped, never model SQL.
+    where = []
+    if ids:
+        where.append('equipment_key IN (' + ','.join('equipment_key(' + _literal(x) + ')' for x in sorted(ids)) + ')')
+    if role:
+        where.append("role = 'criticality'")
+    sql = 'SELECT DISTINCT source_document_id FROM ' + table
+    if where:
+        sql += ' WHERE ' + ' AND '.join(where)
+    sql += ' ORDER BY source_document_id'
+    completed = subprocess.run(['tof-data', 'query', '--generation', generation['run_id'], '--limit', '10000', '--json', sql],
+                               check=True, capture_output=True, text=True, timeout=90)
+    return json.loads(completed.stdout)
+
+
+def _criticality_query(generation: dict[str, Any], ids: set[str]) -> dict[str, Any]:
+    return _semantic_query(generation, ids, 'equipment_sources', 'criticality')
+
+
+def _techcard_query(generation: dict[str, Any], ids: set[str]) -> dict[str, Any]:
+    return _semantic_query(generation, ids, 'tech_card_sources')
+
+
+def _eligible_sources(generation: dict[str, Any]) -> set[str]:
+    def rows(path):
+        with Path(path).open(encoding='utf-8-sig', newline='') as stream:
+            return list(csv.DictReader(stream))
+    sources, catalog = {}, {}
+    for row in rows(Path(generation['ledger_path']) / 'source_documents.csv'):
+        sources.setdefault(row.get('source_document_id'), set()).add(row.get('parser_status', ''))
+    for row in rows(generation['catalog_path']):
+        catalog.setdefault(row.get('source_document_id'), set()).add((row.get('parser_status', ''), row.get('catalog_status', '')))
+    eligible = set()
+    for ident, statuses in sources.items():
+        if not ident or len(statuses) != 1 or len(catalog.get(ident, ())) != 1:
+            continue
+        parser = next(iter(statuses))
+        cat_parser, status = next(iter(catalog[ident]))
+        if parser == cat_parser and ((parser == 'supported' and status == 'ready_for_parse') or
+                                     (parser in ('supported', 'inventory_only', 'unknown') and status == 'auto_parsed')):
+            eligible.add(ident)
+    return eligible
+
+
+def _source_observation(result: dict[str, Any], generation: dict[str, Any], eligible: set[str]) -> list[str]:
+    if not isinstance(result, dict) or result.get('generation') != generation['run_id']:
+        raise ValueError('semantic_query_generation_mismatch')
+    if result.get('columns') != ['source_document_id'] or not isinstance(result.get('rows'), list) or type(result.get('truncated')) is not bool:
+        raise ValueError('invalid_semantic_query_result')
+    if result['truncated']:
+        return []
+    if any(not isinstance(row, list) or len(row) != 1 or (row[0] is not None and not isinstance(row[0], str)) for row in result['rows']):
+        raise ValueError('invalid_semantic_query_result')
+    return sorted({row[0] for row in result['rows'] if row[0] in eligible})
+
+
 def _collect(generation: dict[str, Any], root: Path, ids: set[str], start: date | None, end: date | None) -> list[dict[str, Any]]:
-    ledger = Path(generation['ledger_path'])
     capabilities = json.loads((root / 'harness/capabilities/analytics.json').read_text(encoding='utf-8'))
     active = {x.get('id'): x for x in capabilities.get('capabilities', []) if isinstance(x, dict) and x.get('lifecycle') == 'available'}
-    connection = duckdb.connect(':memory:', config={'threads': '2', 'memory_limit': '2GB', 'temp_directory': ''})
-    try:
-        source_path = ledger / 'source_documents.csv'
-        if not source_path.is_file():
-            raise ValueError('published_generation_sources_missing')
-        source = _literal(str(source_path))
-        catalog = _literal(generation['catalog_path'])
-        # Both inventories must agree, including duplicate records. Auto-parsed
-        # sources may originally have been inventory_only or unknown.
-        connection.execute(f"""
-            CREATE TEMP VIEW eligible AS
-            WITH s AS (
-                SELECT source_document_id, min(coalesce(parser_status, '')) AS parser_kind
-                FROM read_csv({source}, all_varchar=true)
-                WHERE source_document_id IS NOT NULL AND source_document_id <> ''
-                GROUP BY source_document_id HAVING count(DISTINCT coalesce(parser_status, '')) = 1
-            ), c AS (
-                SELECT source_document_id, min(coalesce(parser_status, '')) AS parser_kind,
-                       min(coalesce(catalog_status, '')) status
-                FROM read_csv({catalog}, all_varchar=true)
-                WHERE source_document_id IS NOT NULL AND source_document_id <> ''
-                GROUP BY source_document_id
-                HAVING count(DISTINCT coalesce(parser_status, '')) = 1
-                   AND count(DISTINCT coalesce(catalog_status, '')) = 1
-            )
-            SELECT s.source_document_id FROM s JOIN c USING (source_document_id)
-            WHERE s.parser_kind = c.parser_kind AND
-              ((s.parser_kind = 'supported' AND c.status = 'ready_for_parse') OR
-               (s.parser_kind IN ('supported', 'inventory_only', 'unknown') AND c.status = 'auto_parsed'))
-        """)
-        observations: dict[str, dict[str, Any]] = {}
-        for table in dict.fromkeys(t for tables in ROUTES.values() for t in tables):
-            path = ledger / (table + '.csv')
-            empty = {'count': 0, 'months': [], 'equipment_ids': [], 'source_document_ids': []}
-            if not path.is_file():
-                observations[table] = empty
-                continue
-            file_sql = _literal(str(path))
-            columns = {row[0] for row in connection.execute(f'DESCRIBE SELECT * FROM read_csv({file_sql}, all_varchar=true)').fetchall()}
-            if 'source_document_id' not in columns:
-                observations[table] = empty
-                continue
-            equipment = 't.equipment_id' if 'equipment_id' in columns else 'NULL::VARCHAR'
-            order = 't.order_id' if 'order_id' in columns else 'NULL::VARCHAR'
-            date_parts = [f"nullif(t.{name}, '')" for name in DATE_COLUMNS if name in columns]
-            raw_date = 'coalesce(' + ', '.join(date_parts + ['NULL']) + ')'
-            day = f'try_cast(substr({raw_date}, 1, 10) AS DATE)'
-            filters = []
-            if ids:
-                filters.append(f"{equipment} IN (" + ','.join(_literal(x) for x in sorted(ids)) + ')')
-            if start:
-                filters.append(f"{day} >= DATE {_literal(start.isoformat())}")
-            if end:
-                filters.append(f"{day} <= DATE {_literal(end.isoformat())}")
-            where = ' AND '.join(filters) if filters else 'true'
-            connection.execute(f"""CREATE TEMP VIEW {table} AS
-                SELECT {equipment} AS equipment_id, {order} AS order_id,
-                       {day} AS day, t.source_document_id
-                FROM read_csv({file_sql}, all_varchar=true) t
-                SEMI JOIN eligible e ON t.source_document_id = e.source_document_id
-                WHERE {where}""")
-            # Source evidence is a single deterministic example, not an
-            # unbounded list of identifiers. Scope output is request-bounded.
-            row = connection.execute(f"""SELECT count(*),
-                list_slice(list_sort(list(DISTINCT strftime(day, '%Y-%m')) FILTER (WHERE day IS NOT NULL)), 1, 120),
-                min(source_document_id), count(DISTINCT strftime(day, '%Y-%m')) > 120,
-                min(source_document_id) <> max(source_document_id)
-                FROM {table}""").fetchone()
-            seen = []
-            if ids and row[0]:
-                seen = [x[0] for x in connection.execute(f'SELECT DISTINCT equipment_id FROM {table} WHERE equipment_id IS NOT NULL ORDER BY 1').fetchall()]
-            observations[table] = {'count': row[0], 'months': row[1] or [], 'equipment_ids': seen,
-                                   'source_document_ids': [row[2]] if row[2] else [],
-                                   'months_truncated': row[3], 'source_document_ids_sampled': row[4]}
-        plan_join = False
-        if observations['maintenance_plan_events']['count'] and observations['maintenance_fact_events']['count']:
-            plan_join = connection.execute("""SELECT EXISTS (
-                SELECT 1 FROM maintenance_plan_events p
-                SEMI JOIN maintenance_fact_events f ON p.order_id = f.order_id
-                WHERE p.order_id IS NOT NULL AND p.order_id <> '')""").fetchone()[0]
-    finally:
-        connection.close()
+    eligible = _eligible_sources(generation)
+    observations = {
+        'AN-EQUIPMENT-CRITICALITY': ('equipment', _source_observation(_criticality_query(generation, ids), generation, eligible)),
+        'AN-TECHCARD-LABOR': ('tech_card', _source_observation(_techcard_query(generation, ids), generation, eligible)),
+    }
     results = []
-    for capability, tables in ROUTES.items():
-        present = {table: observations[table] for table in tables if observations[table]['count']}
-        missing = ['Полнота наблюдений за период и периметр не подтверждена источником.']
+    for capability, limitation in ROUTES.items():
+        missing = [limitation, 'Источники со статусом needs_review исключены; полнота наблюдений не подтверждена.']
         if not ids:
-            missing.append('Не задан точный периметр оборудования.')
+            missing.append('Не задан точный периметр оборудования; источники не подтверждают охват всего оборудования.')
         if not start or not end:
             missing.append('Не задан полный период исследования.')
-        if not present:
-            missing.append('Нет подтверждённых строк для заданного периметра и периода.')
-        if capability == 'AN-PLAN-FACT':
-            if not plan_join:
-                missing.append('Нет подтверждённого совпадения ключей плана и факта.')
+        table, sources = observations.get(capability, ('', []))
         if capability not in active:
             missing.append('Маршрут не зарегистрирован как доступный.')
+        present = bool(sources and capability in active)
         results.append({'capability_id': capability, 'route_id': active.get(capability, {}).get('route_id'),
-                        'availability': 'partial' if present and capability in active else 'unavailable',
-                        'tables': {name: {k: v for k, v in item.items() if k != 'order_ids'} for name, item in present.items()},
+                        'availability': 'partial' if present else 'unavailable',
+                        'tables': {table: {'source_document_ids': sources[:20], 'source_document_ids_sampled': len(sources) > 20}} if present else {},
                         'missing_evidence': missing})
     return results
 
