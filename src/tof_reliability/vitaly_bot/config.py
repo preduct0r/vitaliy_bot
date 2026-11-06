@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -61,6 +62,18 @@ def load_config(environ: Optional[Dict[str, str]] = None, require_token: bool = 
     if not 0 <= learning_run_hour <= 23:
         raise InputError("VITALY_BOT_LEARNING_RUN_HOUR должен быть целым часом от 0 до 23")
     hypotheses_development = None
+    hypotheses_production = None
+    if values.get('VITALY_BOT_HYPOTHESES_PRODUCTION') == '1':
+        if values.get('VITALY_BOT_HYPOTHESES_DEVELOPMENT') == '1':
+            raise InputError('Нельзя одновременно включить тестовые и производственные гипотезы')
+        directory = values.get('VITALY_BOT_HYPOTHESES_RELEASE_DIR', '').strip()
+        digest = values.get('VITALY_BOT_HYPOTHESES_RELEASE_SHA256', '').strip()
+        if not directory or not Path(directory).is_absolute() or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            raise InputError('Нужны абсолютный частный каталог выпусков и SHA-256 манифеста')
+        release_path = Path(directory).resolve()
+        if any((parent / '.git').exists() for parent in (release_path, *release_path.parents)):
+            raise InputError('Каталог частных выпусков должен находиться вне Git')
+        hypotheses_production = {'directory': directory, 'manifest_sha256': digest}
     if values.get('VITALY_BOT_HYPOTHESES_DEVELOPMENT') == '1':
         fields = {'corpus_dir': 'VITALY_BOT_HYPOTHESES_CORPUS_DIR',
                   'original_dir': 'VITALY_BOT_HYPOTHESES_ORIGINAL_DIR',
@@ -85,4 +98,5 @@ def load_config(environ: Optional[Dict[str, str]] = None, require_token: bool = 
         learning_run_hour=learning_run_hour,
         operator_user_ids=operator_user_ids,
         hypotheses_development=hypotheses_development,
+        hypotheses_production=hypotheses_production,
     )

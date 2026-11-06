@@ -28,13 +28,19 @@ def render(card: dict, *, plan: bool = False) -> str:
         lines.append('Показатели, сравнения и метод: ' + _value(card.get('metrics_method')))
     readiness = {'partial': 'частичная', 'available': 'доступны по указанному маршруту', 'unavailable': 'не подтверждена'}.get(
         card.get('source_readiness'), 'не определена')
+    brief = _value(card.get('analyst_brief'))
+    if 'анализ пока не выполнять' in brief.casefold():
+        brief = ('Подготовить проверку: ' + _value(card.get('metrics_method')) +
+                 '. Уточнить периметр: ' + _value(card.get('scope')) +
+                 '. Проверить источники и восполнить пробелы: ' + _value(card.get('missing_evidence')) +
+                 '. Результаты и ограничения представить для решения; анализ ещё не выполнен.')
     lines.extend(['Доступные источники: ' + _value((card.get('source_references') or []) +
                                                    (card.get('case_material_references') or [])),
                   'Готовность источников: ' + readiness,
                   'Пробелы: ' + _value(card.get('missing_evidence')),
                   'Опровержение: ' + _value(card.get('falsification')),
                   'Сложные вопросы: ' + _value(card.get('hard_questions')),
-                  'Поручение аналитику: ' + _value(card.get('analyst_brief'))])
+                  'Поручение аналитику: ' + brief])
     if not plan:
         lines.append('Новизна: неизвестна')
     return '\n'.join(lines)

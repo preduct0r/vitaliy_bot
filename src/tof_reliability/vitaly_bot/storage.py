@@ -211,6 +211,8 @@ class VitalyStore:
             connection.execute('ALTER TABLE hypotheses_runs ADD COLUMN knowledge_hash TEXT')
         if 'coverage_json' not in columns:
             connection.execute('ALTER TABLE hypotheses_runs ADD COLUMN coverage_json TEXT')
+        if 'approved_rules_json' not in columns:
+            connection.execute('ALTER TABLE hypotheses_runs ADD COLUMN approved_rules_json TEXT')
 
     @staticmethod
     def _hypotheses_run(row: sqlite3.Row) -> Dict[str, Any]:
@@ -1053,7 +1055,7 @@ class VitalyStore:
     def begin_hypotheses_run(self, case_id: str, chat_id: int, user_id: int, description: str,
                              *, ttl_days: int = 4, knowledge_version: Optional[str] = None,
                              interest_version: Optional[str] = None, knowledge_hash: Optional[str] = None,
-                             expected_profile: Optional[tuple] = None) -> Dict[str, Any]:
+                             expected_profile: Optional[tuple] = None, approved_rules: Optional[list] = None) -> Dict[str, Any]:
         """Atomically admit a case job and its initial, content-bound run."""
         if not isinstance(description, str) or len(description) > 10000 or ttl_days < 1:
             raise ValueError("Некорректное описание или срок контекста")
@@ -1096,9 +1098,9 @@ class VitalyStore:
                                (job_id, case_id, chat_id, _json({'run_id': run_id}), now))
             connection.execute("""INSERT INTO hypotheses_runs(id, job_id, case_id, chat_id, user_id, user_request,
                 case_hash, artifact_hashes_json, profile_version, knowledge_package_id, status, created_at, artifact_snapshot_json,
-                knowledge_version, interest_version, knowledge_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
-                (run_id, job_id, case_id, chat_id, user_id, description, digest, _json(hashes), row['profile_version'], row['knowledge_package_id'], now, _json(artifact_snapshot), knowledge_version, interest_version, knowledge_hash))
+                knowledge_version, interest_version, knowledge_hash, approved_rules_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)""",
+                (run_id, job_id, case_id, chat_id, user_id, description, digest, _json(hashes), row['profile_version'], row['knowledge_package_id'], now, _json(artifact_snapshot), knowledge_version, interest_version, knowledge_hash, _json(approved_rules) if approved_rules is not None else None))
             connection.execute("UPDATE cases SET activity = 'queued', activity_detail = ?, activity_started_at = ?, active_job_id = ?, updated_at = ? WHERE id = ?",
                                ('Ожидаю общей очереди', now, job_id, now, case_id))
         return self.get_job(job_id)

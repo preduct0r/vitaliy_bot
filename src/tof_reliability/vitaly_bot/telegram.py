@@ -345,6 +345,46 @@ class TelegramRuntime:
         self.store = VitalyStore(config.state_dir, config.knowledge_dir)
         self.profile = load_default_profile()
         self.service = VitalyService(self.store, self.profile, config)
+        if config.hypotheses_production:
+            from .coverage import RemoteCoverageProvider
+            from .hypotheses_pilot import TrustedRequestStore, _interests, _dimension_bindings
+            from .hypotheses_service import HypothesesService
+            from .hypotheses_knowledge import VerifiedReleaseStore
+
+            releases = VerifiedReleaseStore(config.hypotheses_production['directory'])
+            current = releases.current()
+            if not current or current['manifest_sha256'] != config.hypotheses_production['manifest_sha256']:
+                raise StateError('Производственный выпуск гипотез не соответствует конфигурации')
+
+            class CaseBoundReleaseKnowledge:
+                def load(inner, profile_version, knowledge_package_id):
+                    active = releases.current()
+                    if not active or active['manifest_sha256'] != config.hypotheses_production['manifest_sha256']:
+                        raise StateError('Выпуск гипотез изменился без согласованной конфигурации')
+                    return inner.load_version(active['version'], profile_version, knowledge_package_id)
+
+                def load_version(inner, version, profile_version, knowledge_package_id):
+                    package = self.store.get_knowledge_package(knowledge_package_id)
+                    if str(package['package']['profile']['version']) != profile_version:
+                        raise StateError('Профиль не соответствует пакету кейса')
+                    result = releases.load(version)
+                    interests = _interests(result['interest_context'])
+                    projection = result['dimension_projection']
+                    generation = projection.get('generation_id', 'not-yet-checked')
+                    if not _dimension_bindings(projection, interests, {'generation': {'run_id': generation}}):
+                        raise StateError('В выпуске нет проверенных связей интересов')
+                    return result
+
+            # Fail before enabling the service when the configured package is
+            # not usable by the generation pipeline.
+            active_package = self.store.active_knowledge_package()
+            loader = CaseBoundReleaseKnowledge()
+            loader.load(active_package['package']['profile']['version'], active_package['id'])
+            self.service.hypotheses_service = HypothesesService(
+                store=self.store, config=config, runner=self.service.runner,
+                coverage_provider=RemoteCoverageProvider(timeout_seconds=config.evidence_timeout_seconds),
+                knowledge_loader=loader,
+                trusted_store=TrustedRequestStore(config.state_dir / 'hypotheses-trusted.sqlite3'))
         if config.hypotheses_development:
             from .coverage import RemoteCoverageProvider
             from .hypotheses_pilot import TrustedRequestStore

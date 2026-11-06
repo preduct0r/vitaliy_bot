@@ -160,18 +160,20 @@ def test_updated_profile_has_traceable_september_patterns_and_preserves_baseline
 def test_local_config_uses_explicit_env_and_never_needs_a_repository_token(tmp_path: Path):
     from tof_reliability.vitaly_bot.config import load_config
 
+    configured_codex = tmp_path / "codex"
+    configured_codex.touch()
     config = load_config(
         {
             "VITALY_BOT_TOKEN": "only-in-test",
             "VITALY_BOT_STATE_DIR": str(tmp_path / "state"),
             "VITALY_BOT_ENV_FILE": str(tmp_path / "missing.env"),
-            "VITALY_BOT_CODEX_BIN": "/tmp/codex",
+            "VITALY_BOT_CODEX_BIN": str(configured_codex),
         }
     )
 
     assert config.token == "only-in-test"
     assert config.state_dir == tmp_path / "state"
-    assert config.codex_bin == Path("/tmp/codex")
+    assert config.codex_bin == configured_codex
     assert config.model_timeout_seconds == 480
     assert config.context_ttl_days == 4
     assert config.knowledge_dir == tmp_path / "state" / "knowledge"

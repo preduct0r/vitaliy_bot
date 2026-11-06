@@ -33,12 +33,19 @@ class HypothesesService:
         self.store, self.config, self.runner = store, config, runner
         self.coverage_provider, self.knowledge_loader, self.trusted_store = coverage_provider, knowledge_loader, trusted_store
 
-    def _knowledge(self, case):
+    def _knowledge(self, case, version=None, approved_rules=None):
         from .learning import TRANSFERABLE_ANALYSIS_RULES
-        knowledge = copy.deepcopy(self.knowledge_loader.load(case['profile_version'], case['knowledge_package_id']))
-        package = self.store.knowledge_package_for_case(case['id'])['package']
-        raw = package.get('analysis_rules', package.get('patch', {}).get('analysis_rules', []))
-        keys = {str(rule.get('transfer_key')) for rule in raw if isinstance(rule, dict)} if isinstance(raw, list) else set()
+        load_version = getattr(self.knowledge_loader, 'load_version', None)
+        if version is not None and callable(load_version):
+            knowledge = copy.deepcopy(load_version(version, case['profile_version'], case['knowledge_package_id']))
+        else:
+            knowledge = copy.deepcopy(self.knowledge_loader.load(case['profile_version'], case['knowledge_package_id']))
+        if approved_rules is None:
+            package = self.store.knowledge_package_for_case(case['id'])['package']
+            raw = package.get('analysis_rules', package.get('patch', {}).get('analysis_rules', []))
+            keys = {str(rule.get('transfer_key')) for rule in raw if isinstance(rule, dict)} if isinstance(raw, list) else set()
+        else:
+            keys = set(approved_rules)
         knowledge['approved_analysis_rules'] = [dict(TRANSFERABLE_ANALYSIS_RULES[key]) for key in sorted(keys)
                                                 if key in TRANSFERABLE_ANALYSIS_RULES]
         return knowledge
@@ -47,11 +54,17 @@ class HypothesesService:
         case = self.store.get_case(case_id)
         if user_id != chat_id or case['chat_id'] != chat_id:
             raise StateError('Кейс принадлежит другому пользователю')
-        knowledge = self._knowledge(case)
+        package = self.store.active_knowledge_package()['package']
+        raw = package.get('analysis_rules', package.get('patch', {}).get('analysis_rules', []))
+        from .learning import TRANSFERABLE_ANALYSIS_RULES
+        keys = sorted({str(rule.get('transfer_key')) for rule in raw if isinstance(rule, dict)
+                       and rule.get('transfer_key') in TRANSFERABLE_ANALYSIS_RULES}) if isinstance(raw, list) else []
+        knowledge = self._knowledge(case, approved_rules=keys)
         return self.store.begin_hypotheses_run(
             case_id, chat_id, user_id, description, ttl_days=self.config.context_ttl_days,
             knowledge_version=knowledge['knowledge_version'], interest_version=knowledge['interest_context']['version'],
-            knowledge_hash=_digest(knowledge), expected_profile=(case['profile_version'], case['knowledge_package_id']))
+            knowledge_hash=_digest(knowledge), expected_profile=(case['profile_version'], case['knowledge_package_id']),
+            approved_rules=keys)
 
     def get_run(self, *, user_id, job_id=None, run_id=None):
         return self.store.hypotheses_run(user_id=user_id, job_id=job_id, run_id=run_id)
@@ -104,7 +117,8 @@ class HypothesesService:
 
     async def execute(self, job):
         run = self.get_run(job_id=job['id'], user_id=job['chat_id'])
-        knowledge = self._knowledge(self.store.get_case(run['case_id']))
+        rules = json.loads(run['approved_rules_json']) if run.get('approved_rules_json') is not None else None
+        knowledge = self._knowledge(self.store.get_case(run['case_id']), run['knowledge_version'], rules)
         if _digest(knowledge) != run['knowledge_hash']:
             # S4a queued jobs predate the extra rule snapshot. Preserve their
             # original binding and do not attach rules retroactively.
