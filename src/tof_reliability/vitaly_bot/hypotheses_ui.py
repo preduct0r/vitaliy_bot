@@ -34,8 +34,10 @@ def render(card: dict, *, plan: bool = False) -> str:
                  '. Уточнить периметр: ' + _value(card.get('scope')) +
                  '. Проверить источники и восполнить пробелы: ' + _value(card.get('missing_evidence')) +
                  '. Результаты и ограничения представить для решения; анализ ещё не выполнен.')
-    lines.extend(['Доступные источники: ' + _value((card.get('source_references') or []) +
-                                                   (card.get('case_material_references') or [])),
+    source_references = ((card.get('source_references') or []) +
+                         (card.get('case_material_references') or []))
+    source_label = _value(source_references) if source_references else 'Источники не подтверждены'
+    lines.extend(['Доступные источники: ' + source_label,
                   'Готовность источников: ' + readiness,
                   'Пробелы: ' + _value(card.get('missing_evidence')),
                   'Опровержение: ' + _value(card.get('falsification')),
